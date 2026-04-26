@@ -3,6 +3,65 @@ import pytest
 from hermes_cli import runtime_provider as rp
 
 
+def test_auto_provider_with_codex_model_prefers_openai_codex_before_env_keys(monkeypatch):
+    monkeypatch.setenv("GLM_API_KEY", "redacted-test-glm-key")
+    monkeypatch.setenv("XIAOMI_API_KEY", "redacted-test-xiaomi-key")
+    monkeypatch.delenv("OPENAI_API_KEY", raising=False)
+    monkeypatch.delenv("OPENROUTER_API_KEY", raising=False)
+    monkeypatch.setattr(rp.auth_mod, "_load_auth_store", lambda: {})
+    monkeypatch.setattr(rp, "_get_model_config", lambda: {})
+    monkeypatch.setattr(
+        rp,
+        "load_pool",
+        lambda provider: type("P", (), {"has_credentials": lambda self: False})(),
+    )
+    monkeypatch.setattr(
+        rp,
+        "resolve_codex_runtime_credentials",
+        lambda: {
+            "provider": "openai-codex",
+            "base_url": "https://chatgpt.com/backend-api/codex",
+            "api_key": "codex-token",
+            "source": "hermes-auth-store",
+        },
+    )
+
+    resolved = rp.resolve_runtime_provider(requested="auto", target_model="gpt-5.5")
+
+    assert resolved["provider"] == "openai-codex"
+    assert resolved["api_mode"] == "codex_responses"
+    assert "chatgpt.com/backend-api/codex" in resolved["base_url"]
+
+
+def test_explicit_zai_with_codex_model_fails_fast_before_api_key_resolution(monkeypatch):
+    def _unexpected_api_key_resolution(provider):
+        raise AssertionError(f"must fail before resolving {provider} credentials")
+
+    monkeypatch.setattr(rp, "resolve_api_key_provider_credentials", _unexpected_api_key_resolution)
+
+    with pytest.raises(rp.ProviderModelMismatchError, match="Provider/model mismatch"):
+        rp.resolve_runtime_provider(requested="zai", target_model="gpt-5.5")
+
+
+def test_explicit_zai_with_glm_model_remains_allowed(monkeypatch):
+    monkeypatch.setattr(rp, "_get_model_config", lambda: {})
+    monkeypatch.setattr(
+        rp,
+        "resolve_api_key_provider_credentials",
+        lambda provider: {
+            "provider": provider,
+            "api_key": "zai-token",
+            "base_url": "https://api.z.ai/api/coding/paas/v4",
+            "source": "env",
+        },
+    )
+
+    resolved = rp.resolve_runtime_provider(requested="zai", target_model="glm-5.1")
+
+    assert resolved["provider"] == "zai"
+    assert resolved["base_url"] == "https://api.z.ai/api/coding/paas/v4"
+
+
 def test_resolve_runtime_provider_uses_credential_pool(monkeypatch):
     class _Entry:
         access_token = "pool-token"

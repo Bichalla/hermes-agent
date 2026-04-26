@@ -31,6 +31,66 @@ from hermes_cli.config import get_compatible_custom_providers, load_config
 from hermes_constants import OPENROUTER_BASE_URL
 from utils import base_url_host_matches, base_url_hostname
 
+_PROVIDER_MODEL_MISMATCH_EXEMPT_PROVIDERS = frozenset({"openrouter", "nous", "ai-gateway", "copilot", "kilocode", "custom"})
+
+
+class ProviderModelMismatchError(AuthError):
+    """Raised before network access when an explicit provider cannot serve a known model."""
+
+
+def _effective_target_model(model_cfg: Dict[str, Any], target_model: Optional[str]) -> str:
+    return str(target_model or model_cfg.get("default") or "").strip()
+
+
+def _detect_provider_for_runtime_model(model_name: str, current_provider: str = "auto") -> Optional[tuple[str, str]]:
+    if not model_name:
+        return None
+    try:
+        from hermes_cli.models import detect_provider_for_model
+
+        return detect_provider_for_model(model_name, current_provider)
+    except Exception:
+        return None
+
+
+def _normalize_runtime_provider(provider: str) -> str:
+    try:
+        from hermes_cli.models import normalize_provider
+
+        return normalize_provider(provider)
+    except Exception:
+        return (provider or "").strip().lower()
+
+
+def _provider_model_mismatch_message(provider: str, model: str, detected_provider: str) -> str:
+    return (
+        f"Provider/model mismatch: provider '{provider}' does not support model '{model}'. "
+        f"Detected provider for this model is '{detected_provider}'. "
+        f"Use --provider {detected_provider} -m {model}, or choose a model supported by '{provider}'."
+    )
+
+
+def validate_provider_model_compatibility(provider: str, model: str) -> None:
+    """Fail fast when an explicit concrete provider conflicts with a known model owner."""
+    provider_norm = _normalize_runtime_provider(provider)
+    model_name = (model or "").strip()
+    if not provider_norm or provider_norm == "auto" or not model_name:
+        return
+    if provider_norm in _PROVIDER_MODEL_MISMATCH_EXEMPT_PROVIDERS:
+        return
+
+    detected = _detect_provider_for_runtime_model(model_name, provider_norm)
+    if not detected:
+        return
+    detected_provider, _ = detected
+    detected_norm = _normalize_runtime_provider(detected_provider)
+    if detected_norm and detected_norm != provider_norm:
+        raise ProviderModelMismatchError(
+            _provider_model_mismatch_message(provider_norm, model_name, detected_norm),
+            provider=provider_norm,
+            code="provider_model_mismatch",
+        )
+
 
 def _normalize_custom_provider_name(value: str) -> str:
     return value.strip().lower().replace(" ", "-")
@@ -876,12 +936,19 @@ def resolve_runtime_provider(
         custom_runtime["requested_provider"] = requested_provider
         return custom_runtime
 
+    model_cfg = _get_model_config()
+    effective_model = _effective_target_model(model_cfg, target_model)
+    if requested_provider == "auto" and effective_model:
+        detected = _detect_provider_for_runtime_model(effective_model)
+        if detected:
+            requested_provider = _normalize_runtime_provider(detected[0])
+
     provider = resolve_provider(
         requested_provider,
         explicit_api_key=explicit_api_key,
         explicit_base_url=explicit_base_url,
     )
-    model_cfg = _get_model_config()
+    validate_provider_model_compatibility(provider, str(target_model or ""))
     explicit_runtime = _resolve_explicit_runtime(
         provider=provider,
         requested_provider=requested_provider,

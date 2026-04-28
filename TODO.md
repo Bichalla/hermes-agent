@@ -4,7 +4,7 @@ document_id: "hermes-agent-todo-20260428"
 title: "Hermes Agent TODO"
 subtitle: null
 created: "2026-04-28T10:24:31+09:00"
-updated: "2026-04-28T14:23:30+09:00"
+updated: "2026-04-28T14:51:59+09:00"
 authors:
   - Hermes
 owners:
@@ -92,9 +92,10 @@ version: 0.1.0
 - [x] Run benchmark and sample queries.
 - [x] Update `STATUS.md` with graph stats, query evidence, and watch risk.
 - [x] Review initial graph quality and prune baseline install/upstream docs from Tier 1.
+- [x] Patch Graphify hidden-path allowlisting via `.graphifyinclude` so curated `.hermes/` operating docs remain SSOT and are indexed.
 - [ ] Decide whether to split docs/business-PKM graph from runtime/AST graph.
 - [ ] Decide whether to patch Graphify AST extraction/export to suppress primitive/common nodes.
-- [ ] Decide whether to patch Graphify watch ignore handling.
+- [ ] Decide whether to patch Graphify watch ignore/include handling.
 - [ ] Decide whether to add `skills/` as Tier 2 after Tier 1 quality check, preferably as a separate skill-discovery graph.
 
 ## Project operating docs

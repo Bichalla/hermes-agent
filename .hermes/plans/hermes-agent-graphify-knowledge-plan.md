@@ -4,7 +4,7 @@ document_id: "hermes-agent-graphify-knowledge-plan-20260428"
 title: "Hermes Agent Graphify Knowledge Corpus Plan"
 subtitle: "핵심 산출물·문서 중심 Graphify 초기화와 watch 운영 계획"
 created: "2026-04-28T10:15:56+09:00"
-updated: "2026-04-28T14:23:30+09:00"
+updated: "2026-04-28T14:51:59+09:00"
 authors:
   - Hermes
 owners:
@@ -133,15 +133,15 @@ Graphify should not index routine byproducts:
 
 Use for first high-quality graph.
 
-Approximate candidate size after baseline install/upstream doc pruning:
+Approximate candidate size after baseline install/upstream doc pruning and `.graphifyinclude` hidden-path allowlisting:
 
-- 295 files
-- ~903,254 words
-- 291 code files, 4 project-local operating documents
+- 296 files
+- ~905,230 words
+- 291 code files, 5 project-local operating documents
 
 Include:
 
-- project-local operating docs: `AGENTS.md`, `STATUS.md`, `ROADMAP.md`, `TODO.md`
+- project-local operating docs: `AGENTS.md`, `STATUS.md`, `ROADMAP.md`, `TODO.md`, plus curated `.hermes/plans/**/*.md`, `.hermes/reports/**/*.md`, and `.hermes/reviews/**/*.md` via `.graphifyinclude`
 - root runtime files: `run_agent.py`, `model_tools.py`, `toolsets.py`, `cli.py`, `hermes_state.py`, `hermes_constants.py`, `hermes_logging.py`, `batch_runner.py`, `trajectory_compressor.py`, `mcp_serve.py`
 - runtime directories: `agent/`, `hermes_cli/`, `tools/`, `gateway/`, `cron/`, `plugins/`, `scripts/`, `acp_adapter/`, `tui_gateway/`
 
@@ -231,8 +231,8 @@ SECURITY.md
 RELEASE_*.md
 constraints-termux.txt
 hermes-already-has-routines.md
-plans/
-docs/plans/
+plans/*
+docs/plans/*
 plugins/**/README.md
 gateway/platforms/ADDING_A_PLATFORM.md
 
@@ -259,11 +259,27 @@ acp_registry/
 graphify-out/
 ```
 
+## Proposed `.graphifyinclude` allowlist
+
+Place at `/Users/honbul/.hermes/hermes-agent/.graphifyinclude` after using a Graphify version that supports hidden-path allowlisting.
+
+```gitignore
+# Graphify hidden-path allowlist for Hermes Agent
+# Keep SSOT documents in project-local hidden operating folders while indexing only curated markdown.
+# Sensitive-looking files are still hard-skipped by Graphify even when allowlisted.
+
+.hermes/plans/**/*.md
+.hermes/reports/**/*.md
+.hermes/reviews/**/*.md
+```
+
+This preserves SSOT: project operating artifacts stay in `.hermes/`; Graphify indexes only the curated Markdown paths needed for retrieval.
+
 ## Watch-mode caveat
 
 Graphify's current `watch.py` does **not** fully apply `.graphifyignore` in the filesystem event handler. Verified behavior from source:
 
-- `detect()` respects `.graphifyignore`.
+- `detect()` respects `.graphifyignore` and, after the local Graphify patch, `.graphifyinclude` for curated hidden paths.
 - `_rebuild_code()` calls `detect()`, so code rebuilds respect ignore rules.
 - But the watch event handler only skips:
   - hidden path parts,
@@ -277,14 +293,14 @@ Operational implication:
 
 ## Watch strategy options
 
-### Option A — Patch Graphify watch to respect `.graphifyignore` before using root watch
+### Option A — Patch Graphify watch to respect `.graphifyignore` and `.graphifyinclude` before using root watch
 
 Best long-term behavior.
 
 Implementation idea:
 
-1. Add ignore loading to `graphify/watch.py`.
-2. In `Handler.on_any_event`, call `_is_ignored(path, watch_path.resolve(), ignore_patterns)` before setting `pending = True`.
+1. Add ignore/include loading to `graphify/watch.py`.
+2. In `Handler.on_any_event`, call `_is_ignored(path, watch_path.resolve(), ignore_patterns)` and the hidden-path allowlist check before setting `pending = True`.
 3. Add regression tests:
    - ignored Markdown change does not create `needs_update`,
    - ignored code change does not rebuild,
@@ -307,8 +323,9 @@ Good short-term behavior without patching Graphify.
 Run separate watchers or a launch wrapper for curated directories only:
 
 - `/Users/honbul/.hermes/hermes-agent/docs`
-- `/Users/honbul/.hermes/hermes-agent/plans`
-- `/Users/honbul/.hermes/hermes-agent/.plans`
+- `/Users/honbul/.hermes/hermes-agent/.hermes/plans` if using a Graphify watch version that applies `.graphifyinclude` at event time
+- `/Users/honbul/.hermes/hermes-agent/.hermes/reports` if using a Graphify watch version that applies `.graphifyinclude` at event time
+- `/Users/honbul/.hermes/hermes-agent/.hermes/reviews` if using a Graphify watch version that applies `.graphifyinclude` at event time
 - `/Users/honbul/.hermes/hermes-agent/skills` if Tier 2 is enabled
 - optionally `/Users/honbul/.hermes/skills` for installed/local skills
 
@@ -322,7 +339,7 @@ Cons:
 - Does not automatically rebuild when root runtime code changes unless separate code watcher is added.
 - Multiple watcher processes or a wrapper script needed.
 
-### Option C — Curated corpus mirror under `.hermes/graphify-corpora/`
+### Option C — Curated corpus mirror under `.hermes/graphify-corpora/` — rejected for now
 
 Create a dedicated corpus directory and copy/sync selected docs/source snapshots there.
 
@@ -335,22 +352,26 @@ Cons:
 
 - Requires sync automation.
 - Source paths become less direct unless metadata is preserved.
+- Violates the preferred SSOT principle if not implemented as a generated cache.
+
+Current decision: prefer `.graphifyinclude` hidden-path allowlisting over mirrors so project documents stay in one canonical location.
 
 ## Recommended plan
 
-1. Start with refined Tier 1 corpus and `.graphifyignore` policy.
-2. Validate the runtime/AST graph separately from docs/business-PKM search:
+1. Start with refined Tier 1 corpus, `.graphifyignore` exclusion policy, and `.graphifyinclude` hidden-path allowlist.
+2. Validate that detect includes `.hermes/plans/hermes-agent-graphify-knowledge-plan.md` without mirroring it into visible docs.
+3. Validate the runtime/AST graph separately from docs/business-PKM search:
    - god nodes should be Hermes core concepts, not tests/fixtures/vendor nodes.
    - query “How does tool dispatch work?” should traverse `model_tools.py`, `tools/registry.py`, `toolsets.py`, and `run_agent.py`.
    - query “How does gateway session routing work?” should traverse `gateway/` and session/platform code.
    - query “How should Hermes Agent Graphify corpus be operated for honbul's business PKM?” should not be dominated by gateway/runtime hubs; if it is, split a separate docs/business-PKM graph.
-3. If the runtime graph is clean, decide whether to patch AST primitive filtering for common nodes such as `.get()`, `str`, `.print()`, `.items()`, and `.set()`.
-4. Add `skills/` only as Tier 2 after comparing report quality, preferably as a separate skill-discovery graph.
-5. Do not add `optional-skills/` to the core graph unless the goal is skill discovery; keep it as a separate knowledge-docs graph if needed.
-6. For watch:
-   - Preferred: patch Graphify watch ignore behavior, then run one root watcher.
-   - Short term: watch a curated docs/business-PKM graph and rely on manual `/graphify --update` for semantic changes.
-7. Store the final commands and policy in a repo-local runbook after validation.
+4. If the runtime graph is clean, decide whether to patch AST primitive filtering for common nodes such as `.get()`, `str`, `.print()`, `.items()`, and `.set()`.
+5. Add `skills/` only as Tier 2 after comparing report quality, preferably as a separate skill-discovery graph.
+6. Do not add `optional-skills/` to the core graph unless the goal is skill discovery; keep it as a separate knowledge-docs graph if needed.
+7. For watch:
+   - Preferred: patch Graphify watch ignore/include event filtering, then run one root watcher.
+   - Short term: run manual Graphify update for semantic changes or watch only explicitly curated visible docs folders.
+8. Store the final commands and policy in a repo-local runbook after validation.
 
 ## Concrete next execution sequence
 
@@ -365,13 +386,14 @@ Expected acceptance criteria:
 - no `tests/`, `website/`, `ui-tui/`, `node_modules/` in detected paths,
 - sensitive skip count remains nonzero but filenames are not reported in chat.
 
-### Step 2 — Create `.graphifyignore`
+### Step 2 — Create `.graphifyignore` and `.graphifyinclude`
 
 Only after dry-run acceptance.
 
-File:
+Files:
 
 - `/Users/honbul/.hermes/hermes-agent/.graphifyignore`
+- `/Users/honbul/.hermes/hermes-agent/.graphifyinclude`
 
 ### Step 3 — Initialize Tier 1 graph
 
@@ -397,7 +419,7 @@ graphify path "AIAgent" "tool registry" --graph graphify-out/graph.json
 
 ### Step 5 — Watch setup
 
-Short-term safe watcher should target a dedicated docs/business-PKM corpus after deciding its visible location. Do not rely on `.hermes/` paths for Graphify indexing until hidden-path handling is patched; current `detect()` skips hidden path parts.
+Short-term safe watcher should not rely on root watch until Graphify watch event filtering is patched for both `.graphifyignore` and `.graphifyinclude`. Manual detect/build/update now indexes curated `.hermes/` documents through `.graphifyinclude`; no visible-doc mirror is required.
 
 Example visible-doc watcher after creating a curated docs corpus:
 
@@ -425,6 +447,6 @@ Proceed with either:
 
 1. **Split docs/business-PKM graph next** — recommended for honbul-facing document search and reuse.
 2. **Patch AST primitive filtering next** — recommended if one combined runtime graph must also answer business-PKM questions.
-3. **Patch watch first** — fix Graphify watch ignore behavior before any always-on watcher.
+3. **Patch watch first** — fix Graphify watch ignore/include behavior before any always-on watcher.
 
 Recommended: **split docs/business-PKM graph next**, then patch watch, then consider `skills/` as a separate skill-discovery graph.

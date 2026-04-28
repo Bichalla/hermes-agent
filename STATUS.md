@@ -4,7 +4,7 @@ document_id: "hermes-agent-status-20260428"
 title: "Hermes Agent Status"
 subtitle: null
 created: "2026-04-28T10:24:31+09:00"
-updated: "2026-04-28T14:23:30+09:00"
+updated: "2026-04-28T14:51:59+09:00"
 authors:
   - Hermes
 owners:
@@ -114,8 +114,9 @@ version: 0.1.0
 
 ### In progress
 
-- Graph quality review follow-up: decide whether to split a docs/business-PKM graph from the runtime/AST graph, or patch Graphify AST extraction to suppress common primitive nodes.
-- Watch strategy decision after seeing initial graph characteristics.
+- Graph quality review follow-up: Graphify now supports `.graphifyinclude` hidden-path allowlisting, so `.hermes/plans/**/*.md`, `.hermes/reports/**/*.md`, and `.hermes/reviews/**/*.md` can remain SSOT in `.hermes/` while being indexed.
+- Remaining graph quality decision: split a docs/business-PKM graph from the runtime/AST graph, or patch Graphify AST extraction to suppress common primitive nodes.
+- Watch strategy decision remains open: detect/indexing allowlists work, but watch event filtering still needs separate verification/patching before root watch.
 
 ### Latest Tier 1 run evidence
 
@@ -135,15 +136,17 @@ version: 0.1.0
   - Graph captured real Hermes gateway/runtime hubs (`Platform`, `BasePlatformAdapter`, `SessionDB`, `AIAgent`) but was still too AST-heavy for polished human browsing.
   - Detected document list contained upstream/install-baseline docs such as release notes, `README.md`, `CONTRIBUTING.md`, `SECURITY.md`, plugin READMEs, and upstream plans that are useful for Hermes users but low-signal for honbul's business PKM search.
 
-#### Refined Tier 1 graph, after install-doc pruning
+#### Refined Tier 1 graph, after install-doc pruning and hidden-path allowlisting
 
 - Updated `.graphifyignore` to exclude baseline install/upstream docs while keeping project-local operating docs in scope.
-- Refined detect result:
-  - 295 supported files
-  - ~903,254 words
-  - 291 code, 4 documents, 0 media
-  - remaining detected documents: `AGENTS.md`, `STATUS.md`, `ROADMAP.md`, `TODO.md`
-  - excluded install-doc spot check: `README.md`, `CONTRIBUTING.md`, `SECURITY.md`, `RELEASE_*.md`, plugin READMEs, upstream `plans/`, `docs/plans/`, and `gateway/platforms/ADDING_A_PLATFORM.md` had 0 detected hits
+- Added `.graphifyinclude` after patching Graphify `detect()` so curated hidden operating documents remain in their SSOT location under `.hermes/`.
+- Refined detect result after `.graphifyinclude`:
+  - 296 supported files
+  - ~905,602 words
+  - 291 code, 5 documents, 0 media
+  - remaining detected documents: `AGENTS.md`, `STATUS.md`, `ROADMAP.md`, `TODO.md`, `.hermes/plans/hermes-agent-graphify-knowledge-plan.md`
+  - `.graphifyinclude` patterns loaded: 3 (`.hermes/plans/**/*.md`, `.hermes/reports/**/*.md`, `.hermes/reviews/**/*.md`)
+  - excluded install-doc spot check: `README.md`, `CONTRIBUTING.md`, `SECURITY.md`, `RELEASE_*.md`, plugin READMEs, root `plans/*`, `docs/plans/*`, and `gateway/platforms/ADDING_A_PLATFORM.md` had 0 detected hits
 - Refined graph output location: `/Users/honbul/.hermes/hermes-agent/graphify-out/`.
 - Refined graph stats:
   - 11,608 nodes
@@ -164,16 +167,16 @@ version: 0.1.0
 1. Decide graph split strategy:
    - **Recommended:** keep the current runtime/AST graph for engineering architecture, and create a separate docs/business-PKM graph for honbul-facing operating knowledge.
    - Alternative: patch Graphify AST extraction/export to suppress common primitive nodes before reusing one combined graph.
-2. Patch Graphify watch ignore behavior before enabling root-level watch, or run a curated docs-only watch.
+2. Patch Graphify watch ignore/include event filtering before enabling root-level watch, or run a curated docs-only watch.
 3. After split/filtering, rerun practical queries against the intended use case before adding `skills/` as Tier 2.
 4. Decide whether to add `skills/` as a separate skill-discovery graph rather than merging it into the runtime graph.
 
 ## Watch-mode decision
 
-Graphify `detect()` respects `.graphifyignore`, but the current watch event handler can still notice ignored Markdown changes and write `graphify-out/needs_update`. Therefore:
+Graphify `detect()` now respects `.graphifyinclude` for curated hidden-path indexing, so `.hermes/` can remain the SSOT for project-local operating artifacts. The current allowlist indexes `.hermes/plans/**/*.md`, `.hermes/reports/**/*.md`, and `.hermes/reviews/**/*.md` while preserving Graphify's sensitive-file hard skips. However, the current watch event handler may still notice ignored or non-allowlisted Markdown changes and write `graphify-out/needs_update`. Therefore:
 
-- Do **not** start root-level `graphify watch .` as an always-on watcher until watch ignore behavior is patched or explicitly accepted.
-- Short-term safe watch scope should be a docs/business-PKM graph or explicitly curated visible docs folders. Note: Graphify `detect()` currently skips hidden paths, so `.hermes/` operating artifacts are not indexed unless Graphify hidden-path handling is patched or the artifacts are mirrored into visible docs.
+- Do **not** start root-level `graphify watch .` as an always-on watcher until watch ignore/include event filtering is patched or explicitly accepted.
+- Short-term safe watch scope should be a docs/business-PKM graph or explicitly curated visible docs folders. Manual detect/build/update runs can include the allowlisted `.hermes/` operating docs through `.graphifyinclude`.
 
 ## Verification discipline
 

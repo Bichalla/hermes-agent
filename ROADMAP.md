@@ -4,7 +4,7 @@ document_id: "hermes-agent-roadmap-20260428"
 title: "Hermes Agent Roadmap"
 subtitle: null
 created: "2026-04-28T10:24:31+09:00"
-updated: "2026-04-28T14:23:30+09:00"
+updated: "2026-04-28T14:51:59+09:00"
 authors:
   - Hermes
 owners:
@@ -90,6 +90,7 @@ Objective: Build a high-signal Graphify graph over Hermes core runtime and proje
 Acceptance criteria:
 
 - `.graphifyignore` excludes TDD byproducts, generated outputs, dependency trees, website/public docs noise, large frontend trees, and baseline install/upstream docs such as release notes and bundled plugin READMEs.
+- `.graphifyinclude` allowlists curated hidden operating docs under `.hermes/plans/**/*.md`, `.hermes/reports/**/*.md`, and `.hermes/reviews/**/*.md` so SSOT stays in `.hermes/` without document mirrors.
 - Graphify outputs are created under `/Users/honbul/.hermes/hermes-agent/graphify-out/`.
 - God nodes and communities reflect Hermes runtime/tool/gateway concepts, not tests/fixtures/vendor concepts.
 - Project-local operating docs remain searchable without upstream documentation dominating document semantics.
@@ -102,7 +103,7 @@ Objective: Safely track future Markdown knowledge updates without false positive
 
 Acceptance criteria:
 
-- Either Graphify watch is patched to respect `.graphifyignore` at event time, or curated-directory watch is used intentionally.
+- Either Graphify watch is patched to respect `.graphifyignore` and `.graphifyinclude` at event time, or curated-directory watch is used intentionally.
 - Root-level watch is not enabled until the ignore behavior is safe.
 - `STATUS.md` records the chosen watch mode and verification evidence.
 

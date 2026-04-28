@@ -4,7 +4,7 @@ document_id: "hermes-agent-agents-20260428"
 title: "Hermes Agent Development Guide"
 subtitle: null
 created: "2026-04-28T10:24:31+09:00"
-updated: "2026-04-28T14:23:30+09:00"
+updated: "2026-04-28T14:51:59+09:00"
 authors:
   - Hermes
 owners:
@@ -166,7 +166,7 @@ The Hermes Agent Graphify corpus is a curated **knowledge-bearing corpus**, not 
 
 Approved Tier 1 scope:
 
-- Project-local operating docs: `AGENTS.md`, `STATUS.md`, `ROADMAP.md`, and `TODO.md`.
+- Project-local operating docs: `AGENTS.md`, `STATUS.md`, `ROADMAP.md`, `TODO.md`, plus curated `.hermes/plans/**/*.md`, `.hermes/reports/**/*.md`, and `.hermes/reviews/**/*.md` selected through `.graphifyinclude`.
 - Load-bearing runtime files, including `run_agent.py`, `model_tools.py`, `toolsets.py`, `cli.py`, `hermes_state.py`, `hermes_constants.py`, `hermes_logging.py`, `batch_runner.py`, `trajectory_compressor.py`, and `mcp_serve.py`.
 - Core runtime directories: `agent/`, `hermes_cli/`, `tools/`, `gateway/`, `cron/`, `plugins/`, `scripts/`, `acp_adapter/`, and `tui_gateway/`.
 
@@ -180,9 +180,10 @@ Excluded by Tier 1 policy:
 
 Operational notes:
 
-- The policy file is `.graphifyignore` at repo root.
-- Do not enable root-level `graphify watch .` until watch ignores `.graphifyignore` at event time, or until the false-positive risk is explicitly accepted.
-- Short-term safe watch targets are curated docs folders such as `docs/`, `plans/`, `.plans/`, and optionally `skills/` after Tier 2 approval.
+- The exclusion policy file is `.graphifyignore` at repo root.
+- The hidden-path allowlist policy file is `.graphifyinclude` at repo root. It preserves SSOT in `.hermes/` while allowing Graphify to index only curated hidden Markdown paths; sensitive-looking filenames remain hard-skipped by Graphify.
+- Do not enable root-level `graphify watch .` until watch ignores `.graphifyignore` and `.graphifyinclude` at event time, or until the false-positive risk is explicitly accepted.
+- Short-term safe watch targets are curated docs folders such as `docs/`, `plans/`, `.plans/`, and optionally `skills/` after Tier 2 approval. `.hermes/` watch should remain manual/curated until watch event filtering is patched.
 - Detailed plan: `.hermes/plans/hermes-agent-graphify-knowledge-plan.md`.
 
 ## File Dependency Chain

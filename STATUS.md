@@ -4,7 +4,7 @@ document_id: "hermes-agent-status-20260428"
 title: "Hermes Agent Status"
 subtitle: null
 created: "2026-04-28T10:24:31+09:00"
-updated: "2026-04-28T10:24:31+09:00"
+updated: "2026-04-28T14:23:30+09:00"
 authors:
   - Hermes
 owners:
@@ -114,60 +114,66 @@ version: 0.1.0
 
 ### In progress
 
-- Tier 1 graph quality review.
+- Graph quality review follow-up: decide whether to split a docs/business-PKM graph from the runtime/AST graph, or patch Graphify AST extraction to suppress common primitive nodes.
 - Watch strategy decision after seeing initial graph characteristics.
 
 ### Latest Tier 1 run evidence
 
-- Graphify dry-run after `.graphifyignore`:
+#### Initial Tier 1 graph, before install-doc pruning
+
+- Graphify dry-run after first `.graphifyignore`:
   - 323 supported files
   - ~944,824 words
   - 291 code, 32 documents, 0 media
   - 3 sensitive-looking files skipped by Graphify
   - excluded-folder spot check: `tests/`, `website/`, `ui-tui/`, `web/`, `node_modules/`, `skills/`, `optional-skills/` all had 0 detected hits
-- Tier 1 graph output location: `/Users/honbul/.hermes/hermes-agent/graphify-out/`.
-- Generated outputs:
-  - `graphify-out/graph.json`
-  - `graphify-out/GRAPH_REPORT.md`
-  - `graphify-out/manifest.json`
-- HTML visualization was intentionally skipped because the graph has more than 5,000 nodes.
 - Initial graph stats:
   - 11,829 nodes
   - 46,698 edges
   - 127 communities
-- Extraction mix:
-  - 11,635 AST nodes from 291 code files
-  - 250 semantic document nodes from 32 docs
-  - 53,895 pre-build merged edges before graph normalization
-- Benchmark output:
-  - naive corpus estimate: ~788,600 tokens
-  - average graph query cost: ~298,134 tokens
-  - reduction: 2.6x fewer tokens per query
 - Initial quality finding:
-  - Graph captures real Hermes gateway/runtime hubs (`Platform`, `BasePlatformAdapter`, `SessionDB`, `AIAgent`) but is still too AST-heavy for polished human browsing.
-  - `graph.html` is not viable at this size; querying/report/path traversal are the useful modes for this first graph.
-  - Next improvement should be either a narrower runtime/doc graph, AST node filtering for builtins/common primitives, or a separate docs/skills graph.
+  - Graph captured real Hermes gateway/runtime hubs (`Platform`, `BasePlatformAdapter`, `SessionDB`, `AIAgent`) but was still too AST-heavy for polished human browsing.
+  - Detected document list contained upstream/install-baseline docs such as release notes, `README.md`, `CONTRIBUTING.md`, `SECURITY.md`, plugin READMEs, and upstream plans that are useful for Hermes users but low-signal for honbul's business PKM search.
+
+#### Refined Tier 1 graph, after install-doc pruning
+
+- Updated `.graphifyignore` to exclude baseline install/upstream docs while keeping project-local operating docs in scope.
+- Refined detect result:
+  - 295 supported files
+  - ~903,254 words
+  - 291 code, 4 documents, 0 media
+  - remaining detected documents: `AGENTS.md`, `STATUS.md`, `ROADMAP.md`, `TODO.md`
+  - excluded install-doc spot check: `README.md`, `CONTRIBUTING.md`, `SECURITY.md`, `RELEASE_*.md`, plugin READMEs, upstream `plans/`, `docs/plans/`, and `gateway/platforms/ADDING_A_PLATFORM.md` had 0 detected hits
+- Refined graph output location: `/Users/honbul/.hermes/hermes-agent/graphify-out/`.
+- Refined graph stats:
+  - 11,608 nodes
+  - 46,436 edges
+  - 130 communities
+  - 221 low-signal document-derived nodes pruned from the previous graph
+- Benchmark output after pruning:
+  - naive corpus estimate: ~1,204,338 tokens
+  - average graph query cost: ~298,134 tokens
+  - reduction: 4.0x fewer tokens per query
+- Query quality finding:
+  - The refined graph is cleaner on the document side, but business-PKM questions still get pulled toward runtime hubs (`Platform`, `BasePlatformAdapter`, gateway adapters) because AST nodes dominate the graph.
+  - `graphify query "How should Hermes Agent Graphify corpus be operated for honbul's business PKM?"` still returned mostly gateway/runtime nodes, which means install-doc pruning alone is not sufficient for business-document search quality.
+  - Next improvement should be either a separate docs/business-PKM graph, or a Graphify AST/noise filter for primitive/common nodes such as `.get()`, `str`, `.print()`, `.items()`, and `.set()`.
 
 ### Next steps
 
-1. Run Graphify detection with `.graphifyignore` applied.
-2. Confirm detected file/word counts and absence of excluded folders.
-3. Initialize Tier 1 graph.
-4. Verify outputs:
-   - `graphify-out/graph.json`
-   - `graphify-out/GRAPH_REPORT.md`
-   - `graphify-out/graph.html` if node count permits
-   - `graphify-out/manifest.json`
-5. Run benchmark and sample queries.
-6. Decide whether to patch Graphify watch before enabling root-level watch.
-7. Decide whether to add `skills/` as Tier 2.
+1. Decide graph split strategy:
+   - **Recommended:** keep the current runtime/AST graph for engineering architecture, and create a separate docs/business-PKM graph for honbul-facing operating knowledge.
+   - Alternative: patch Graphify AST extraction/export to suppress common primitive nodes before reusing one combined graph.
+2. Patch Graphify watch ignore behavior before enabling root-level watch, or run a curated docs-only watch.
+3. After split/filtering, rerun practical queries against the intended use case before adding `skills/` as Tier 2.
+4. Decide whether to add `skills/` as a separate skill-discovery graph rather than merging it into the runtime graph.
 
 ## Watch-mode decision
 
 Graphify `detect()` respects `.graphifyignore`, but the current watch event handler can still notice ignored Markdown changes and write `graphify-out/needs_update`. Therefore:
 
 - Do **not** start root-level `graphify watch .` as an always-on watcher until watch ignore behavior is patched or explicitly accepted.
-- Short-term safe watch scope should be curated docs folders only, for example `docs/`, `plans/`, `.plans/`, and possibly `skills/` after Tier 2 approval.
+- Short-term safe watch scope should be a docs/business-PKM graph or explicitly curated visible docs folders. Note: Graphify `detect()` currently skips hidden paths, so `.hermes/` operating artifacts are not indexed unless Graphify hidden-path handling is patched or the artifacts are mirrored into visible docs.
 
 ## Verification discipline
 

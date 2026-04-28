@@ -4,7 +4,7 @@ document_id: "hermes-agent-roadmap-20260428"
 title: "Hermes Agent Roadmap"
 subtitle: null
 created: "2026-04-28T10:24:31+09:00"
-updated: "2026-04-28T10:24:31+09:00"
+updated: "2026-04-28T14:23:30+09:00"
 authors:
   - Hermes
 owners:
@@ -85,14 +85,16 @@ version: 0.1.0
 
 ### Milestone 1 — Curated Tier 1 graph
 
-Objective: Build a high-signal Graphify graph over Hermes core runtime and operational docs.
+Objective: Build a high-signal Graphify graph over Hermes core runtime and project-local operating docs, excluding baseline install/upstream documentation that is not useful for honbul's business PKM search.
 
 Acceptance criteria:
 
-- `.graphifyignore` excludes TDD byproducts, generated outputs, dependency trees, website/public docs noise, and large frontend trees.
+- `.graphifyignore` excludes TDD byproducts, generated outputs, dependency trees, website/public docs noise, large frontend trees, and baseline install/upstream docs such as release notes and bundled plugin READMEs.
 - Graphify outputs are created under `/Users/honbul/.hermes/hermes-agent/graphify-out/`.
 - God nodes and communities reflect Hermes runtime/tool/gateway concepts, not tests/fixtures/vendor concepts.
-- Benchmark and practical queries demonstrate useful traversal.
+- Project-local operating docs remain searchable without upstream documentation dominating document semantics.
+- Benchmark and practical queries demonstrate useful traversal for the intended graph type.
+- If business-PKM queries still route mostly through runtime hubs, split a separate docs/business-PKM graph instead of forcing one graph to serve both architecture and business-document search.
 
 ### Milestone 2 — Watch governance
 

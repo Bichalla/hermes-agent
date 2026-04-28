@@ -38,6 +38,19 @@ htmlcov/
 skills/
 optional-skills/
 
+# Baseline install / upstream project docs that are useful for Hermes users but low-signal for honbul's business PKM search.
+# Keep project-local operating docs (AGENTS.md, STATUS.md, ROADMAP.md, TODO.md, docs/operations/**) in scope.
+README.md
+CONTRIBUTING.md
+SECURITY.md
+RELEASE_*.md
+constraints-termux.txt
+hermes-already-has-routines.md
+plans/
+docs/plans/
+plugins/**/README.md
+gateway/platforms/ADDING_A_PLATFORM.md
+
 # Public docs site and large UI/static assets: often duplicate internal knowledge or explode graph size
 website/
 web/

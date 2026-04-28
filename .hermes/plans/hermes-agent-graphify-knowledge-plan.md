@@ -4,7 +4,7 @@ document_id: "hermes-agent-graphify-knowledge-plan-20260428"
 title: "Hermes Agent Graphify Knowledge Corpus Plan"
 subtitle: "핵심 산출물·문서 중심 Graphify 초기화와 watch 운영 계획"
 created: "2026-04-28T10:15:56+09:00"
-updated: "2026-04-28T10:24:31+09:00"
+updated: "2026-04-28T14:23:30+09:00"
 authors:
   - Hermes
 owners:
@@ -133,20 +133,22 @@ Graphify should not index routine byproducts:
 
 Use for first high-quality graph.
 
-Approximate candidate size measured with proposed policy:
+Approximate candidate size after baseline install/upstream doc pruning:
 
-- 327 files
-- ~927,240 words
+- 295 files
+- ~903,254 words
+- 291 code files, 4 project-local operating documents
 
 Include:
 
-- root docs/files: `AGENTS.md`, `README.md`, `CONTRIBUTING.md`, `SECURITY.md`
+- project-local operating docs: `AGENTS.md`, `STATUS.md`, `ROADMAP.md`, `TODO.md`
 - root runtime files: `run_agent.py`, `model_tools.py`, `toolsets.py`, `cli.py`, `hermes_state.py`, `hermes_constants.py`, `hermes_logging.py`, `batch_runner.py`, `trajectory_compressor.py`, `mcp_serve.py`
-- directories: `agent/`, `hermes_cli/`, `tools/`, `gateway/`, `cron/`, `plugins/`, `docs/`, `plans/`, `.plans/`, `scripts/`, `acp_adapter/`, `tui_gateway/`
+- runtime directories: `agent/`, `hermes_cli/`, `tools/`, `gateway/`, `cron/`, `plugins/`, `scripts/`, `acp_adapter/`, `tui_gateway/`
 
 Exclude:
 
 - `tests/`, `website/`, `ui-tui/`, `web/`, `node_modules/`, generated/build/cache/vendor dirs.
+- baseline install/upstream docs that are not useful for honbul's business PKM search: `README.md`, `CONTRIBUTING.md`, `SECURITY.md`, `RELEASE_*.md`, bundled plugin READMEs, upstream `plans/`/`docs/plans/`, and platform-addition guide docs.
 
 ### Tier 2 — Core + built-in skills
 
@@ -220,6 +222,19 @@ htmlcov/
 # Tier 1 excludes bundled skill corpora. Remove skills/ only when enabling Tier 2.
 skills/
 optional-skills/
+
+# Baseline install / upstream project docs that are useful for Hermes users but low-signal for honbul's business PKM search.
+# Keep project-local operating docs (AGENTS.md, STATUS.md, ROADMAP.md, TODO.md, docs/operations/**) in scope.
+README.md
+CONTRIBUTING.md
+SECURITY.md
+RELEASE_*.md
+constraints-termux.txt
+hermes-already-has-routines.md
+plans/
+docs/plans/
+plugins/**/README.md
+gateway/platforms/ADDING_A_PLATFORM.md
 
 # Public docs site and large UI/static assets: often duplicate internal knowledge or explode graph size
 website/
@@ -323,17 +338,19 @@ Cons:
 
 ## Recommended plan
 
-1. Start with Tier 1 corpus and `.graphifyignore` policy.
-2. Do one Graphify initialization and validate:
+1. Start with refined Tier 1 corpus and `.graphifyignore` policy.
+2. Validate the runtime/AST graph separately from docs/business-PKM search:
    - god nodes should be Hermes core concepts, not tests/fixtures/vendor nodes.
    - query “How does tool dispatch work?” should traverse `model_tools.py`, `tools/registry.py`, `toolsets.py`, and `run_agent.py`.
    - query “How does gateway session routing work?” should traverse `gateway/` and session/platform code.
-3. If Tier 1 is clean, add `skills/` as Tier 2 and compare report quality.
-4. Do not add `optional-skills/` to the core graph unless the goal is skill discovery; keep it as a separate knowledge-docs graph if needed.
-5. For watch:
+   - query “How should Hermes Agent Graphify corpus be operated for honbul's business PKM?” should not be dominated by gateway/runtime hubs; if it is, split a separate docs/business-PKM graph.
+3. If the runtime graph is clean, decide whether to patch AST primitive filtering for common nodes such as `.get()`, `str`, `.print()`, `.items()`, and `.set()`.
+4. Add `skills/` only as Tier 2 after comparing report quality, preferably as a separate skill-discovery graph.
+5. Do not add `optional-skills/` to the core graph unless the goal is skill discovery; keep it as a separate knowledge-docs graph if needed.
+6. For watch:
    - Preferred: patch Graphify watch ignore behavior, then run one root watcher.
-   - Short term: watch curated docs directories and rely on manual `/graphify --update` for semantic changes.
-6. Store the final commands and policy in a repo-local runbook after validation.
+   - Short term: watch a curated docs/business-PKM graph and rely on manual `/graphify --update` for semantic changes.
+7. Store the final commands and policy in a repo-local runbook after validation.
 
 ## Concrete next execution sequence
 
@@ -380,13 +397,13 @@ graphify path "AIAgent" "tool registry" --graph graphify-out/graph.json
 
 ### Step 5 — Watch setup
 
-Short-term safe watcher:
+Short-term safe watcher should target a dedicated docs/business-PKM corpus after deciding its visible location. Do not rely on `.hermes/` paths for Graphify indexing until hidden-path handling is patched; current `detect()` skips hidden path parts.
+
+Example visible-doc watcher after creating a curated docs corpus:
 
 ```bash
 cd /Users/honbul/.hermes/hermes-agent
 graphify watch docs --debounce 5
-graphify watch plans --debounce 5
-graphify watch .plans --debounce 5
 ```
 
 If Tier 2 is approved:
@@ -406,8 +423,8 @@ graphify watch . --debounce 5
 
 Proceed with either:
 
-1. **Tier 1 now** — core runtime + operational docs, no bundled skills at first.
-2. **Tier 1 + skills now** — larger, but includes active bundled skill knowledge.
+1. **Split docs/business-PKM graph next** — recommended for honbul-facing document search and reuse.
+2. **Patch AST primitive filtering next** — recommended if one combined runtime graph must also answer business-PKM questions.
 3. **Patch watch first** — fix Graphify watch ignore behavior before any always-on watcher.
 
-Recommended: **Tier 1 now, then patch watch, then add skills as Tier 2 after quality check.**
+Recommended: **split docs/business-PKM graph next**, then patch watch, then consider `skills/` as a separate skill-discovery graph.

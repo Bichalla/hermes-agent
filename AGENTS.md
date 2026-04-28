@@ -4,7 +4,7 @@ document_id: "hermes-agent-agents-20260428"
 title: "Hermes Agent Development Guide"
 subtitle: null
 created: "2026-04-28T10:24:31+09:00"
-updated: "2026-04-28T10:24:31+09:00"
+updated: "2026-04-28T14:23:30+09:00"
 authors:
   - Hermes
 owners:
@@ -166,15 +166,17 @@ The Hermes Agent Graphify corpus is a curated **knowledge-bearing corpus**, not 
 
 Approved Tier 1 scope:
 
-- Root docs and load-bearing runtime files, including `AGENTS.md`, `README.md`, `run_agent.py`, `model_tools.py`, `toolsets.py`, `cli.py`, `hermes_state.py`, `hermes_constants.py`, `hermes_logging.py`, `batch_runner.py`, `trajectory_compressor.py`, and `mcp_serve.py`.
-- Core directories: `agent/`, `hermes_cli/`, `tools/`, `gateway/`, `cron/`, `plugins/`, `docs/`, `plans/`, `.plans/`, `scripts/`, `acp_adapter/`, and `tui_gateway/`.
+- Project-local operating docs: `AGENTS.md`, `STATUS.md`, `ROADMAP.md`, and `TODO.md`.
+- Load-bearing runtime files, including `run_agent.py`, `model_tools.py`, `toolsets.py`, `cli.py`, `hermes_state.py`, `hermes_constants.py`, `hermes_logging.py`, `batch_runner.py`, `trajectory_compressor.py`, and `mcp_serve.py`.
+- Core runtime directories: `agent/`, `hermes_cli/`, `tools/`, `gateway/`, `cron/`, `plugins/`, `scripts/`, `acp_adapter/`, and `tui_gateway/`.
 
 Excluded by Tier 1 policy:
 
 - TDD byproducts and fixtures: `tests/`, `**/tests/`, `test/`, `**/test/`.
 - Tier 2+ corpora until separately approved: `skills/`, `optional-skills/`.
+- Baseline install/upstream docs that are low-signal for honbul's business PKM search: `README.md`, `CONTRIBUTING.md`, `SECURITY.md`, `RELEASE_*.md`, bundled plugin READMEs, and upstream `plans/`/`docs/plans/`.
 - Generated/build/dependency outputs: `node_modules/`, `dist/`, `build/`, `out/`, `target/`, caches, lockfiles, and compiled artifacts.
-- Public-site or large UI noise unless explicitly needed: `website/`, `web/`, `ui-tui/node_modules/`, static assets.
+- Public-site or large UI noise unless explicitly needed: `website/`, `web/`, `ui-tui/`, static assets.
 
 Operational notes:
 

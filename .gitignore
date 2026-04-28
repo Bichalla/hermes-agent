@@ -69,3 +69,8 @@ mini-swe-agent/
 .nix-stamps/
 result
 website/static/api/skills-index.json
+
+# Graphify local outputs and extraction scratch files
+/graphify-out/
+/.graphify_*.json
+/.graphify_chunk_*.txt

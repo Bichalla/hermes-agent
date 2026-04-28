@@ -1,0 +1,61 @@
+# Graphify corpus hygiene for Hermes Agent
+# Keep knowledge-bearing source/docs; skip TDD byproducts, generated outputs, deps, public-site duplicates.
+
+# Always-noisy development byproducts
+tests/
+**/tests/
+test/
+**/test/
+__pycache__/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.tox/
+.eggs/
+*.egg-info/
+
+# Dependencies / package caches / generated frontend trees
+node_modules/
+ui-tui/node_modules/
+package-lock.json
+yarn.lock
+pnpm-lock.yaml
+
+# Build / generated outputs
+dist/
+build/
+out/
+target/
+coverage/
+htmlcov/
+*.pyc
+*.pyo
+*.min.js
+*.map
+
+# Tier controls
+# Tier 1 excludes bundled skill corpora. Remove skills/ only when enabling Tier 2.
+skills/
+optional-skills/
+
+# Public docs site and large UI/static assets: often duplicate internal knowledge or explode graph size
+website/
+web/
+ui-tui/
+assets/
+
+# Sample/generated media data
+neutts_samples/
+**/neutts_samples/
+
+# Infra/package metadata usually not useful for knowledge search
+docker/
+nix/
+packaging/
+datagen-config-examples/
+environments/
+tinker-atropos/
+acp_registry/
+
+# Graphify output; Graphify already skips this, keep explicit for readers
+graphify-out/

@@ -1,3 +1,90 @@
+---
+schema: pkm-frontmatter/v1
+document_id: "hermes-agent-agents-20260428"
+title: "Hermes Agent Development Guide"
+subtitle: null
+created: "2026-04-28T10:24:31+09:00"
+updated: "2026-04-28T10:24:31+09:00"
+authors:
+  - Hermes
+owners:
+  - honbul
+status: active
+lifecycle: evergreen
+document_type: standard
+audience:
+  - honbul
+  - Hermes
+language: ko
+visibility: private
+sensitivity: internal
+priority: high
+confidence: high
+summary: >-
+  Hermes Agent codebase에서 AI coding assistant와 개발자가 따라야 하는 프로젝트 구조, 개발 절차, 검증, Graphify 지식 그래프 운영 규칙을 정의한다.
+tags:
+  - hermes-agent
+  - agents
+  - development-guide
+  - graphify
+aliases:
+  - Hermes Agent AGENTS
+projects:
+  - hermes-agent
+areas:
+  - agent-ops
+  - software-development
+  - knowledge-ops
+resources: []
+entities:
+  people:
+    - honbul
+  organizations: []
+  brands:
+    - Hermes
+  products:
+    - Hermes Agent
+    - Graphify
+  systems:
+    - Hermes
+    - Graphify
+sources:
+  - type: existing_document
+    title: "Hermes Agent - Development Guide"
+    url: null
+    date: null
+  - type: user_request
+    title: "Graphify project operating docs upkeep"
+    url: null
+    date: "2026-04-28"
+links:
+  canonical: /Users/honbul/.hermes/hermes-agent/AGENTS.md
+  source: null
+  related:
+    - /Users/honbul/.hermes/hermes-agent/STATUS.md
+    - /Users/honbul/.hermes/hermes-agent/.hermes/plans/hermes-agent-graphify-knowledge-plan.md
+relations:
+  parent: null
+  children: []
+  depends_on: []
+  supersedes: []
+  superseded_by: null
+review:
+  cadence: on_change
+  last_reviewed: "2026-04-28"
+  next_review: null
+governance:
+  pkm_required: true
+  frontmatter_required: true
+  approval_required_for_external_publish: true
+automation:
+  indexing: true
+  extract_tasks: true
+  sync_targets:
+    - local_markdown
+version: 0.1.0
+---
+
 # Hermes Agent - Development Guide
 
 Instructions for AI coding assistants and developers working on the hermes-agent codebase.
@@ -60,6 +147,41 @@ hermes-agent/
 **Logs:** `~/.hermes/logs/` — `agent.log` (INFO+), `errors.log` (WARNING+),
 `gateway.log` when running the gateway. Profile-aware via `get_hermes_home()`.
 Browse with `hermes logs [--follow] [--level ...] [--session ...]`.
+
+## Project-local operating docs
+
+Keep these project-local docs current during meaningful work:
+
+- `STATUS.md` — current state source of truth and next work.
+- `ROADMAP.md` — longer-term milestones and direction.
+- `TODO.md` — project-local task queue.
+- `.hermes/plans/`, `.hermes/reports/`, `.hermes/reviews/`, `.hermes/handoffs/`, `.hermes/context/` — agent-generated operating artifacts.
+- `docs/adr/`, `docs/architecture/`, `docs/operations/`, `docs/product/` — decisions, architecture, runbooks, and product docs.
+
+All new or materially edited Markdown docs must use the PKM frontmatter standard from `/Users/honbul/.hermes/docs/document-frontmatter-standard.md`.
+
+## Graphify knowledge corpus policy
+
+The Hermes Agent Graphify corpus is a curated **knowledge-bearing corpus**, not a physical full-repo dump.
+
+Approved Tier 1 scope:
+
+- Root docs and load-bearing runtime files, including `AGENTS.md`, `README.md`, `run_agent.py`, `model_tools.py`, `toolsets.py`, `cli.py`, `hermes_state.py`, `hermes_constants.py`, `hermes_logging.py`, `batch_runner.py`, `trajectory_compressor.py`, and `mcp_serve.py`.
+- Core directories: `agent/`, `hermes_cli/`, `tools/`, `gateway/`, `cron/`, `plugins/`, `docs/`, `plans/`, `.plans/`, `scripts/`, `acp_adapter/`, and `tui_gateway/`.
+
+Excluded by Tier 1 policy:
+
+- TDD byproducts and fixtures: `tests/`, `**/tests/`, `test/`, `**/test/`.
+- Tier 2+ corpora until separately approved: `skills/`, `optional-skills/`.
+- Generated/build/dependency outputs: `node_modules/`, `dist/`, `build/`, `out/`, `target/`, caches, lockfiles, and compiled artifacts.
+- Public-site or large UI noise unless explicitly needed: `website/`, `web/`, `ui-tui/node_modules/`, static assets.
+
+Operational notes:
+
+- The policy file is `.graphifyignore` at repo root.
+- Do not enable root-level `graphify watch .` until watch ignores `.graphifyignore` at event time, or until the false-positive risk is explicitly accepted.
+- Short-term safe watch targets are curated docs folders such as `docs/`, `plans/`, `.plans/`, and optionally `skills/` after Tier 2 approval.
+- Detailed plan: `.hermes/plans/hermes-agent-graphify-knowledge-plan.md`.
 
 ## File Dependency Chain
 

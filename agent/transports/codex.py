@@ -88,6 +88,9 @@ class ResponsesApiTransport(ProviderTransport):
 
         _effort_clamp = {"minimal": "low"}
         reasoning_effort = _effort_clamp.get(reasoning_effort, reasoning_effort)
+        reasoning_payload = {"summary": "auto"}
+        if reasoning_effort != "auto":
+            reasoning_payload["effort"] = reasoning_effort
 
         kwargs = {
             "model": model,
@@ -111,7 +114,7 @@ class ResponsesApiTransport(ProviderTransport):
                 if github_reasoning is not None:
                     kwargs["reasoning"] = github_reasoning
             else:
-                kwargs["reasoning"] = {"effort": reasoning_effort, "summary": "auto"}
+                kwargs["reasoning"] = reasoning_payload
                 kwargs["include"] = ["reasoning.encrypted_content"]
         elif not is_github_responses and not is_xai_responses:
             kwargs["include"] = []

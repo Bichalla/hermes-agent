@@ -83,6 +83,23 @@ class TestCodexBuildKwargs:
         )
         assert "reasoning" not in kw or kw.get("include") == []
 
+    def test_reasoning_xhigh_preserved(self, transport):
+        messages = [{"role": "user", "content": "Hi"}]
+        kw = transport.build_kwargs(
+            model="gpt-5.4", messages=messages, tools=[],
+            reasoning_config={"enabled": True, "effort": "xhigh"},
+        )
+        assert kw.get("reasoning", {}).get("effort") == "xhigh"
+
+    def test_reasoning_auto_omits_effort(self, transport):
+        messages = [{"role": "user", "content": "Hi"}]
+        kw = transport.build_kwargs(
+            model="gpt-5.4", messages=messages, tools=[],
+            reasoning_config={"enabled": True, "effort": "auto"},
+        )
+        assert kw.get("reasoning") == {"summary": "auto"}
+        assert "reasoning.encrypted_content" in kw.get("include", [])
+
     def test_session_id_sets_cache_key(self, transport):
         messages = [{"role": "user", "content": "Hi"}]
         kw = transport.build_kwargs(

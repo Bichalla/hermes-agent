@@ -1497,6 +1497,112 @@ class TestDelegationReasoningEffort(unittest.TestCase):
         call_kwargs = MockAgent.call_args[1]
         self.assertEqual(call_kwargs["reasoning_config"], {"enabled": True, "effort": "medium"})
 
+    def test_schema_exposes_top_level_and_per_task_reasoning_effort(self):
+        """delegate_task schema exposes reasoning_effort in both modes."""
+        props = DELEGATE_TASK_SCHEMA["parameters"]["properties"]
+        self.assertIn("reasoning_effort", props)
+        self.assertIn("auto", props["reasoning_effort"]["enum"])
+        task_props = props["tasks"]["items"]["properties"]
+        self.assertIn("reasoning_effort", task_props)
+        self.assertIn("xhigh", task_props["reasoning_effort"]["enum"])
+
+    @patch("tools.delegate_tool._load_config")
+    @patch("run_agent.AIAgent")
+    def test_top_level_reasoning_effort_overrides_config(self, MockAgent, mock_cfg):
+        """A per-call override beats delegation.reasoning_effort."""
+        mock_cfg.return_value = {"max_iterations": 50, "reasoning_effort": "low"}
+        MockAgent.return_value = MagicMock()
+        parent = _make_mock_parent()
+        parent.reasoning_config = {"enabled": True, "effort": "xhigh"}
+
+        _build_child_agent(
+            task_index=0, goal="Implement a feature", context=None, toolsets=None,
+            model=None, max_iterations=50, parent_agent=parent,
+            task_count=1, reasoning_effort="high",
+        )
+        call_kwargs = MockAgent.call_args[1]
+        self.assertEqual(call_kwargs["reasoning_config"], {"enabled": True, "effort": "high"})
+
+    @patch("tools.delegate_tool._load_config")
+    @patch("run_agent.AIAgent")
+    def test_auto_reasoning_effort_classifies_task(self, MockAgent, mock_cfg):
+        """auto maps risky architecture/security work to xhigh, not literal auto."""
+        mock_cfg.return_value = {"max_iterations": 50, "reasoning_effort": ""}
+        MockAgent.return_value = MagicMock()
+        parent = _make_mock_parent()
+        parent.reasoning_config = {"enabled": True, "effort": "medium"}
+
+        _build_child_agent(
+            task_index=0,
+            goal="Design the payment authentication architecture and migration plan",
+            context="Security-sensitive user data migration",
+            toolsets=["terminal", "file"],
+            model=None,
+            max_iterations=50,
+            parent_agent=parent,
+            task_count=1,
+            reasoning_effort="auto",
+        )
+        call_kwargs = MockAgent.call_args[1]
+        self.assertEqual(call_kwargs["reasoning_config"], {"enabled": True, "effort": "xhigh"})
+
+    @patch("tools.delegate_tool._load_config")
+    @patch("run_agent.AIAgent")
+    def test_config_auto_reasoning_effort_classifies_task(self, MockAgent, mock_cfg):
+        """delegation.reasoning_effort: auto classifies each child task."""
+        mock_cfg.return_value = {"max_iterations": 50, "reasoning_effort": "auto"}
+        MockAgent.return_value = MagicMock()
+        parent = _make_mock_parent()
+        parent.reasoning_config = {"enabled": True, "effort": "medium"}
+
+        _build_child_agent(
+            task_index=0,
+            goal="Format one file",
+            context=None,
+            toolsets=["file"],
+            model=None,
+            max_iterations=50,
+            parent_agent=parent,
+            task_count=1,
+        )
+        call_kwargs = MockAgent.call_args[1]
+        self.assertEqual(call_kwargs["reasoning_config"], {"enabled": True, "effort": "low"})
+
+    @patch("tools.delegate_tool._load_config", return_value={"max_iterations": 50, "reasoning_effort": "low"})
+    @patch("tools.delegate_tool._resolve_delegation_credentials")
+    def test_batch_tasks_can_override_reasoning_effort_independently(self, mock_creds, mock_cfg):
+        """Batch tasks can produce different child reasoning_config values."""
+        mock_creds.return_value = {
+            "provider": None, "base_url": None,
+            "api_key": None, "api_mode": None, "model": None,
+        }
+        parent = _make_mock_parent(depth=0)
+        parent.reasoning_config = {"enabled": True, "effort": "medium"}
+        with patch("tools.delegate_tool._build_child_agent") as mock_build:
+            mock_child = MagicMock()
+            mock_child.run_conversation.return_value = {
+                "final_response": "done", "completed": True,
+                "api_calls": 1, "messages": [],
+            }
+            mock_child._delegate_saved_tool_names = []
+            mock_child._credential_pool = None
+            mock_child.session_prompt_tokens = 0
+            mock_child.session_completion_tokens = 0
+            mock_child.model = "test"
+            mock_build.return_value = mock_child
+
+            delegate_task(
+                tasks=[
+                    {"goal": "Format one file", "reasoning_effort": "low"},
+                    {"goal": "Review auth data migration", "reasoning_effort": "xhigh"},
+                ],
+                reasoning_effort="medium",
+                parent_agent=parent,
+            )
+
+        efforts = [call.kwargs["reasoning_effort"] for call in mock_build.call_args_list]
+        self.assertEqual(efforts, ["low", "xhigh"])
+
 
 # =========================================================================
 # Dispatch helper, progress events, concurrency
@@ -1536,6 +1642,27 @@ class TestDispatchDelegateTask(unittest.TestCase):
             _, kwargs = mock_build.call_args
             self.assertEqual(kwargs["override_acp_command"], "claude")
             self.assertEqual(kwargs["override_acp_args"], ["--acp", "--stdio"])
+
+    @patch("tools.delegate_tool.delegate_task")
+    def test_run_agent_dispatch_forwards_reasoning_effort(self, mock_delegate):
+        """AIAgent._dispatch_delegate_task forwards reasoning_effort into delegate_task."""
+        from run_agent import AIAgent
+
+        agent = AIAgent.__new__(AIAgent)
+        mock_delegate.return_value = '{"results": []}'
+
+        result = AIAgent._dispatch_delegate_task(
+            agent,
+            {
+                "goal": "Review auth migration",
+                "reasoning_effort": "xhigh",
+                "role": "leaf",
+            },
+        )
+
+        self.assertEqual(result, '{"results": []}')
+        self.assertEqual(mock_delegate.call_args.kwargs["reasoning_effort"], "xhigh")
+        self.assertIs(mock_delegate.call_args.kwargs["parent_agent"], agent)
 
 class TestDelegateEventEnum(unittest.TestCase):
     """Tests for DelegateEvent enum and back-compat aliases."""

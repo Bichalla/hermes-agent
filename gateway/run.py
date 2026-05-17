@@ -7823,6 +7823,21 @@ class GatewayRunner:
         if not voice_channel:
             return "You need to be in a voice channel first."
 
+        permission_checker = getattr(adapter, "check_voice_channel_permissions", None)
+        if callable(permission_checker):
+            missing_permissions = permission_checker(voice_channel)
+            if asyncio.iscoroutine(missing_permissions):
+                missing_permissions = await missing_permissions
+            if not isinstance(missing_permissions, (list, tuple, set)):
+                missing_permissions = []
+            if missing_permissions:
+                missing = ", ".join(missing_permissions)
+                return (
+                    "Missing Discord voice permission(s): "
+                    f"{missing}. Ask an admin to grant these on the target VC, "
+                    "then retry /voice channel."
+                )
+
         # Wire callbacks BEFORE join so voice input arriving immediately
         # after connection is not lost.
         if hasattr(adapter, "_voice_input_callback"):

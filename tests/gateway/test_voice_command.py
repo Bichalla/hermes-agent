@@ -771,6 +771,7 @@ class TestVoiceChannelCommands:
         mock_adapter = AsyncMock()
         mock_adapter.join_voice_channel = AsyncMock(return_value=True)
         mock_adapter.get_user_voice_channel = AsyncMock(return_value=mock_channel)
+        mock_adapter.check_voice_channel_permissions = MagicMock(return_value=[])
         mock_adapter._voice_text_channels = {}
         mock_adapter._voice_sources = {}
         mock_adapter._voice_input_callback = None
@@ -784,6 +785,38 @@ class TestVoiceChannelCommands:
         assert runner._voice_mode["discord:123"] == "all"
         assert mock_adapter._voice_sources[111]["chat_id"] == "123"
         assert mock_adapter._voice_sources[111]["chat_type"] == "group"
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        ("missing_permissions", "expected"),
+        [
+            (["Connect"], "Connect"),
+            (["Speak"], "Speak"),
+            (["Connect", "Speak"], "Connect, Speak"),
+        ],
+    )
+    async def test_join_fails_closed_with_exact_missing_voice_permissions(
+        self, runner, missing_permissions, expected
+    ):
+        """Permission preflight stops before join and names exact Discord gaps."""
+        mock_channel = MagicMock()
+        mock_channel.name = "General"
+        mock_adapter = AsyncMock()
+        mock_adapter.join_voice_channel = AsyncMock(return_value=True)
+        mock_adapter.get_user_voice_channel = AsyncMock(return_value=mock_channel)
+        mock_adapter.check_voice_channel_permissions = MagicMock(return_value=missing_permissions)
+        mock_adapter._voice_text_channels = {}
+        mock_adapter._voice_sources = {}
+        mock_adapter._voice_input_callback = None
+        event = self._make_discord_event()
+        runner.adapters[event.source.platform] = mock_adapter
+
+        result = await runner._handle_voice_channel_join(event)
+
+        assert "missing discord voice permission" in result.lower()
+        assert expected in result
+        mock_adapter.join_voice_channel.assert_not_called()
+        assert runner._voice_mode.get("discord:123") is None
 
     @pytest.mark.asyncio
     async def test_join_failure(self, runner):
@@ -1028,6 +1061,37 @@ class TestDiscordVoiceChannelMethods:
         mock_vc.is_connected.return_value = False
         adapter._voice_clients[111] = mock_vc
         assert adapter.is_in_voice_channel(111) is False
+
+    @pytest.mark.parametrize(
+        ("connect", "speak", "expected"),
+        [
+            (False, True, ["Connect"]),
+            (True, False, ["Speak"]),
+            (False, False, ["Connect", "Speak"]),
+            (True, True, []),
+        ],
+    )
+    def test_check_voice_channel_permissions_reports_exact_missing_names(
+        self, connect, speak, expected
+    ):
+        adapter = self._make_adapter()
+        bot_member = MagicMock()
+        channel = MagicMock()
+        channel.guild.me = bot_member
+        channel.permissions_for.return_value = SimpleNamespace(
+            connect=connect,
+            speak=speak,
+        )
+
+        assert adapter.check_voice_channel_permissions(channel) == expected
+
+    def test_check_voice_channel_permissions_fails_closed_when_bot_member_unknown(self):
+        adapter = self._make_adapter()
+        channel = MagicMock()
+        channel.guild.me = None
+        channel.guild.get_member.return_value = None
+
+        assert adapter.check_voice_channel_permissions(channel) == ["Connect", "Speak"]
 
     @pytest.mark.asyncio
     async def test_leave_voice_channel_cleans_up(self):

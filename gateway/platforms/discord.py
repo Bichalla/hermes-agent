@@ -1577,14 +1577,53 @@ class DiscordAdapter(BasePlatformAdapter):
             return await super().send_voice(chat_id, audio_path, caption, reply_to, metadata=metadata)
 
     # ------------------------------------------------------------------
-    # Voice channel methods (join / leave / play)
+    # Voice channel methods (preflight / join / leave / play)
     # ------------------------------------------------------------------
+
+    def check_voice_channel_permissions(self, channel) -> List[str]:
+        """Return exact missing Discord VC permissions for this bot.
+
+        The runner uses this as a fail-closed preflight before attempting to
+        connect. Exact names intentionally match Discord's UI labels so an
+        operator can fix the target-channel override without widening broader
+        server permissions.
+        """
+        guild = getattr(channel, "guild", None)
+        bot_member = getattr(guild, "me", None) if guild else None
+        if bot_member is None and guild and self._client and getattr(self._client, "user", None):
+            get_member = getattr(guild, "get_member", None)
+            if callable(get_member):
+                bot_member = get_member(self._client.user.id)
+
+        if bot_member is None:
+            return ["Connect", "Speak"]
+
+        permissions_for = getattr(channel, "permissions_for", None)
+        if not callable(permissions_for):
+            return ["Connect", "Speak"]
+
+        permissions = permissions_for(bot_member)
+        missing: List[str] = []
+        if not getattr(permissions, "connect", False):
+            missing.append("Connect")
+        if not getattr(permissions, "speak", False):
+            missing.append("Speak")
+        return missing
 
     async def join_voice_channel(self, channel) -> bool:
         """Join a Discord voice channel. Returns True on success."""
         if not self._client or not DISCORD_AVAILABLE:
             return False
         guild_id = channel.guild.id
+
+        missing_permissions = self.check_voice_channel_permissions(channel)
+        if missing_permissions:
+            logger.warning(
+                "Missing Discord voice permission(s) for #%s: %s",
+                getattr(channel, "name", "unknown"),
+                ", ".join(missing_permissions),
+            )
+            return False
 
         async with self._voice_locks.setdefault(guild_id, asyncio.Lock()):
             # Already connected in this guild?

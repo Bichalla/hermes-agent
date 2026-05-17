@@ -61,6 +61,43 @@ from gateway.platforms.base import (
 from tools.url_safety import is_safe_url
 
 
+DISCORD_OPUS_FALLBACK_PATHS = (
+    "/opt/homebrew/lib/libopus.dylib",  # Homebrew, Apple Silicon
+    "/usr/local/lib/libopus.dylib",     # Homebrew, Intel Mac
+    "~/.local/lib/libopus.dylib",       # user-local dependency installs
+)
+
+
+def _find_discord_opus_library() -> Optional[str]:
+    """Return a loadable Opus library path/name for Discord voice, if present."""
+    import ctypes.util
+
+    opus_path = ctypes.util.find_library("opus")
+    if opus_path:
+        return opus_path
+    if sys.platform == "darwin":
+        for candidate in DISCORD_OPUS_FALLBACK_PATHS:
+            expanded = os.path.expanduser(candidate)
+            if os.path.isfile(expanded):
+                return expanded
+    return None
+
+
+def _load_discord_opus_if_available() -> bool:
+    """Load Opus for discord.py voice without requiring system-wide Homebrew."""
+    if not DISCORD_AVAILABLE:
+        return False
+    if discord.opus.is_loaded():
+        return True
+    opus_path = _find_discord_opus_library()
+    if opus_path:
+        try:
+            discord.opus.load_opus(opus_path)
+        except Exception:
+            logger.warning("Opus codec found at %s but failed to load", opus_path)
+    return discord.opus.is_loaded()
+
+
 def _clean_discord_id(entry: str) -> str:
     """Strip common prefixes from a Discord user ID or username entry.
 
@@ -171,6 +208,7 @@ class VoiceReceiver:
         self._bot_ssrc = conn.ssrc
 
         self._install_speaking_hook(conn)
+        _load_discord_opus_if_available()
         conn.add_socket_listener(self._on_packet)
         self._running = True
         logger.info("VoiceReceiver started (bot_ssrc=%d)", self._bot_ssrc)
@@ -537,28 +575,8 @@ class DiscordAdapter(BasePlatformAdapter):
             return False
 
         # Load opus codec for voice channel support
-        if not discord.opus.is_loaded():
-            import ctypes.util
-            opus_path = ctypes.util.find_library("opus")
-            # ctypes.util.find_library fails on macOS with Homebrew-installed libs,
-            # so fall back to known Homebrew paths if needed.
-            if not opus_path:
-                _homebrew_paths = (
-                    "/opt/homebrew/lib/libopus.dylib",  # Apple Silicon
-                    "/usr/local/lib/libopus.dylib",     # Intel Mac
-                )
-                if sys.platform == "darwin":
-                    for _hp in _homebrew_paths:
-                        if os.path.isfile(_hp):
-                            opus_path = _hp
-                            break
-            if opus_path:
-                try:
-                    discord.opus.load_opus(opus_path)
-                except Exception:
-                    logger.warning("Opus codec found at %s but failed to load", opus_path)
-            if not discord.opus.is_loaded():
-                logger.warning("Opus codec not found — voice channel playback disabled")
+        if not _load_discord_opus_if_available():
+            logger.warning("Opus codec not found — voice channel playback disabled")
 
         if not self.config.token:
             logger.error("[%s] No bot token configured", self.name)

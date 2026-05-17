@@ -32,6 +32,7 @@ incident.
 """
 
 import ast
+import importlib.util
 import sys
 from pathlib import Path
 from unittest.mock import MagicMock
@@ -97,6 +98,13 @@ def _ensure_discord_mock() -> None:
     maintaining their own mock setup.
     """
     if "discord" in sys.modules and hasattr(sys.modules["discord"], "__file__"):
+        return  # Real library is installed — nothing to mock
+    try:
+        discord_spec = importlib.util.find_spec("discord")
+    except ValueError:
+        discord_spec = None
+    if discord_spec is not None:
+        __import__("discord")
         return  # Real library is installed — nothing to mock
 
     from types import SimpleNamespace

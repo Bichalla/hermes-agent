@@ -16,6 +16,13 @@ def _ensure_discord_mock():
     """Install a lightweight discord mock when discord.py isn't available."""
     if "discord" in sys.modules and hasattr(sys.modules["discord"], "__file__"):
         return
+    try:
+        discord_spec = importlib.util.find_spec("discord")
+    except ValueError:
+        discord_spec = None
+    if discord_spec is not None:
+        __import__("discord")
+        return
 
     discord_mod = MagicMock()
     discord_mod.Intents.default.return_value = MagicMock()

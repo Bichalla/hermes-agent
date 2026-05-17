@@ -49,6 +49,18 @@ def test_check_runtime_accepts_homebrew_opus_fallback():
     assert "lib:opus" not in result["missing"]
 
 
+def test_check_runtime_accepts_user_local_opus_fallback():
+    result = check_runtime(
+        find_spec=lambda name: object(),
+        which=lambda name: f"/usr/bin/{name}",
+        find_library=lambda name: None if name == "opus" else f"lib{name}.dylib",
+        exists=lambda path: path.endswith("/.local/lib/libopus.dylib"),
+    )
+
+    assert result["ok"] is True
+    assert "lib:opus" not in result["missing"]
+
+
 def test_check_runtime_reports_optional_mutagen_without_blocking():
     result = check_runtime(
         find_spec=lambda name: None if name == "mutagen" else object(),

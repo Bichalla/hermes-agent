@@ -19,9 +19,10 @@ REQUIRED_MODULES = ["discord", "nacl", "davey", "edge_tts", "faster_whisper"]
 OPTIONAL_MODULES = ["mutagen"]
 REQUIRED_BINARIES = ["ffmpeg"]
 REQUIRED_LIBRARIES = ["opus"]
-MACOS_HOMEBREW_OPUS_PATHS = [
+MACOS_OPUS_FALLBACK_PATHS = [
     "/opt/homebrew/lib/libopus.dylib",
     "/usr/local/lib/libopus.dylib",
+    "~/.local/lib/libopus.dylib",
 ]
 
 
@@ -33,7 +34,7 @@ def _has_library(
     if find_library(name):
         return True
     if name == "opus":
-        return any(exists(path) for path in MACOS_HOMEBREW_OPUS_PATHS)
+        return any(exists(os.path.expanduser(path)) for path in MACOS_OPUS_FALLBACK_PATHS)
     return False
 
 

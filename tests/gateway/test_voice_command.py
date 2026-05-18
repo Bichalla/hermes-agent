@@ -61,6 +61,17 @@ _ensure_discord_mock()
 from gateway.platforms.base import MessageEvent, MessageType, SessionSource
 
 
+@pytest.fixture(autouse=True)
+def _isolate_live_voice_tuning_env(monkeypatch):
+    """Keep live gateway voice tuning from changing default-behavior tests."""
+    for name in (
+        "HERMES_DISCORD_VOICE_MIN_SPEECH_SECONDS",
+        "HERMES_DISCORD_VOICE_SILENCE_THRESHOLD_SECONDS",
+        "HERMES_DISCORD_VOICE_WAKE_WORD_REQUIRED",
+    ):
+        monkeypatch.delenv(name, raising=False)
+
+
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------

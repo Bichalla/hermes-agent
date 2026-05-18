@@ -41,6 +41,16 @@ from unittest.mock import MagicMock
 from gateway.platforms.discord import VoiceReceiver
 
 
+@pytest.fixture(autouse=True)
+def _isolate_live_voice_tuning_env(monkeypatch):
+    """Keep live gateway voice tuning from changing default-flow tests."""
+    for name in (
+        "HERMES_DISCORD_VOICE_MIN_SPEECH_SECONDS",
+        "HERMES_DISCORD_VOICE_SILENCE_THRESHOLD_SECONDS",
+    ):
+        monkeypatch.delenv(name, raising=False)
+
+
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------

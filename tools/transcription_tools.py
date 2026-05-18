@@ -86,6 +86,7 @@ DEFAULT_GROQ_STT_MODEL = os.getenv("STT_GROQ_MODEL", "whisper-large-v3-turbo")
 DEFAULT_MISTRAL_STT_MODEL = os.getenv("STT_MISTRAL_MODEL", "voxtral-mini-latest")
 LOCAL_STT_COMMAND_ENV = "HERMES_LOCAL_STT_COMMAND"
 LOCAL_STT_LANGUAGE_ENV = "HERMES_LOCAL_STT_LANGUAGE"
+LOCAL_STT_INITIAL_PROMPT_ENV = "HERMES_LOCAL_STT_INITIAL_PROMPT"
 COMMON_LOCAL_BIN_DIRS = ("/opt/homebrew/bin", "/usr/local/bin")
 
 GROQ_BASE_URL = os.getenv("GROQ_BASE_URL", "https://api.groq.com/openai/v1")
@@ -402,14 +403,22 @@ def _transcribe_local(file_path: str, model_name: str) -> Dict[str, Any]:
             _local_model_name = model_name
 
         # Language: config.yaml (stt.local.language) > env var > auto-detect.
+        local_config = _load_stt_config().get("local", {})
         _forced_lang = (
-            _load_stt_config().get("local", {}).get("language")
+            local_config.get("language")
             or os.getenv(LOCAL_STT_LANGUAGE_ENV)
+            or None
+        )
+        _initial_prompt = (
+            local_config.get("initial_prompt")
+            or os.getenv(LOCAL_STT_INITIAL_PROMPT_ENV)
             or None
         )
         transcribe_kwargs = {"beam_size": 5}
         if _forced_lang:
             transcribe_kwargs["language"] = _forced_lang
+        if _initial_prompt:
+            transcribe_kwargs["initial_prompt"] = _initial_prompt
 
         try:
             segments, info = _local_model.transcribe(file_path, **transcribe_kwargs)

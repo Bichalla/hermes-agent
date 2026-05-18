@@ -51,6 +51,7 @@ def clean_env(monkeypatch):
     monkeypatch.delenv("MISTRAL_API_KEY", raising=False)
     monkeypatch.delenv("HERMES_LOCAL_STT_COMMAND", raising=False)
     monkeypatch.delenv("HERMES_LOCAL_STT_LANGUAGE", raising=False)
+    monkeypatch.delenv("HERMES_LOCAL_STT_INITIAL_PROMPT", raising=False)
 
 
 # ============================================================================
@@ -504,6 +505,41 @@ class TestTranscribeLocalExtended:
 
         assert result["success"] is True
         assert result["transcript"] == "Hello world"
+
+    def test_configured_initial_prompt_passed_to_local_whisper(self, tmp_path):
+        """Local faster-whisper should accept a config prompt for rare wake words."""
+        audio = tmp_path / "test.ogg"
+        audio.write_bytes(b"fake")
+
+        seg = MagicMock()
+        seg.text = "혼불아 반가워"
+        mock_info = MagicMock()
+        mock_info.language = "ko"
+        mock_info.duration = 1.0
+
+        mock_model = MagicMock()
+        mock_model.transcribe.return_value = ([seg], mock_info)
+
+        with patch("tools.transcription_tools._HAS_FASTER_WHISPER", True), \
+             patch("faster_whisper.WhisperModel", return_value=mock_model), \
+             patch("tools.transcription_tools._local_model", None), \
+             patch("tools.transcription_tools._local_model_name", None), \
+             patch("tools.transcription_tools._load_stt_config", return_value={
+                 "local": {
+                     "language": "ko",
+                     "initial_prompt": "혼불 혼불아 반가워",
+                 }
+             }):
+            from tools.transcription_tools import _transcribe_local
+            result = _transcribe_local(str(audio), "base")
+
+        assert result["success"] is True
+        mock_model.transcribe.assert_called_once_with(
+            str(audio),
+            beam_size=5,
+            language="ko",
+            initial_prompt="혼불 혼불아 반가워",
+        )
 
     def test_load_time_cuda_lib_failure_falls_back_to_cpu(self, tmp_path):
         """Missing libcublas at load time → reload on CPU, succeed."""

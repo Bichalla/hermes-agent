@@ -1003,9 +1003,8 @@ class TestVoiceChannelCommands:
         assert event.text == "회의 메모해줘"
 
     @pytest.mark.asyncio
-    async def test_input_requires_wake_word_when_enabled(self, runner, monkeypatch):
-        """Optional wake-word gating ignores background commute speech."""
-        monkeypatch.setenv("HERMES_DISCORD_VOICE_WAKE_WORD_REQUIRED", "1")
+    async def test_input_strips_observed_korean_wake_word_mishearing(self, runner):
+        """Observed STT wake-word mishearings should still activate voice input."""
         from gateway.config import Platform
         mock_adapter = AsyncMock()
         mock_adapter._voice_text_channels = {111: 123}
@@ -1015,9 +1014,31 @@ class TestVoiceChannelCommands:
         mock_adapter.handle_message = AsyncMock()
         runner.adapters[Platform.DISCORD] = mock_adapter
 
+        await runner._handle_voice_channel_input(111, 42, "홈그라 슈퍼토닉 테스트야")
+
+        event = mock_adapter.handle_message.call_args[0][0]
+        assert event.text == "슈퍼토닉 테스트야"
+
+    @pytest.mark.asyncio
+    async def test_input_requires_wake_word_when_enabled(self, runner, monkeypatch):
+        """Optional wake-word gating ignores background commute speech."""
+        monkeypatch.setenv("HERMES_DISCORD_VOICE_WAKE_WORD_REQUIRED", "1")
+        from gateway.config import Platform
+        mock_adapter = AsyncMock()
+        mock_adapter._voice_text_channels = {111: 123}
+        mock_adapter._voice_sources = {}
+        mock_channel = AsyncMock()
+        mock_adapter._client = MagicMock()
+        mock_adapter._client.get_channel = MagicMock(return_value=mock_channel)
+        mock_adapter.handle_message = AsyncMock()
+        runner.adapters[Platform.DISCORD] = mock_adapter
+
         await runner._handle_voice_channel_input(111, 42, "동료한테 하는 배경 대화")
 
         mock_adapter.handle_message.assert_not_called()
+        mock_channel.send.assert_called_once()
+        assert "[Voice ignored" in mock_channel.send.call_args[0][0]
+        assert "동료한테 하는 배경 대화" in mock_channel.send.call_args[0][0]
 
     @pytest.mark.asyncio
     async def test_input_reuses_bound_source_metadata(self, runner):

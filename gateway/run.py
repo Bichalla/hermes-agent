@@ -7909,7 +7909,7 @@ class GatewayRunner:
     @staticmethod
     def _discord_voice_wake_words() -> tuple[str, ...]:
         """Wake words accepted at the start of Discord voice-channel speech."""
-        raw = os.getenv("HERMES_DISCORD_VOICE_WAKE_WORDS", "혼불아,혼불,헤르메스,hermes,펀불아,펀불")
+        raw = os.getenv("HERMES_DISCORD_VOICE_WAKE_WORDS", "혼불아,혼불,헤르메스,hermes,펀불아,펀불,홈그라,홈불아,혼브라")
         words = (word.strip() for word in raw.split(","))
         return tuple(sorted((word for word in words if word), key=len, reverse=True))
 
@@ -7972,20 +7972,24 @@ class GatewayRunner:
             return
 
         normalized_transcript, had_wake_word = self._normalize_discord_voice_transcript(transcript)
+
+        # Show every authorized transcript in the linked private text channel
+        # before wake-word gating. Otherwise a real STT success that misses the
+        # wake word looks like "voice-to-text did not work" to the operator.
+        try:
+            channel = adapter._client.get_channel(text_ch_id)
+            if channel:
+                safe_text = transcript[:2000].replace("@everyone", "@\u200beveryone").replace("@here", "@\u200bhere")
+                prefix = "**[Voice]**" if had_wake_word or not self._discord_voice_requires_wake_word() else "**[Voice ignored — wake word missing]**"
+                await channel.send(f"{prefix} <@{user_id}>: {safe_text}")
+        except Exception:
+            pass
+
         if self._discord_voice_requires_wake_word() and not had_wake_word:
             logger.debug("Voice input from user %d ignored because wake word is required", user_id)
             return
         if not normalized_transcript:
             return
-
-        # Show transcript in text channel (after auth, with mention sanitization)
-        try:
-            channel = adapter._client.get_channel(text_ch_id)
-            if channel:
-                safe_text = transcript[:2000].replace("@everyone", "@\u200beveryone").replace("@here", "@\u200bhere")
-                await channel.send(f"**[Voice]** <@{user_id}>: {safe_text}")
-        except Exception:
-            pass
 
         # Build a synthetic MessageEvent and feed through the normal pipeline
         # Use SimpleNamespace as raw_message so _get_guild_id() can extract

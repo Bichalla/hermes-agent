@@ -625,6 +625,16 @@ class TestVoiceReceiver:
         receiver.resume()
         assert receiver._paused is False
 
+    def test_thresholds_can_be_tuned_for_commute_voice(self, monkeypatch):
+        """Voice silence/min-speech thresholds can be tuned without code edits."""
+        monkeypatch.setenv("HERMES_DISCORD_VOICE_SILENCE_THRESHOLD_SECONDS", "0.9")
+        monkeypatch.setenv("HERMES_DISCORD_VOICE_MIN_SPEECH_SECONDS", "0.25")
+
+        receiver = self._make_receiver()
+
+        assert receiver.silence_threshold == pytest.approx(0.9)
+        assert receiver.min_speech_duration == pytest.approx(0.25)
+
     def test_check_silence_empty(self):
         receiver = self._make_receiver()
         assert receiver.check_silence() == []
@@ -943,6 +953,60 @@ class TestVoiceChannelCommands:
         assert event.message_type == MessageType.VOICE
         assert event.source.chat_id == "123"
         assert event.source.chat_type == "channel"
+
+    @pytest.mark.asyncio
+    async def test_input_strips_wake_word_before_dispatch(self, runner):
+        """Leading wake words like '혼불아' should not pollute the agent prompt."""
+        from gateway.config import Platform
+        mock_adapter = AsyncMock()
+        mock_adapter._voice_text_channels = {111: 123}
+        mock_adapter._voice_sources = {}
+        mock_channel = AsyncMock()
+        mock_adapter._client = MagicMock()
+        mock_adapter._client.get_channel = MagicMock(return_value=mock_channel)
+        mock_adapter.handle_message = AsyncMock()
+        runner.adapters[Platform.DISCORD] = mock_adapter
+
+        await runner._handle_voice_channel_input(111, 42, "혼불아 오늘 할 일 정리해줘")
+
+        event = mock_adapter.handle_message.call_args[0][0]
+        assert event.text == "오늘 할 일 정리해줘"
+        transcript_msg = mock_channel.send.call_args[0][0]
+        assert "혼불아 오늘 할 일 정리해줘" in transcript_msg
+
+    @pytest.mark.asyncio
+    async def test_input_strips_longest_wake_word_variant_first(self, runner):
+        """STT variants like '펀불아' should strip the full wake word."""
+        from gateway.config import Platform
+        mock_adapter = AsyncMock()
+        mock_adapter._voice_text_channels = {111: 123}
+        mock_adapter._voice_sources = {}
+        mock_adapter._client = MagicMock()
+        mock_adapter._client.get_channel = MagicMock(return_value=AsyncMock())
+        mock_adapter.handle_message = AsyncMock()
+        runner.adapters[Platform.DISCORD] = mock_adapter
+
+        await runner._handle_voice_channel_input(111, 42, "펀불아 회의 메모해줘")
+
+        event = mock_adapter.handle_message.call_args[0][0]
+        assert event.text == "회의 메모해줘"
+
+    @pytest.mark.asyncio
+    async def test_input_requires_wake_word_when_enabled(self, runner, monkeypatch):
+        """Optional wake-word gating ignores background commute speech."""
+        monkeypatch.setenv("HERMES_DISCORD_VOICE_WAKE_WORD_REQUIRED", "1")
+        from gateway.config import Platform
+        mock_adapter = AsyncMock()
+        mock_adapter._voice_text_channels = {111: 123}
+        mock_adapter._voice_sources = {}
+        mock_adapter._client = MagicMock()
+        mock_adapter._client.get_channel = MagicMock(return_value=AsyncMock())
+        mock_adapter.handle_message = AsyncMock()
+        runner.adapters[Platform.DISCORD] = mock_adapter
+
+        await runner._handle_voice_channel_input(111, 42, "동료한테 하는 배경 대화")
+
+        mock_adapter.handle_message.assert_not_called()
 
     @pytest.mark.asyncio
     async def test_input_reuses_bound_source_metadata(self, runner):
@@ -2208,6 +2272,21 @@ class TestVoiceChannelAwareness:
         assert "#chat-room" in ctx
         assert "1 participant" in ctx
         assert "Alice" in ctx
+
+    def test_context_includes_concise_spoken_reply_guidance(self):
+        """Voice context nudges the agent toward short spoken commute replies."""
+        adapter = self._make_adapter()
+        vc = MagicMock()
+        vc.is_connected.return_value = True
+        user_a = self._make_member(1001, "Alice")
+        vc.channel.name = "chat-room"
+        vc.channel.members = [user_a]
+        adapter._voice_clients[111] = vc
+
+        ctx = adapter.get_voice_channel_context(111)
+
+        assert "spoken" in ctx.lower()
+        assert "concise" in ctx.lower()
 
     def test_context_empty_when_not_connected(self):
         adapter = self._make_adapter()

@@ -7906,6 +7906,34 @@ class GatewayRunner:
         adapter = self.adapters.get(Platform.DISCORD)
         self._set_adapter_auto_tts_disabled(adapter, chat_id, disabled=True)
 
+    @staticmethod
+    def _discord_voice_wake_words() -> tuple[str, ...]:
+        """Wake words accepted at the start of Discord voice-channel speech."""
+        raw = os.getenv("HERMES_DISCORD_VOICE_WAKE_WORDS", "혼불아,혼불,헤르메스,hermes,펀불아,펀불")
+        words = (word.strip() for word in raw.split(","))
+        return tuple(sorted((word for word in words if word), key=len, reverse=True))
+
+    @classmethod
+    def _normalize_discord_voice_transcript(cls, transcript: str) -> tuple[str, bool]:
+        """Strip a leading wake word and report whether one was present."""
+        text = (transcript or "").strip()
+        lowered = text.lower()
+        for wake_word in cls._discord_voice_wake_words():
+            wake = wake_word.lower()
+            if lowered == wake:
+                return "", True
+            if lowered.startswith(wake):
+                remainder = text[len(wake_word):].lstrip(" ,.!?。，！？:：;；-—~")
+                return remainder.strip(), True
+        return text, False
+
+    @staticmethod
+    def _discord_voice_requires_wake_word() -> bool:
+        """Whether Discord voice-channel input must start with a wake word."""
+        return os.getenv("HERMES_DISCORD_VOICE_WAKE_WORD_REQUIRED", "").strip().lower() in {
+            "1", "true", "yes", "on",
+        }
+
     async def _handle_voice_channel_input(
         self, guild_id: int, user_id: int, transcript: str
     ):
@@ -7943,6 +7971,13 @@ class GatewayRunner:
             logger.debug("Unauthorized voice input from user %d, ignoring", user_id)
             return
 
+        normalized_transcript, had_wake_word = self._normalize_discord_voice_transcript(transcript)
+        if self._discord_voice_requires_wake_word() and not had_wake_word:
+            logger.debug("Voice input from user %d ignored because wake word is required", user_id)
+            return
+        if not normalized_transcript:
+            return
+
         # Show transcript in text channel (after auth, with mention sanitization)
         try:
             channel = adapter._client.get_channel(text_ch_id)
@@ -7958,7 +7993,7 @@ class GatewayRunner:
         from types import SimpleNamespace
         event = MessageEvent(
             source=source,
-            text=transcript,
+            text=normalized_transcript,
             message_type=MessageType.VOICE,
             raw_message=SimpleNamespace(guild_id=guild_id, guild=None),
         )

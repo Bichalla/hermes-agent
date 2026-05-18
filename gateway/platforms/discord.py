@@ -172,6 +172,14 @@ class VoiceReceiver:
     def __init__(self, voice_client, allowed_user_ids: set = None):
         self._vc = voice_client
         self._allowed_user_ids = allowed_user_ids or set()
+        self.silence_threshold = self._env_float(
+            "HERMES_DISCORD_VOICE_SILENCE_THRESHOLD_SECONDS",
+            self.SILENCE_THRESHOLD,
+        )
+        self.min_speech_duration = self._env_float(
+            "HERMES_DISCORD_VOICE_MIN_SPEECH_SECONDS",
+            self.MIN_SPEECH_DURATION,
+        )
         self._running = False
 
         # Decryption
@@ -195,6 +203,15 @@ class VoiceReceiver:
 
         # Debug logging counter (instance-level to avoid cross-instance races)
         self._packet_debug_count = 0
+
+    @staticmethod
+    def _env_float(name: str, default: float) -> float:
+        """Read a positive float from the environment with a safe fallback."""
+        try:
+            value = float(os.getenv(name, ""))
+            return value if value > 0 else default
+        except (TypeError, ValueError):
+            return default
 
     # ------------------------------------------------------------------
     # Lifecycle
@@ -458,7 +475,7 @@ class VoiceReceiver:
                 # 48kHz, 16-bit, stereo = 192000 bytes/sec
                 buf_duration = len(buf) / (self.SAMPLE_RATE * self.CHANNELS * 2)
 
-                if silence_duration >= self.SILENCE_THRESHOLD and buf_duration >= self.MIN_SPEECH_DURATION:
+                if silence_duration >= self.silence_threshold and buf_duration >= self.min_speech_duration:
                     user_id = ssrc_user_map.get(ssrc, 0)
                     if not user_id:
                         # SSRC not mapped (SPEAKING event missing after bot rejoin).
@@ -468,7 +485,7 @@ class VoiceReceiver:
                         completed.append((user_id, bytes(buf)))
                     self._buffers[ssrc] = bytearray()
                     self._last_packet_time.pop(ssrc, None)
-                elif silence_duration >= self.SILENCE_THRESHOLD * 2:
+                elif silence_duration >= self.silence_threshold * 2:
                     # Stale buffer with no valid user — discard
                     self._buffers.pop(ssrc, None)
                     self._last_packet_time.pop(ssrc, None)
@@ -1850,6 +1867,11 @@ class DiscordAdapter(BasePlatformAdapter):
         for m in info["members"]:
             status = " (speaking)" if m["is_speaking"] else ""
             parts.append(f"  - {m['display_name']}{status}")
+
+        parts.append(
+            "[Voice reply guidance: respond as spoken conversation — concise, direct, "
+            "and avoid long markdown/code unless explicitly requested.]"
+        )
 
         return "\n".join(parts)
 

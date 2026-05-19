@@ -7934,6 +7934,13 @@ class GatewayRunner:
             "1", "true", "yes", "on",
         }
 
+    @staticmethod
+    def _discord_voice_show_ignored_transcripts() -> bool:
+        """Whether wake-word-missing Discord voice transcripts should be posted."""
+        return os.getenv("HERMES_DISCORD_VOICE_SHOW_IGNORED_TRANSCRIPTS", "").strip().lower() in {
+            "1", "true", "yes", "on",
+        }
+
     async def _handle_voice_channel_input(
         self, guild_id: int, user_id: int, transcript: str
     ):
@@ -7972,20 +7979,24 @@ class GatewayRunner:
             return
 
         normalized_transcript, had_wake_word = self._normalize_discord_voice_transcript(transcript)
+        requires_wake = self._discord_voice_requires_wake_word()
+        show_ignored = self._discord_voice_show_ignored_transcripts()
 
-        # Show every authorized transcript in the linked private text channel
-        # before wake-word gating. Otherwise a real STT success that misses the
-        # wake word looks like "voice-to-text did not work" to the operator.
+        # Show actionable transcripts in the linked private text channel.  When
+        # wake-word-required mode rejects a transcript, keep it quiet by default
+        # to avoid surfacing acoustic echo as user-visible phantom input; a
+        # debug env flag can restore the old diagnostic display.
         try:
             channel = adapter._client.get_channel(text_ch_id)
-            if channel:
+            should_show_transcript = had_wake_word or not requires_wake or show_ignored
+            if channel and should_show_transcript:
                 safe_text = transcript[:2000].replace("@everyone", "@\u200beveryone").replace("@here", "@\u200bhere")
-                prefix = "**[Voice]**" if had_wake_word or not self._discord_voice_requires_wake_word() else "**[Voice ignored — wake word missing]**"
+                prefix = "**[Voice]**" if had_wake_word or not requires_wake else "**[Voice ignored — wake word missing]**"
                 await channel.send(f"{prefix} <@{user_id}>: {safe_text}")
         except Exception:
             pass
 
-        if self._discord_voice_requires_wake_word() and not had_wake_word:
+        if requires_wake and not had_wake_word:
             logger.debug("Voice input from user %d ignored because wake word is required", user_id)
             return
         if not normalized_transcript:

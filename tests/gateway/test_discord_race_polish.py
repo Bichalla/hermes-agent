@@ -77,3 +77,140 @@ async def test_concurrent_joins_do_not_double_connect():
     )
     assert r1 is True and r2 is True
     assert 42 in adapter._voice_clients
+
+
+def _install_fake_voice_playback(adapter, monkeypatch, tmp_path, calls, sleeps, *, env_value):
+    guild_id = 42
+    audio_path = tmp_path / "reply.mp3"
+    audio_path.write_bytes(b"fake")
+
+    class FakeReceiver:
+        def pause(self, clear_buffers=False):
+            calls.append(("pause", clear_buffers))
+
+        def resume(self, clear_buffers=False):
+            calls.append(("resume", clear_buffers))
+
+        def clear_buffers(self):
+            calls.append(("clear", None))
+
+    class FakeVoiceClient:
+        def is_connected(self):
+            return True
+
+        def is_playing(self):
+            return False
+
+        def play(self, _source, after=None):
+            calls.append(("play", None))
+            if after:
+                after(None)
+
+    async def fake_sleep(seconds):
+        sleeps.append(seconds)
+
+    adapter._voice_clients[guild_id] = FakeVoiceClient()
+    adapter._voice_receivers[guild_id] = FakeReceiver()
+    adapter._reset_voice_timeout = lambda gid: calls.append(("reset_timeout", gid))
+    monkeypatch.setenv("HERMES_DISCORD_VOICE_POST_TTS_COOLDOWN_SECONDS", env_value)
+    monkeypatch.setenv("HERMES_DISCORD_VOICE_CLEAR_BUFFERS_ON_TTS", "true")
+    monkeypatch.setattr("gateway.platforms.discord.asyncio.sleep", fake_sleep)
+    monkeypatch.setattr("gateway.platforms.discord.discord.FFmpegPCMAudio", lambda *_a, **_k: object())
+    monkeypatch.setattr("gateway.platforms.discord.discord.PCMVolumeTransformer", lambda source, volume=1.0: source)
+    return guild_id, audio_path
+
+
+@pytest.mark.asyncio
+async def test_play_in_voice_channel_applies_post_tts_cooldown(monkeypatch, tmp_path):
+    from gateway.platforms.discord import DiscordAdapter
+
+    adapter = _make_adapter()
+    calls = []
+    sleeps = []
+    guild_id, audio_path = _install_fake_voice_playback(
+        adapter, monkeypatch, tmp_path, calls, sleeps, env_value="1.25"
+    )
+
+    assert await DiscordAdapter.play_in_voice_channel(adapter, guild_id, str(audio_path)) is True
+
+    assert ("pause", True) in calls
+    assert sleeps == [1.25]
+    assert calls[-1] == ("resume", True)
+
+
+@pytest.mark.asyncio
+async def test_play_in_voice_channel_skips_cooldown_sleep_when_zero(monkeypatch, tmp_path):
+    from gateway.platforms.discord import DiscordAdapter
+
+    adapter = _make_adapter()
+    calls = []
+    sleeps = []
+    guild_id, audio_path = _install_fake_voice_playback(
+        adapter, monkeypatch, tmp_path, calls, sleeps, env_value="0"
+    )
+
+    assert await DiscordAdapter.play_in_voice_channel(adapter, guild_id, str(audio_path)) is True
+
+    assert ("pause", True) in calls
+    assert sleeps == []
+    assert calls[-1] == ("resume", True)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("env_value", ["not-a-float", "-1"])
+async def test_play_in_voice_channel_uses_default_cooldown_for_invalid_or_negative_env(
+    monkeypatch, tmp_path, env_value
+):
+    from gateway.platforms.discord import DiscordAdapter
+
+    adapter = _make_adapter()
+    calls = []
+    sleeps = []
+    guild_id, audio_path = _install_fake_voice_playback(
+        adapter, monkeypatch, tmp_path, calls, sleeps, env_value=env_value
+    )
+
+    assert await DiscordAdapter.play_in_voice_channel(adapter, guild_id, str(audio_path)) is True
+
+    assert ("pause", True) in calls
+    assert sleeps == [1.0]
+    assert calls[-1] == ("resume", True)
+
+
+@pytest.mark.asyncio
+async def test_play_in_voice_channel_resumes_receiver_when_play_raises(monkeypatch, tmp_path):
+    from gateway.platforms.discord import DiscordAdapter
+
+    adapter = _make_adapter()
+    guild_id = 42
+    audio_path = tmp_path / "reply.mp3"
+    audio_path.write_bytes(b"fake")
+    calls = []
+
+    class FakeReceiver:
+        def pause(self, clear_buffers=False):
+            calls.append(("pause", clear_buffers))
+
+        def resume(self, clear_buffers=False):
+            calls.append(("resume", clear_buffers))
+
+    class FakeVoiceClient:
+        def is_connected(self):
+            return True
+
+        def is_playing(self):
+            return False
+
+        def play(self, _source, after=None):
+            raise RuntimeError("boom")
+
+    adapter._voice_clients[guild_id] = FakeVoiceClient()
+    adapter._voice_receivers[guild_id] = FakeReceiver()
+    adapter._reset_voice_timeout = lambda gid: calls.append(("reset_timeout", gid))
+    monkeypatch.setenv("HERMES_DISCORD_VOICE_CLEAR_BUFFERS_ON_TTS", "true")
+    monkeypatch.setattr("gateway.platforms.discord.discord.FFmpegPCMAudio", lambda *_a, **_k: object())
+    monkeypatch.setattr("gateway.platforms.discord.discord.PCMVolumeTransformer", lambda source, volume=1.0: source)
+
+    assert await DiscordAdapter.play_in_voice_channel(adapter, guild_id, str(audio_path)) is False
+    assert calls[0] == ("pause", True)
+    assert calls[-1] == ("resume", True)

@@ -150,6 +150,36 @@ def _make_voice_receiver(secret_key, dave_session=None, bot_ssrc=9999,
 # ---------------------------------------------------------------------------
 
 
+def test_clear_buffers_drops_stale_audio_state():
+    key = _make_secret_key()
+    receiver = _make_voice_receiver(key)
+    receiver._buffers[100].extend(b"abc")
+    receiver._last_packet_time[100] = time.monotonic()
+
+    receiver._ssrc_to_user[100] = 999
+    receiver._decoders[100] = object()
+
+    receiver.clear_buffers()
+
+    assert receiver._buffers == {}
+    assert receiver._last_packet_time == {}
+    assert receiver._ssrc_to_user == {100: 999}
+    assert 100 in receiver._decoders
+
+
+def test_pause_with_clear_buffers_drops_existing_audio_state():
+    key = _make_secret_key()
+    receiver = _make_voice_receiver(key)
+    receiver._buffers[100].extend(b"abc")
+    receiver._last_packet_time[100] = time.monotonic()
+
+    receiver.pause(clear_buffers=True)
+
+    assert receiver._paused is True
+    assert receiver._buffers == {}
+    assert receiver._last_packet_time == {}
+
+
 class TestRealNaClDecrypt:
     """End-to-end: real NaCl encrypt → _on_packet decrypt → buffer."""
 

@@ -115,6 +115,25 @@ def _clean_discord_id(entry: str) -> str:
     return entry.strip()
 
 
+def _env_bool(name: str, default: bool) -> bool:
+    """Read a boolean environment flag with a safe fallback."""
+    raw = os.getenv(name, "").strip().lower()
+    if raw in {"1", "true", "yes", "on"}:
+        return True
+    if raw in {"0", "false", "no", "off"}:
+        return False
+    return default
+
+
+def _env_nonnegative_float(name: str, default: float) -> float:
+    """Read a non-negative float environment flag with a safe fallback."""
+    try:
+        value = float(os.getenv(name, ""))
+        return value if value >= 0 else default
+    except (TypeError, ValueError):
+        return default
+
+
 def check_discord_requirements() -> bool:
     """Check if Discord dependencies are available."""
     return DISCORD_AVAILABLE
@@ -244,10 +263,20 @@ class VoiceReceiver:
             self._ssrc_to_user.clear()
         logger.info("VoiceReceiver stopped")
 
-    def pause(self):
-        self._paused = True
+    def clear_buffers(self):
+        """Clear buffered inbound audio without changing SSRC/user mappings."""
+        with self._lock:
+            self._buffers.clear()
+            self._last_packet_time.clear()
 
-    def resume(self):
+    def pause(self, clear_buffers: bool = False):
+        self._paused = True
+        if clear_buffers:
+            self.clear_buffers()
+
+    def resume(self, clear_buffers: bool = False):
+        if clear_buffers:
+            self.clear_buffers()
         self._paused = False
 
     # ------------------------------------------------------------------
@@ -1717,10 +1746,17 @@ class DiscordAdapter(BasePlatformAdapter):
         if not vc or not vc.is_connected():
             return False
 
-        # Pause voice receiver while playing (echo prevention)
+        # Pause voice receiver while playing (echo prevention).  Clearing on
+        # both sides of playback drops stale echo fragments without losing
+        # SSRC/user mappings.
         receiver = self._voice_receivers.get(guild_id)
+        clear_on_tts = _env_bool("HERMES_DISCORD_VOICE_CLEAR_BUFFERS_ON_TTS", True)
+        post_tts_cooldown = _env_nonnegative_float(
+            "HERMES_DISCORD_VOICE_POST_TTS_COOLDOWN_SECONDS", 1.0
+        )
+        playback_started = False
         if receiver:
-            receiver.pause()
+            receiver.pause(clear_buffers=clear_on_tts)
 
         try:
             # Wait for current playback to finish (with timeout)
@@ -1740,19 +1776,27 @@ class DiscordAdapter(BasePlatformAdapter):
                     logger.error("Voice playback error: %s", error)
                 loop.call_soon_threadsafe(done.set)
 
-            source = discord.FFmpegPCMAudio(audio_path)
-            source = discord.PCMVolumeTransformer(source, volume=1.0)
-            vc.play(source, after=_after)
+            try:
+                source = discord.FFmpegPCMAudio(audio_path)
+                source = discord.PCMVolumeTransformer(source, volume=1.0)
+                vc.play(source, after=_after)
+                playback_started = True
+            except Exception as e:
+                logger.warning("Voice playback failed to start: %s", e, exc_info=True)
+                return False
+
             try:
                 await asyncio.wait_for(done.wait(), timeout=self.PLAYBACK_TIMEOUT)
             except asyncio.TimeoutError:
                 logger.warning("Voice playback timed out after %ds", self.PLAYBACK_TIMEOUT)
                 vc.stop()
+            if playback_started and post_tts_cooldown > 0:
+                await asyncio.sleep(post_tts_cooldown)
             self._reset_voice_timeout(guild_id)
             return True
         finally:
             if receiver:
-                receiver.resume()
+                receiver.resume(clear_buffers=clear_on_tts)
 
     async def get_user_voice_channel(self, guild_id: int, user_id: str):
         """Return the voice channel the user is currently in, or None."""

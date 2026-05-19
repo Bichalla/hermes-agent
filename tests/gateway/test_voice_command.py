@@ -102,6 +102,75 @@ def _make_runner(tmp_path):
     return runner
 
 
+@pytest.mark.asyncio
+async def test_discord_voice_wake_word_missing_not_sent_by_default(monkeypatch, tmp_path):
+    from gateway.config import Platform
+
+    runner = _make_runner(tmp_path)
+    channel = AsyncMock()
+    adapter = SimpleNamespace(
+        _voice_text_channels={42: 123},
+        _voice_sources={},
+        _client=SimpleNamespace(get_channel=lambda _id: channel),
+        handle_message=AsyncMock(),
+    )
+    runner.adapters = {Platform.DISCORD: adapter}
+    monkeypatch.setenv("HERMES_DISCORD_VOICE_WAKE_WORD_REQUIRED", "true")
+    monkeypatch.delenv("HERMES_DISCORD_VOICE_SHOW_IGNORED_TRANSCRIPTS", raising=False)
+
+    await runner._handle_voice_channel_input(42, 999, "고맙습니다")
+
+    channel.send.assert_not_awaited()
+    adapter.handle_message.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_discord_voice_wake_word_missing_can_be_shown_for_debug(monkeypatch, tmp_path):
+    from gateway.config import Platform
+
+    runner = _make_runner(tmp_path)
+    channel = AsyncMock()
+    adapter = SimpleNamespace(
+        _voice_text_channels={42: 123},
+        _voice_sources={},
+        _client=SimpleNamespace(get_channel=lambda _id: channel),
+        handle_message=AsyncMock(),
+    )
+    runner.adapters = {Platform.DISCORD: adapter}
+    monkeypatch.setenv("HERMES_DISCORD_VOICE_WAKE_WORD_REQUIRED", "true")
+    monkeypatch.setenv("HERMES_DISCORD_VOICE_SHOW_IGNORED_TRANSCRIPTS", "true")
+
+    await runner._handle_voice_channel_input(42, 999, "고맙습니다")
+
+    channel.send.assert_awaited_once()
+    assert "Voice ignored" in channel.send.await_args.args[0]
+    adapter.handle_message.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_discord_voice_wake_word_transcript_still_posts_and_handles(monkeypatch, tmp_path):
+    from gateway.config import Platform
+
+    runner = _make_runner(tmp_path)
+    channel = AsyncMock()
+    adapter = SimpleNamespace(
+        _voice_text_channels={42: 123},
+        _voice_sources={},
+        _client=SimpleNamespace(get_channel=lambda _id: channel),
+        handle_message=AsyncMock(),
+    )
+    runner.adapters = {Platform.DISCORD: adapter}
+    monkeypatch.setenv("HERMES_DISCORD_VOICE_WAKE_WORD_REQUIRED", "true")
+    monkeypatch.delenv("HERMES_DISCORD_VOICE_SHOW_IGNORED_TRANSCRIPTS", raising=False)
+
+    await runner._handle_voice_channel_input(42, 999, "혼불아 지금 상태 알려줘")
+
+    channel.send.assert_awaited_once()
+    adapter.handle_message.assert_awaited_once()
+    event = adapter.handle_message.await_args.args[0]
+    assert event.text == "지금 상태 알려줘"
+
+
 # =====================================================================
 # /voice command handler
 # =====================================================================
@@ -1021,8 +1090,9 @@ class TestVoiceChannelCommands:
 
     @pytest.mark.asyncio
     async def test_input_requires_wake_word_when_enabled(self, runner, monkeypatch):
-        """Optional wake-word gating ignores background commute speech."""
+        """Optional wake-word gating ignores background commute speech quietly by default."""
         monkeypatch.setenv("HERMES_DISCORD_VOICE_WAKE_WORD_REQUIRED", "1")
+        monkeypatch.delenv("HERMES_DISCORD_VOICE_SHOW_IGNORED_TRANSCRIPTS", raising=False)
         from gateway.config import Platform
         mock_adapter = AsyncMock()
         mock_adapter._voice_text_channels = {111: 123}
@@ -1036,9 +1106,7 @@ class TestVoiceChannelCommands:
         await runner._handle_voice_channel_input(111, 42, "동료한테 하는 배경 대화")
 
         mock_adapter.handle_message.assert_not_called()
-        mock_channel.send.assert_called_once()
-        assert "[Voice ignored" in mock_channel.send.call_args[0][0]
-        assert "동료한테 하는 배경 대화" in mock_channel.send.call_args[0][0]
+        mock_channel.send.assert_not_called()
 
     @pytest.mark.asyncio
     async def test_input_reuses_bound_source_metadata(self, runner):

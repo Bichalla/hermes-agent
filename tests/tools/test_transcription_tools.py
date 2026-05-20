@@ -537,6 +537,7 @@ class TestTranscribeLocalExtended:
         mock_model.transcribe.assert_called_once_with(
             str(audio),
             beam_size=5,
+            condition_on_previous_text=False,
             language="ko",
             initial_prompt="혼불 혼불아 반가워",
         )
@@ -1378,3 +1379,37 @@ class TestTranscribeAudioXAIDispatch:
             transcribe_audio(sample_ogg, model="custom-stt")
 
         assert mock_xai.call_args[0][1] == "custom-stt"
+
+
+class TestLocalWhisperHallucinationControls:
+    def test_local_whisper_disables_previous_text_conditioning(self, monkeypatch, tmp_path):
+        """Local Whisper should avoid context hallucination across chunks/calls."""
+        from tools import transcription_tools as stt
+
+        calls = []
+
+        class Segment:
+            text = " 안녕하세요 "
+
+        class Info:
+            language = "ko"
+            duration = 1.0
+
+        class FakeModel:
+            def transcribe(self, file_path, **kwargs):
+                calls.append(kwargs)
+                return [Segment()], Info()
+
+        audio_path = tmp_path / "sample.wav"
+        audio_path.write_bytes(b"fake wav")
+
+        monkeypatch.setattr(stt, "_HAS_FASTER_WHISPER", True)
+        monkeypatch.setattr(stt, "_local_model", FakeModel())
+        monkeypatch.setattr(stt, "_local_model_name", "base")
+        monkeypatch.setattr(stt, "_load_stt_config", lambda: {"local": {"language": "ko"}})
+
+        result = stt._transcribe_local(str(audio_path), "base")
+
+        assert result["success"] is True
+        assert calls
+        assert calls[0]["condition_on_previous_text"] is False

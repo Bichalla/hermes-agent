@@ -414,7 +414,7 @@ def _transcribe_local(file_path: str, model_name: str) -> Dict[str, Any]:
             or os.getenv(LOCAL_STT_INITIAL_PROMPT_ENV)
             or None
         )
-        transcribe_kwargs = {"beam_size": 5}
+        transcribe_kwargs = {"beam_size": 5, "condition_on_previous_text": False}
         if _forced_lang:
             transcribe_kwargs["language"] = _forced_lang
         if _initial_prompt:

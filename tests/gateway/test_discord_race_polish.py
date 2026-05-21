@@ -25,8 +25,19 @@ def _make_adapter():
     adapter._voice_timeout_tasks = {}
     adapter._voice_text_channels = {}
     adapter._voice_sources = {}
+    adapter._on_voice_disconnect = None
     adapter._client = MagicMock()
     return adapter
+
+
+def _fake_named_tempfile(tmp_path):
+    class FakeTmp:
+        name = str(tmp_path / "voice.wav")
+
+        def close(self):
+            return None
+
+    return lambda *args, **kwargs: FakeTmp()
 
 
 @pytest.mark.asyncio
@@ -213,4 +224,154 @@ async def test_play_in_voice_channel_resumes_receiver_when_play_raises(monkeypat
 
     assert await DiscordAdapter.play_in_voice_channel(adapter, guild_id, str(audio_path)) is False
     assert calls[0] == ("pause", True)
+    assert ("reset_timeout", guild_id) in calls
     assert calls[-1] == ("resume", True)
+
+
+@pytest.mark.asyncio
+async def test_process_voice_input_resets_timeout_for_valid_transcript(monkeypatch, tmp_path):
+    from gateway.platforms.discord import DiscordAdapter
+
+    adapter = _make_adapter()
+    calls = []
+    callback_payloads = []
+    adapter._reset_voice_timeout = lambda gid: calls.append(("reset_timeout", gid))
+
+    async def callback(**kwargs):
+        callback_payloads.append(kwargs)
+
+    adapter._voice_input_callback = callback
+
+    monkeypatch.setattr("gateway.platforms.discord.tempfile.NamedTemporaryFile", _fake_named_tempfile(tmp_path))
+    monkeypatch.setattr("gateway.platforms.discord.VoiceReceiver.pcm_to_wav", lambda *_a, **_k: None)
+    monkeypatch.setattr(
+        "tools.transcription_tools.transcribe_audio",
+        lambda _path: {"success": True, "transcript": "혼불아 안녕"},
+    )
+    monkeypatch.setattr("tools.voice_mode.is_whisper_hallucination", lambda _text: False)
+
+    await DiscordAdapter._process_voice_input(adapter, guild_id=42, user_id=7, pcm_data=b"pcm")
+
+    assert calls == [("reset_timeout", 42)]
+    assert callback_payloads == [{"guild_id": 42, "user_id": 7, "transcript": "혼불아 안녕"}]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "transcription_result,is_hallucination",
+    [
+        ({"success": False, "transcript": "혼불아"}, False),
+        ({"success": True, "transcript": "   "}, False),
+        ({"success": True, "transcript": "엔진음,"}, True),
+    ],
+)
+async def test_process_voice_input_does_not_reset_timeout_for_ignored_transcripts(
+    monkeypatch, tmp_path, transcription_result, is_hallucination
+):
+    from gateway.platforms.discord import DiscordAdapter
+
+    adapter = _make_adapter()
+    calls = []
+    callback_payloads = []
+    adapter._reset_voice_timeout = lambda gid: calls.append(("reset_timeout", gid))
+
+    async def callback(**kwargs):
+        callback_payloads.append(kwargs)
+
+    adapter._voice_input_callback = callback
+    monkeypatch.setattr("gateway.platforms.discord.tempfile.NamedTemporaryFile", _fake_named_tempfile(tmp_path))
+    monkeypatch.setattr("gateway.platforms.discord.VoiceReceiver.pcm_to_wav", lambda *_a, **_k: None)
+    monkeypatch.setattr("tools.transcription_tools.transcribe_audio", lambda _path: transcription_result)
+    monkeypatch.setattr("tools.voice_mode.is_whisper_hallucination", lambda _text: is_hallucination)
+
+    await DiscordAdapter._process_voice_input(adapter, guild_id=42, user_id=7, pcm_data=b"pcm")
+
+    assert calls == []
+    assert callback_payloads == []
+
+
+@pytest.mark.asyncio
+async def test_play_in_voice_channel_resets_timeout_when_playback_starts(monkeypatch, tmp_path):
+    from gateway.platforms.discord import DiscordAdapter
+
+    adapter = _make_adapter()
+    guild_id = 42
+    audio_path = tmp_path / "reply.mp3"
+    audio_path.write_bytes(b"fake")
+    calls = []
+    playback_started = asyncio.Event()
+    release_playback = asyncio.Event()
+    after_callback = None
+
+    class FakeReceiver:
+        def pause(self, clear_buffers=False):
+            calls.append(("pause", clear_buffers))
+
+        def resume(self, clear_buffers=False):
+            calls.append(("resume", clear_buffers))
+
+    class FakeVoiceClient:
+        def is_connected(self):
+            return True
+
+        def is_playing(self):
+            return False
+
+        def play(self, _source, after=None):
+            nonlocal after_callback
+            calls.append(("play", None))
+            after_callback = after
+            playback_started.set()
+
+    async def fake_wait_for(awaitable, timeout):
+        await release_playback.wait()
+        if after_callback:
+            after_callback(None)
+        return await awaitable
+
+    adapter._voice_clients[guild_id] = FakeVoiceClient()
+    adapter._voice_receivers[guild_id] = FakeReceiver()
+    adapter._reset_voice_timeout = lambda gid: calls.append(("reset_timeout", gid))
+    monkeypatch.setenv("HERMES_DISCORD_VOICE_CLEAR_BUFFERS_ON_TTS", "true")
+    monkeypatch.setenv("HERMES_DISCORD_VOICE_POST_TTS_COOLDOWN_SECONDS", "0")
+    monkeypatch.setattr("gateway.platforms.discord.discord.FFmpegPCMAudio", lambda *_a, **_k: object())
+    monkeypatch.setattr("gateway.platforms.discord.discord.PCMVolumeTransformer", lambda source, volume=1.0: source)
+    monkeypatch.setattr("gateway.platforms.discord.asyncio.wait_for", fake_wait_for)
+
+    task = asyncio.create_task(
+        DiscordAdapter.play_in_voice_channel(adapter, guild_id, str(audio_path))
+    )
+    await playback_started.wait()
+    await asyncio.sleep(0)
+
+    assert calls[:3] == [
+        ("pause", True),
+        ("play", None),
+        ("reset_timeout", guild_id),
+    ]
+
+    release_playback.set()
+    assert await task is True
+
+
+@pytest.mark.asyncio
+async def test_voice_timeout_handler_logs_before_leaving(monkeypatch, caplog):
+    from gateway.platforms.discord import DiscordAdapter
+
+    adapter = _make_adapter()
+    calls = []
+
+    async def fake_sleep(_seconds):
+        return None
+
+    async def fake_leave(guild_id):
+        calls.append(("leave", guild_id))
+
+    monkeypatch.setattr("gateway.platforms.discord.asyncio.sleep", fake_sleep)
+    adapter.leave_voice_channel = fake_leave
+    caplog.set_level("INFO", logger="gateway.platforms.discord")
+
+    await DiscordAdapter._voice_timeout_handler(adapter, guild_id=42)
+
+    assert "Voice inactivity timeout fired for guild 42 after 300s" in caplog.text
+    assert calls == [("leave", 42)]

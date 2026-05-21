@@ -1781,8 +1781,10 @@ class DiscordAdapter(BasePlatformAdapter):
                 source = discord.PCMVolumeTransformer(source, volume=1.0)
                 vc.play(source, after=_after)
                 playback_started = True
+                self._reset_voice_timeout(guild_id)
             except Exception as e:
                 logger.warning("Voice playback failed to start: %s", e, exc_info=True)
+                self._reset_voice_timeout(guild_id)
                 return False
 
             try:
@@ -1826,6 +1828,11 @@ class DiscordAdapter(BasePlatformAdapter):
         except asyncio.CancelledError:
             return
         text_ch_id = self._voice_text_channels.get(guild_id)
+        logger.info(
+            "Voice inactivity timeout fired for guild %s after %ss",
+            guild_id,
+            self.VOICE_TIMEOUT,
+        )
         await self.leave_voice_channel(guild_id)
         # Notify the runner so it can clean up voice_mode state
         if self._on_voice_disconnect and text_ch_id:
@@ -1978,6 +1985,7 @@ class DiscordAdapter(BasePlatformAdapter):
             if not transcript or is_whisper_hallucination(transcript):
                 return
 
+            self._reset_voice_timeout(guild_id)
             logger.info("Voice input from user %d: %s", user_id, transcript[:100])
 
             if self._voice_input_callback:

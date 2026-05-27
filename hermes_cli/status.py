@@ -18,7 +18,6 @@ from hermes_cli.config import get_env_path, get_env_value, get_hermes_home, load
 from hermes_cli.models import provider_label
 from hermes_cli.nous_subscription import get_nous_subscription_features
 from hermes_cli.runtime_provider import resolve_requested_provider
-from hermes_cli.vercel_auth import describe_vercel_auth
 from hermes_constants import OPENROUTER_MODELS_URL
 from tools.tool_backend_helpers import managed_nous_tools_enabled
 
@@ -122,11 +121,16 @@ def show_status(args):
     print()
     print(color("◆ API Keys", Colors.CYAN, Colors.BOLD))
 
-    keys = {
+    # Values may be a single env var name (str) or a tuple of alternates (first found wins).
+    keys: dict[str, str | tuple[str, ...]] = {
         "OpenRouter": "OPENROUTER_API_KEY",
         "OpenAI": "OPENAI_API_KEY",
-        "NVIDIA": "NVIDIA_API_KEY",
-        "Z.AI/GLM": "GLM_API_KEY",
+        "Anthropic": ("ANTHROPIC_API_KEY", "ANTHROPIC_TOKEN"),
+        "Google / Gemini": ("GOOGLE_API_KEY", "GEMINI_API_KEY"),
+        "DeepSeek": "DEEPSEEK_API_KEY",
+        "xAI / Grok": "XAI_API_KEY",
+        "NVIDIA NIM": "NVIDIA_API_KEY",
+        "Z.AI / GLM": "GLM_API_KEY",
         "Kimi": "KIMI_API_KEY",
         "StepFun Step Plan": "STEPFUN_API_KEY",
         "MiniMax": "MINIMAX_API_KEY",
@@ -136,14 +140,27 @@ def show_status(args):
         "Browser Use": "BROWSER_USE_API_KEY",  # Optional — local browser works without this
         "Browserbase": "BROWSERBASE_API_KEY",  # Optional — direct credentials only
         "FAL": "FAL_KEY",
-        "Tinker": "TINKER_API_KEY",
-        "WandB": "WANDB_API_KEY",
         "ElevenLabs": "ELEVENLABS_API_KEY",
         "GitHub": "GITHUB_TOKEN",
     }
 
-    for name, env_var in keys.items():
-        value = get_env_value(env_var) or ""
+    def _resolve_env(env_ref) -> str:
+        """Return first non-empty env var value from a str or tuple of names."""
+        if isinstance(env_ref, tuple):
+            for candidate in env_ref:
+                v = get_env_value(candidate) or ""
+                if v:
+                    return v
+            return ""
+        return get_env_value(env_ref) or ""
+
+    for name, env_ref in keys.items():
+        # Anthropic already has a dedicated lookup below; keep that as the
+        # single source of truth (it also resolves OAuth tokens), skip here
+        # so we don't print two "Anthropic" rows.
+        if name == "Anthropic":
+            continue
+        value = _resolve_env(env_ref)
         has_key = bool(value)
         display = redact_key(value) if not show_all else value
         print(f"  {name:<12}  {check_mark(has_key)} {display}")
@@ -240,6 +257,27 @@ def show_status(args):
         print(f"    Access exp: {minimax_exp}")
     if minimax_status.get("error") and not minimax_logged_in:
         print(f"    Error:      {minimax_status.get('error')}")
+
+    # xAI OAuth — separate try/except so an import failure here cannot
+    # disrupt the already-printed Nous/Codex/Qwen/MiniMax rows above.
+    try:
+        from hermes_cli.auth import get_xai_oauth_auth_status
+        xai_oauth_status = get_xai_oauth_auth_status() or {}
+    except Exception:
+        xai_oauth_status = {}
+
+    xai_oauth_logged_in = bool(xai_oauth_status.get("logged_in"))
+    print(
+        f"  {'xAI OAuth':<12}  {check_mark(xai_oauth_logged_in)} "
+        f"{'logged in' if xai_oauth_logged_in else 'not logged in (run: hermes auth add xai-oauth)'}"
+    )
+    xai_auth_file = xai_oauth_status.get("auth_store")
+    if xai_auth_file:
+        print(f"    Auth file:  {xai_auth_file}")
+    if xai_oauth_status.get("last_refresh"):
+        print(f"    Refreshed:  {_format_iso_timestamp(xai_oauth_status.get('last_refresh'))}")
+    if xai_oauth_status.get("error") and not xai_oauth_logged_in:
+        print(f"    Error:      {xai_oauth_status.get('error')}")
 
     # =========================================================================
     # Nous Subscription Features
@@ -341,23 +379,6 @@ def show_status(args):
     elif terminal_env == "daytona":
         daytona_image = os.getenv("TERMINAL_DAYTONA_IMAGE", "nikolaik/python-nodejs:python3.11-nodejs20")
         print(f"  Daytona Image: {daytona_image}")
-    elif terminal_env == "vercel_sandbox":
-        runtime = os.getenv("TERMINAL_VERCEL_RUNTIME") or terminal_cfg.get("vercel_runtime") or "node24"
-        persist = os.getenv("TERMINAL_CONTAINER_PERSISTENT")
-        if persist is None:
-            persist_enabled = bool(terminal_cfg.get("container_persistent", True))
-        else:
-            persist_enabled = persist.lower() in ("1", "true", "yes", "on")
-        auth_status = describe_vercel_auth()
-        sdk_ok = importlib.util.find_spec("vercel") is not None
-        sdk_label = "installed" if sdk_ok else "missing (install: pip install 'hermes-agent[vercel]')"
-        print(f"  Runtime:      {runtime}")
-        print(f"  SDK:          {check_mark(sdk_ok)} {sdk_label}")
-        print(f"  Auth:         {check_mark(auth_status.ok)} {auth_status.label}")
-        for line in auth_status.detail_lines:
-            print(f"  Auth detail:  {line}")
-        print(f"  Persistence:  {'snapshot filesystem' if persist_enabled else 'ephemeral filesystem'}")
-        print("  Processes:    live processes do not survive cleanup, snapshots, or sandbox recreation")
 
     sudo_password = os.getenv("SUDO_PASSWORD", "")
     print(f"  Sudo:         {check_mark(bool(sudo_password))} {'enabled' if sudo_password else 'disabled'}")

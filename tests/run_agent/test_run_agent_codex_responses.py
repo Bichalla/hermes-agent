@@ -520,6 +520,72 @@ def test_run_conversation_codex_empty_output_with_output_text(monkeypatch):
     assert result["final_response"] == "Hello from Codex"
 
 
+def test_normalize_codex_response_output_none_with_output_text(monkeypatch):
+    """Regression: output=None should use output_text instead of iterating None."""
+    agent = _build_agent(monkeypatch)
+    from agent.codex_responses_adapter import _normalize_codex_response
+
+    response = SimpleNamespace(
+        output=None,
+        output_text="Recovered from output_text",
+        status="completed",
+        model="gpt-5.5",
+    )
+
+    assistant_message, finish_reason = _normalize_codex_response(response)
+
+    assert finish_reason == "stop"
+    assert assistant_message.content == "Recovered from output_text"
+
+
+def test_normalize_codex_response_message_content_none(monkeypatch):
+    """Regression: message.content=None should be treated as empty, not iterable."""
+    agent = _build_agent(monkeypatch)
+    from agent.codex_responses_adapter import _normalize_codex_response
+
+    response = SimpleNamespace(
+        output=[
+            SimpleNamespace(type="message", status="completed", content=None),
+            SimpleNamespace(
+                type="message",
+                status="completed",
+                content=[SimpleNamespace(type="output_text", text="final text")],
+            ),
+        ],
+        status="completed",
+        model="gpt-5.5",
+    )
+
+    assistant_message, finish_reason = _normalize_codex_response(response)
+
+    assert finish_reason == "stop"
+    assert assistant_message.content == "final text"
+
+
+def test_normalize_codex_response_dict_response_and_content_none(monkeypatch):
+    """Raw dict responses should follow the same extraction path as SDK objects."""
+    agent = _build_agent(monkeypatch)
+    from agent.codex_responses_adapter import _normalize_codex_response
+
+    response = {
+        "output": [
+            {"type": "message", "status": "completed", "content": None},
+            {
+                "type": "message",
+                "status": "completed",
+                "content": [{"type": "output_text", "text": "dict final"}],
+            },
+        ],
+        "status": "completed",
+        "model": "gpt-5.5",
+    }
+
+    assistant_message, finish_reason = _normalize_codex_response(response)
+
+    assert finish_reason == "stop"
+    assert assistant_message.content == "dict final"
+
+
 def test_run_conversation_codex_empty_output_no_output_text_retries(monkeypatch):
     """When both output and output_text are empty, validation should
     correctly mark the response as invalid and trigger retry."""

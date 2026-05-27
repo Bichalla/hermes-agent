@@ -37,6 +37,7 @@ import sys
 import tempfile
 import time
 import threading
+import traceback
 from types import SimpleNamespace
 import urllib.request
 import uuid
@@ -4190,6 +4191,9 @@ class AIAgent:
                 error_info: Dict[str, Any] = {
                     "type": type(error).__name__,
                     "message": str(error),
+                    "traceback": "".join(
+                        traceback.format_exception(type(error), error, error.__traceback__)
+                    ),
                 }
                 for attr_name in ("status_code", "request_id", "code", "param", "type"):
                     attr_value = getattr(error, attr_name, None)
@@ -5861,6 +5865,55 @@ class AIAgent:
                                 len(self._codex_streamed_text_parts), len(assembled),
                             )
                     return final_response
+            except TypeError as exc:
+                if "'NoneType' object is not iterable" not in str(exc):
+                    raise
+                if collected_output_items:
+                    logger.warning(
+                        "Codex Responses stream parser hit response.output=None; "
+                        "recovering from %d collected output item(s). %s",
+                        len(collected_output_items),
+                        self._client_log_context(),
+                    )
+                    return SimpleNamespace(
+                        output=list(collected_output_items),
+                        output_text=None,
+                        status="completed",
+                        model=api_kwargs.get("model"),
+                        usage=None,
+                    )
+                if self._codex_streamed_text_parts and not has_tool_calls:
+                    assembled = "".join(self._codex_streamed_text_parts)
+                    logger.warning(
+                        "Codex Responses stream parser hit response.output=None; "
+                        "recovering from %d streamed text delta(s), %d chars. %s",
+                        len(self._codex_streamed_text_parts),
+                        len(assembled),
+                        self._client_log_context(),
+                    )
+                    return SimpleNamespace(
+                        output=[
+                            SimpleNamespace(
+                                type="message",
+                                role="assistant",
+                                status="completed",
+                                content=[
+                                    SimpleNamespace(type="output_text", text=assembled)
+                                ],
+                            )
+                        ],
+                        output_text=assembled,
+                        status="completed",
+                        model=api_kwargs.get("model"),
+                        usage=None,
+                    )
+                logger.warning(
+                    "Codex Responses stream parser hit response.output=None before "
+                    "any recoverable output was collected; falling back to "
+                    "create(stream=True). %s",
+                    self._client_log_context(),
+                )
+                return self._run_codex_create_stream_fallback(api_kwargs, client=active_client)
             except (_httpx.RemoteProtocolError, _httpx.ReadTimeout, _httpx.ConnectError, ConnectionError) as exc:
                 if attempt < max_stream_retries:
                     logger.debug(
@@ -5943,7 +5996,7 @@ class AIAgent:
                 if terminal_response is not None:
                     # Backfill empty output from collected stream events
                     _out = getattr(terminal_response, "output", None)
-                    if isinstance(_out, list) and not _out:
+                    if _out is None or (isinstance(_out, list) and not _out):
                         if collected_output_items:
                             terminal_response.output = list(collected_output_items)
                             logger.debug(

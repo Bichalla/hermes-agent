@@ -30,6 +30,8 @@ _DISCORD_COMMAND_SYNC_STATE_SUBDIR = "gateway"
 _DISCORD_COMMAND_SYNC_STATE_FILENAME = "discord_command_sync_state.json"
 _DISCORD_COMMAND_SYNC_MUTATION_INTERVAL_SECONDS = 4.5
 _DISCORD_COMMAND_SYNC_MAX_RATE_LIMIT_SLEEP_SECONDS = 30.0
+_DISCORD_TTS_LISTEN_CACHE_SUBDIR = "cache/audio/discord-listen"
+_DISCORD_TTS_LISTEN_DEFAULT_TTL_DAYS = 3.0
 
 try:
     import discord
@@ -162,6 +164,50 @@ def _env_nonnegative_float(name: str, default: float) -> float:
         return value if value >= 0 else default
     except (TypeError, ValueError):
         return default
+
+
+def _discord_tts_listen_cache_dir() -> _Path:
+    """Return the dedicated cache directory for on-demand Discord TTS."""
+    from hermes_constants import get_hermes_home
+
+    return get_hermes_home() / _DISCORD_TTS_LISTEN_CACHE_SUBDIR
+
+
+def _cleanup_discord_tts_listen_cache(
+    cache_dir: Optional[_Path] = None,
+    *,
+    ttl_days: float = _DISCORD_TTS_LISTEN_DEFAULT_TTL_DAYS,
+    now: Optional[float] = None,
+) -> int:
+    """Delete stale on-demand Discord TTS files and return the delete count.
+
+    The cleanup is scoped to ``tts_listen_*`` files in the dedicated Discord
+    listen-button cache so it cannot remove user-created audio or the general
+    TTS cache.
+    """
+    cache_path = _Path(cache_dir) if cache_dir is not None else _discord_tts_listen_cache_dir()
+    if not cache_path.exists():
+        return 0
+
+    try:
+        ttl_seconds = max(0.0, float(ttl_days)) * 86400.0
+    except (TypeError, ValueError):
+        ttl_seconds = _DISCORD_TTS_LISTEN_DEFAULT_TTL_DAYS * 86400.0
+    cutoff = (time.time() if now is None else now) - ttl_seconds
+
+    removed = 0
+    for path in cache_path.iterdir():
+        if not path.is_file() or not path.name.startswith("tts_listen_"):
+            continue
+        if path.suffix.lower() not in {".mp3", ".ogg", ".wav", ".flac"}:
+            continue
+        try:
+            if path.stat().st_mtime < cutoff:
+                path.unlink()
+                removed += 1
+        except OSError:
+            logger.debug("Failed to remove stale Discord TTS cache file %s", path, exc_info=True)
+    return removed
 
 
 def check_discord_requirements() -> bool:
@@ -709,10 +755,75 @@ class DiscordAdapter(BasePlatformAdapter):
         # chunk only, default), "all" (reply-reference on every chunk).
         self._reply_to_mode: str = getattr(config, 'reply_to_mode', 'first') or 'first'
         self._slash_commands: bool = self.config.extra.get("slash_commands", True)
+        tts_button_cfg = self._load_tts_listen_button_config()
+        self._tts_listen_button_enabled: bool = tts_button_cfg["enabled"]
+        self._tts_listen_button_ttl_days: float = tts_button_cfg["ttl_days"]
+        self._tts_listen_button_ephemeral: bool = tts_button_cfg["ephemeral"]
+        self._tts_listen_button_label: str = tts_button_cfg["label"]
         # In-memory cache of the bot's last message ID per channel, used by
         # history backfill to skip the full scan on hot paths.  Falls back to
         # scanning channel.history() on cache miss (cold start / restart).
         self._last_self_message_id: Dict[str, str] = {}
+
+    def _load_tts_listen_button_config(self) -> Dict[str, Any]:
+        """Read on-demand TTS listen-button settings from config/env.
+
+        Preferred config shape under the Discord platform ``extra`` block::
+
+            tts_listen_button:
+              enabled: true
+              ttl_days: 3
+              ephemeral: true
+              label: "듣기"
+
+        Environment variables are useful for quick experiments and override
+        the config: ``HERMES_DISCORD_TTS_LISTEN_BUTTON`` and
+        ``HERMES_DISCORD_TTS_LISTEN_TTL_DAYS``.
+        """
+        raw = self.config.extra.get("tts_listen_button", {})
+        if isinstance(raw, bool):
+            raw_cfg: Dict[str, Any] = {"enabled": raw}
+        elif isinstance(raw, dict):
+            raw_cfg = raw
+        else:
+            raw_cfg = {}
+
+        enabled_default = _env_bool("HERMES_DISCORD_TTS_LISTEN_BUTTON", False)
+        enabled = _env_bool(
+            "HERMES_DISCORD_TTS_LISTEN_BUTTON",
+            bool(raw_cfg.get("enabled", enabled_default)),
+        )
+
+        ttl_raw = os.getenv("HERMES_DISCORD_TTS_LISTEN_TTL_DAYS", raw_cfg.get("ttl_days", _DISCORD_TTS_LISTEN_DEFAULT_TTL_DAYS))
+        try:
+            ttl_days = max(0.0, float(ttl_raw))
+        except (TypeError, ValueError):
+            ttl_days = _DISCORD_TTS_LISTEN_DEFAULT_TTL_DAYS
+
+        ephemeral = bool(raw_cfg.get("ephemeral", True))
+        label = str(raw_cfg.get("label") or "듣기")[:80]
+        return {
+            "enabled": enabled,
+            "ttl_days": ttl_days,
+            "ephemeral": ephemeral,
+            "label": label,
+        }
+
+    def _build_tts_listen_view(self, text: str):
+        """Return a Discord view with a lazy TTS button, or None when disabled."""
+        if not self._tts_listen_button_enabled or not text or not text.strip():
+            return None
+        view_cls = globals().get("DiscordTTSListenView")
+        if view_cls is None:
+            return None
+        return view_cls(
+            text=text,
+            allowed_user_ids=self._allowed_user_ids,
+            allowed_role_ids=self._allowed_role_ids,
+            ttl_days=self._tts_listen_button_ttl_days,
+            ephemeral=self._tts_listen_button_ephemeral,
+            label=self._tts_listen_button_label,
+        )
 
     async def connect(self) -> bool:
         """Connect to Discord and start receiving events."""
@@ -1516,6 +1627,7 @@ class DiscordAdapter(BasePlatformAdapter):
 
             message_ids = []
             reference = None
+            tts_listen_view = self._build_tts_listen_view(content)
 
             if reply_to and self._reply_to_mode != "off":
                 try:
@@ -1533,10 +1645,13 @@ class DiscordAdapter(BasePlatformAdapter):
                 else:  # "first" (default) or "off"
                     chunk_reference = reference if i == 0 else None
                 try:
-                    msg = await channel.send(
-                        content=chunk,
-                        reference=chunk_reference,
-                    )
+                    send_kwargs = {
+                        "content": chunk,
+                        "reference": chunk_reference,
+                    }
+                    if i == 0 and tts_listen_view is not None:
+                        send_kwargs["view"] = tts_listen_view
+                    msg = await channel.send(**send_kwargs)
                 except Exception as e:
                     err_text = str(e)
                     if (
@@ -1555,10 +1670,13 @@ class DiscordAdapter(BasePlatformAdapter):
                             reply_to,
                         )
                         reference = None
-                        msg = await channel.send(
-                            content=chunk,
-                            reference=None,
-                        )
+                        retry_kwargs = {
+                            "content": chunk,
+                            "reference": None,
+                        }
+                        if i == 0 and tts_listen_view is not None:
+                            retry_kwargs["view"] = tts_listen_view
+                        msg = await channel.send(**retry_kwargs)
                     else:
                         raise
                 message_ids.append(str(msg.id))
@@ -5384,7 +5502,137 @@ def _define_discord_view_classes() -> None:
     lazy install sets DISCORD_AVAILABLE=True but leaves the classes
     undefined, causing NameError on the first button interaction.
     """
-    global ExecApprovalView, SlashConfirmView, UpdatePromptView, ModelPickerView, ClarifyChoiceView
+    global ExecApprovalView, SlashConfirmView, UpdatePromptView, ModelPickerView, ClarifyChoiceView, DiscordTTSListenView
+
+    class DiscordTTSListenView(discord.ui.View):
+        """Lazy, per-message TTS button for Discord replies.
+
+        The response text is stored in memory with the view. TTS is generated
+        only after a user clicks the button, then cached as MP3 in a dedicated
+        Hermes cache directory for a short TTL.
+        """
+
+        def __init__(
+            self,
+            text: str,
+            allowed_user_ids: set,
+            allowed_role_ids: Optional[set] = None,
+            ttl_days: float = _DISCORD_TTS_LISTEN_DEFAULT_TTL_DAYS,
+            ephemeral: bool = True,
+            label: str = "듣기",
+        ):
+            super().__init__(timeout=None)
+            self.text = text
+            self.allowed_user_ids = allowed_user_ids
+            self.allowed_role_ids = allowed_role_ids or set()
+            self.ttl_days = ttl_days
+            self.ephemeral = ephemeral
+            self.label = label or "듣기"
+            digest = hashlib.sha256(text.encode("utf-8", errors="ignore")).hexdigest()[:24]
+            self.cache_stem = f"tts_listen_{digest}"
+            self.cache_path = _discord_tts_listen_cache_dir() / f"{self.cache_stem}.mp3"
+
+            button = discord.ui.Button(
+                label=self.label,
+                emoji="🔊",
+                style=discord.ButtonStyle.secondary,
+                custom_id=f"hermes:tts_listen:{digest}",
+            )
+            button.callback = self._handle_click
+            self.add_item(button)
+
+        def _check_auth(self, interaction: discord.Interaction) -> bool:
+            return _component_check_auth(
+                interaction, self.allowed_user_ids, self.allowed_role_ids,
+            )
+
+        async def _defer(self, interaction: discord.Interaction) -> None:
+            response = getattr(interaction, "response", None)
+            defer = getattr(response, "defer", None)
+            if not callable(defer):
+                return
+            try:
+                await defer(thinking=True, ephemeral=self.ephemeral)
+            except TypeError:
+                await defer()
+
+        async def _send_ephemeral_error(self, interaction: discord.Interaction, message: str) -> None:
+            response = getattr(interaction, "response", None)
+            send_message = getattr(response, "send_message", None)
+            if callable(send_message):
+                await send_message(message, ephemeral=True)
+                return
+            followup = getattr(interaction, "followup", None)
+            followup_send = getattr(followup, "send", None)
+            if callable(followup_send):
+                await followup_send(message, ephemeral=True)
+
+        async def _handle_click(self, interaction: discord.Interaction):
+            if not self._check_auth(interaction):
+                await self._send_ephemeral_error(interaction, "이 버튼을 누를 권한이 없어요.")
+                return
+
+            await self._defer(interaction)
+
+            try:
+                audio_path = await self._get_or_generate_audio_path()
+                file = discord.File(str(audio_path), filename=audio_path.name)
+                await interaction.followup.send(
+                    content="🔊 음성으로 듣기",
+                    file=file,
+                    ephemeral=self.ephemeral,
+                )
+            except Exception as exc:  # pragma: no cover - defensive UI path
+                logger.error("Discord TTS listen button failed: %s", exc, exc_info=True)
+                await self._send_ephemeral_error(interaction, f"TTS 생성 실패: {exc}")
+
+        def _find_cached_audio_path(self) -> Optional[_Path]:
+            cache_dir = self.cache_path.parent
+            if not cache_dir.exists():
+                return None
+            candidates = []
+            for suffix in (".mp3", ".ogg", ".wav", ".flac"):
+                candidate = cache_dir / f"{self.cache_stem}{suffix}"
+                try:
+                    if candidate.exists() and candidate.stat().st_size > 0:
+                        candidates.append(candidate)
+                except OSError:
+                    continue
+            if not candidates:
+                return None
+            # Prefer the newest in case the configured provider changed formats.
+            return max(candidates, key=lambda path: path.stat().st_mtime)
+
+        async def _get_or_generate_audio_path(self) -> _Path:
+            cache_dir = self.cache_path.parent
+            cache_dir.mkdir(parents=True, exist_ok=True)
+            _cleanup_discord_tts_listen_cache(cache_dir, ttl_days=self.ttl_days)
+
+            cached = self._find_cached_audio_path()
+            if cached is not None:
+                return cached
+
+            output_path = str(self.cache_path)
+            loop = asyncio.get_running_loop()
+
+            def _generate() -> str:
+                from tools.tts_tool import text_to_speech_tool
+
+                return text_to_speech_tool(self.text, output_path=output_path)
+
+            raw = await loop.run_in_executor(None, _generate)
+            try:
+                data = json.loads(raw)
+            except json.JSONDecodeError as exc:
+                raise RuntimeError(f"TTS returned invalid JSON: {raw[:120]}") from exc
+
+            if not data.get("success"):
+                raise RuntimeError(str(data.get("error") or "unknown TTS error"))
+
+            result_path = _Path(data.get("file_path") or output_path).expanduser()
+            if not result_path.exists() or result_path.stat().st_size == 0:
+                raise RuntimeError(f"TTS output file missing: {result_path}")
+            return result_path
 
     class ExecApprovalView(discord.ui.View):
         """
@@ -6582,6 +6830,18 @@ def _apply_yaml_config(yaml_cfg: dict, discord_cfg: dict) -> dict | None:
     # reply_to_mode: top-level preferred, falls back to extra.reply_to_mode.
     # YAML 1.1 parses bare 'off' as boolean False — coerce to string "off".
     _discord_extra = discord_cfg.get("extra") if isinstance(discord_cfg.get("extra"), dict) else {}
+    tts_listen_cfg = (
+        discord_cfg["tts_listen_button"] if "tts_listen_button" in discord_cfg
+        else _discord_extra.get("tts_listen_button")
+    )
+    if tts_listen_cfg is not None:
+        if isinstance(tts_listen_cfg, dict):
+            if "enabled" in tts_listen_cfg and not os.getenv("HERMES_DISCORD_TTS_LISTEN_BUTTON"):
+                os.environ["HERMES_DISCORD_TTS_LISTEN_BUTTON"] = str(tts_listen_cfg["enabled"]).lower()
+            if "ttl_days" in tts_listen_cfg and not os.getenv("HERMES_DISCORD_TTS_LISTEN_TTL_DAYS"):
+                os.environ["HERMES_DISCORD_TTS_LISTEN_TTL_DAYS"] = str(tts_listen_cfg["ttl_days"])
+        elif not os.getenv("HERMES_DISCORD_TTS_LISTEN_BUTTON"):
+            os.environ["HERMES_DISCORD_TTS_LISTEN_BUTTON"] = str(tts_listen_cfg).lower()
     _discord_rtm = (
         discord_cfg["reply_to_mode"] if "reply_to_mode" in discord_cfg
         else _discord_extra.get("reply_to_mode")

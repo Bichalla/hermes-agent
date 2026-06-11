@@ -132,6 +132,41 @@ class TestFinalizeCapabilityGate:
         picky.edit_message.assert_called_once()
         assert picky.edit_message.call_args[1]["finalize"] is True
 
+    @pytest.mark.asyncio
+    async def test_identical_final_edit_runs_for_adapters_that_need_stream_state_metadata(self):
+        """Adapters that attach final-only UI from metadata still need the final edit.
+
+        Discord TTS listen buttons are attached on the final metadata-bearing
+        edit. With no streaming cursor, final content can equal the last preview;
+        that must not short-circuit before the adapter sees final=True.
+        """
+        adapter = MagicMock()
+        adapter.REQUIRES_EDIT_FINALIZE = False
+        adapter.WANTS_STREAM_STATE_METADATA = True
+        adapter.send = AsyncMock(return_value=SimpleNamespace(
+            success=True, message_id="m1",
+        ))
+        adapter.edit_message = AsyncMock(return_value=SimpleNamespace(
+            success=True, message_id="m1",
+        ))
+        adapter.MAX_MESSAGE_LENGTH = 4096
+
+        consumer = GatewayStreamConsumer(
+            adapter,
+            "chat_1",
+            config=StreamConsumerConfig(cursor=""),
+        )
+
+        await consumer._send_or_edit("hello", finalize=False)
+        await consumer._send_or_edit("hello", finalize=True)
+
+        adapter.edit_message.assert_called_once()
+        assert adapter.edit_message.call_args.kwargs["finalize"] is True
+        assert adapter.edit_message.call_args.kwargs["metadata"] == {
+            "streaming": True,
+            "final": True,
+        }
+
 
 class TestEditMessageFinalizeSignature:
     """Every concrete platform adapter must accept the ``finalize`` kwarg.

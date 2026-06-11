@@ -22,7 +22,7 @@ import queue
 import re
 import time
 from dataclasses import dataclass
-from typing import Any, Callable, Optional
+from typing import Any, Callable, Dict, Optional
 
 from gateway.platforms.base import BasePlatformAdapter as _BasePlatformAdapter
 from gateway.platforms.base import _custom_unit_to_cp
@@ -164,6 +164,9 @@ class GatewayStreamConsumer:
         self._adapter_requires_finalize: bool = (
             getattr(adapter, "REQUIRES_EDIT_FINALIZE", False) is True
         )
+        self._adapter_wants_stream_state_metadata: bool = (
+            getattr(adapter, "WANTS_STREAM_STATE_METADATA", False) is True
+        )
 
         # Think-block filter state (mirrors CLI's _stream_delta tag suppression)
         self._in_think_block = False
@@ -210,9 +213,10 @@ class GatewayStreamConsumer:
         message_id: str,
         content: str,
         finalize: bool = False,
+        is_turn_final: bool = True,
     ):
         """Edit via the adapter, passing routing metadata when supported."""
-        kwargs = {
+        kwargs: Dict[str, Any] = {
             "chat_id": self.chat_id,
             "message_id": message_id,
             "content": content,
@@ -221,17 +225,27 @@ class GatewayStreamConsumer:
         # must accept finalize= even when it is False (guarded by tests).
         kwargs["finalize"] = finalize
 
-        if self.metadata:
+        metadata = self._metadata_with_stream_state(final=finalize and is_turn_final)
+        if metadata is not None:
             try:
                 params = inspect.signature(self.adapter.edit_message).parameters
                 if "metadata" in params or any(
                     param.kind is inspect.Parameter.VAR_KEYWORD
                     for param in params.values()
                 ):
-                    kwargs["metadata"] = self.metadata
+                    kwargs["metadata"] = metadata
             except (TypeError, ValueError):
                 pass
         return await self.adapter.edit_message(**kwargs)
+
+    def _metadata_with_stream_state(self, *, final: bool) -> Optional[dict]:
+        """Return metadata annotated so adapters can distinguish previews from finals."""
+        if getattr(self.adapter, "WANTS_STREAM_STATE_METADATA", False) is not True:
+            return self.metadata
+        meta = dict(self.metadata) if self.metadata else {}
+        meta["streaming"] = True
+        meta["final"] = final
+        return meta
 
     def on_segment_break(self) -> None:
         """Finalize the current stream segment and start a fresh message."""
@@ -1097,7 +1111,7 @@ class GatewayStreamConsumer:
             result = await self.adapter.send(
                 chat_id=self.chat_id,
                 content=text,
-                metadata=self.metadata,
+                metadata=self._metadata_with_stream_state(final=is_turn_final),
             )
         except Exception as e:
             logger.debug("Fresh-final send failed, falling back to edit: %s", e)
@@ -1218,7 +1232,11 @@ class GatewayStreamConsumer:
                     # their streaming UI can transition out of the in-
                     # progress state.  Everyone else short-circuits.
                     if text == self._last_sent_text and not (
-                        finalize and self._adapter_requires_finalize
+                        finalize
+                        and (
+                            self._adapter_requires_finalize
+                            or self._adapter_wants_stream_state_metadata
+                        )
                     ):
                         return True
                     # Fresh-final for long-lived previews: when finalizing
@@ -1244,6 +1262,7 @@ class GatewayStreamConsumer:
                         message_id=self._message_id,
                         content=text,
                         finalize=finalize,
+                        is_turn_final=is_turn_final,
                     )
                     if result.success:
                         self._already_sent = True
@@ -1323,7 +1342,7 @@ class GatewayStreamConsumer:
                     chat_id=self.chat_id,
                     content=text,
                     reply_to=self._initial_reply_to_id,
-                    metadata=self.metadata,
+                    metadata=self._metadata_with_stream_state(final=finalize and is_turn_final),
                 )
                 if result.success:
                     if result.message_id:

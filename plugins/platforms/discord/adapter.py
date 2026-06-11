@@ -14,6 +14,7 @@ import hashlib
 import json
 import logging
 import os
+import secrets
 import struct
 import subprocess
 import tempfile
@@ -32,6 +33,13 @@ _DISCORD_COMMAND_SYNC_MUTATION_INTERVAL_SECONDS = 4.5
 _DISCORD_COMMAND_SYNC_MAX_RATE_LIMIT_SLEEP_SECONDS = 30.0
 _DISCORD_TTS_LISTEN_CACHE_SUBDIR = "cache/audio/discord-listen"
 _DISCORD_TTS_LISTEN_DEFAULT_TTL_DAYS = 3.0
+_DISCORD_TTS_LISTEN_AUDIO_SUFFIXES = {".mp3", ".ogg", ".wav", ".flac"}
+_DISCORD_TTS_LISTEN_VIEW_TIMEOUT_SECONDS = 6 * 3600
+_DISCORD_TTS_LISTEN_CLEANUP_INTERVAL_SECONDS = 3600.0
+_DISCORD_TTS_LISTEN_DEFAULT_MAX_FILES = 200
+_DISCORD_TTS_LISTEN_DEFAULT_MAX_BYTES = 100 * 1024 * 1024
+_DISCORD_TTS_LISTEN_TEXT_CACHE: Dict[str, Tuple[str, float]] = {}
+_DISCORD_TTS_LISTEN_LOCKS: Dict[str, asyncio.Lock] = {}
 
 try:
     import discord
@@ -157,6 +165,20 @@ def _env_bool(name: str, default: bool) -> bool:
     return default
 
 
+def _env_bool_from_value(value: Any, default: bool) -> bool:
+    """Parse a config/env-style boolean value without Python string truthiness."""
+    if value is None:
+        return default
+    if isinstance(value, bool):
+        return value
+    raw = str(value).strip().lower()
+    if raw in {"1", "true", "yes", "on"}:
+        return True
+    if raw in {"0", "false", "no", "off"}:
+        return False
+    return default
+
+
 def _env_nonnegative_float(name: str, default: float) -> float:
     """Read a non-negative float environment flag with a safe fallback."""
     try:
@@ -178,15 +200,17 @@ def _cleanup_discord_tts_listen_cache(
     *,
     ttl_days: float = _DISCORD_TTS_LISTEN_DEFAULT_TTL_DAYS,
     now: Optional[float] = None,
+    max_files: Optional[int] = None,
+    max_bytes: Optional[int] = None,
 ) -> int:
-    """Delete stale on-demand Discord TTS files and return the delete count.
+    """Delete stale or over-budget on-demand Discord TTS files.
 
-    The cleanup is scoped to ``tts_listen_*`` files in the dedicated Discord
-    listen-button cache so it cannot remove user-created audio or the general
-    TTS cache.
+    Cleanup is scoped to ``tts_listen_*`` audio files in the dedicated cache.
+    Symlink cache entries are unlinked rather than followed so a planted link
+    cannot cause unrelated files to be inspected or uploaded later.
     """
     cache_path = _Path(cache_dir) if cache_dir is not None else _discord_tts_listen_cache_dir()
-    if not cache_path.exists():
+    if not cache_path.exists() or not cache_path.is_dir():
         return 0
 
     try:
@@ -196,17 +220,93 @@ def _cleanup_discord_tts_listen_cache(
     cutoff = (time.time() if now is None else now) - ttl_seconds
 
     removed = 0
+    survivors: list[tuple[float, int, _Path]] = []
+
     for path in cache_path.iterdir():
-        if not path.is_file() or not path.name.startswith("tts_listen_"):
+        if not path.name.startswith("tts_listen_"):
             continue
-        if path.suffix.lower() not in {".mp3", ".ogg", ".wav", ".flac"}:
+        if path.suffix.lower() not in _DISCORD_TTS_LISTEN_AUDIO_SUFFIXES:
             continue
         try:
-            if path.stat().st_mtime < cutoff:
+            if path.is_symlink():
                 path.unlink()
                 removed += 1
+                continue
+            if not path.is_file():
+                continue
+            stat = path.stat()
+            if stat.st_mtime < cutoff:
+                path.unlink()
+                removed += 1
+                continue
+            survivors.append((stat.st_mtime, stat.st_size, path))
         except OSError:
-            logger.debug("Failed to remove stale Discord TTS cache file %s", path, exc_info=True)
+            logger.debug("Failed to inspect/remove Discord TTS cache file %s", path, exc_info=True)
+
+    survivors.sort(key=lambda item: item[0])
+
+    if max_files is not None:
+        try:
+            max_files_int = max(0, int(max_files))
+        except (TypeError, ValueError):
+            max_files_int = _DISCORD_TTS_LISTEN_DEFAULT_MAX_FILES
+        while len(survivors) > max_files_int:
+            _mtime, _size, path = survivors.pop(0)
+            try:
+                path.unlink()
+                removed += 1
+            except OSError:
+                logger.debug("Failed to evict Discord TTS cache file %s", path, exc_info=True)
+
+    if max_bytes is not None:
+        try:
+            max_bytes_int = max(0, int(max_bytes))
+        except (TypeError, ValueError):
+            max_bytes_int = _DISCORD_TTS_LISTEN_DEFAULT_MAX_BYTES
+        total = sum(size for _mtime, size, _path in survivors)
+        while survivors and total > max_bytes_int:
+            _mtime, size, path = survivors.pop(0)
+            try:
+                path.unlink()
+                removed += 1
+                total -= size
+            except OSError:
+                logger.debug("Failed to evict Discord TTS cache file %s", path, exc_info=True)
+                total -= size
+
+    return removed
+
+
+def _cleanup_discord_tts_listen_memory_cache(
+    *,
+    now: Optional[float] = None,
+    max_entries: Optional[int] = None,
+) -> int:
+    """Drop expired/over-budget lazy TTS text entries and their locks."""
+    current = time.time() if now is None else now
+    removed = 0
+
+    survivors: list[tuple[float, str]] = []
+    for entry_id, (_text, expires_at) in list(_DISCORD_TTS_LISTEN_TEXT_CACHE.items()):
+        if expires_at <= current:
+            _DISCORD_TTS_LISTEN_TEXT_CACHE.pop(entry_id, None)
+            _DISCORD_TTS_LISTEN_LOCKS.pop(entry_id, None)
+            removed += 1
+        else:
+            survivors.append((expires_at, entry_id))
+
+    if max_entries is not None:
+        try:
+            max_entries_int = max(0, int(max_entries))
+        except (TypeError, ValueError):
+            max_entries_int = _DISCORD_TTS_LISTEN_DEFAULT_MAX_FILES
+        survivors.sort(key=lambda item: item[0])
+        while len(survivors) > max_entries_int:
+            _expires_at, entry_id = survivors.pop(0)
+            _DISCORD_TTS_LISTEN_TEXT_CACHE.pop(entry_id, None)
+            _DISCORD_TTS_LISTEN_LOCKS.pop(entry_id, None)
+            removed += 1
+
     return removed
 
 
@@ -706,6 +806,7 @@ class DiscordAdapter(BasePlatformAdapter):
     # Discord message limits
     MAX_MESSAGE_LENGTH = 2000
     _SPLIT_THRESHOLD = 1900  # near the 2000-char split point
+    WANTS_STREAM_STATE_METADATA = True
 
     # Auto-disconnect from voice channel after this many seconds of inactivity
     VOICE_TIMEOUT = 300
@@ -760,6 +861,9 @@ class DiscordAdapter(BasePlatformAdapter):
         self._tts_listen_button_ttl_days: float = tts_button_cfg["ttl_days"]
         self._tts_listen_button_ephemeral: bool = tts_button_cfg["ephemeral"]
         self._tts_listen_button_label: str = tts_button_cfg["label"]
+        self._tts_listen_button_max_files: int = tts_button_cfg["max_files"]
+        self._tts_listen_button_max_bytes: int = tts_button_cfg["max_bytes"]
+        self._tts_listen_last_cleanup: float = 0.0
         # In-memory cache of the bot's last message ID per channel, used by
         # history backfill to skip the full scan on hot paths.  Falls back to
         # scanning channel.history() on cache miss (cold start / restart).
@@ -777,8 +881,10 @@ class DiscordAdapter(BasePlatformAdapter):
               label: "듣기"
 
         Environment variables are useful for quick experiments and override
-        the config: ``HERMES_DISCORD_TTS_LISTEN_BUTTON`` and
-        ``HERMES_DISCORD_TTS_LISTEN_TTL_DAYS``.
+        the config: ``HERMES_DISCORD_TTS_LISTEN_BUTTON``,
+        ``HERMES_DISCORD_TTS_LISTEN_TTL_DAYS``,
+        ``HERMES_DISCORD_TTS_LISTEN_EPHEMERAL``, and
+        ``HERMES_DISCORD_TTS_LISTEN_LABEL``.
         """
         raw = self.config.extra.get("tts_listen_button", {})
         if isinstance(raw, bool):
@@ -800,27 +906,75 @@ class DiscordAdapter(BasePlatformAdapter):
         except (TypeError, ValueError):
             ttl_days = _DISCORD_TTS_LISTEN_DEFAULT_TTL_DAYS
 
-        ephemeral = bool(raw_cfg.get("ephemeral", True))
-        label = str(raw_cfg.get("label") or "듣기")[:80]
+        ephemeral_default = _env_bool("HERMES_DISCORD_TTS_LISTEN_EPHEMERAL", True)
+        ephemeral = _env_bool(
+            "HERMES_DISCORD_TTS_LISTEN_EPHEMERAL",
+            _env_bool_from_value(raw_cfg.get("ephemeral"), ephemeral_default),
+        )
+        label = str(os.getenv("HERMES_DISCORD_TTS_LISTEN_LABEL", raw_cfg.get("label") or "듣기"))[:80]
+
+        max_files_raw = os.getenv("HERMES_DISCORD_TTS_LISTEN_MAX_FILES", raw_cfg.get("max_files", _DISCORD_TTS_LISTEN_DEFAULT_MAX_FILES))
+        try:
+            max_files = max(0, int(max_files_raw))
+        except (TypeError, ValueError):
+            max_files = _DISCORD_TTS_LISTEN_DEFAULT_MAX_FILES
+
+        max_bytes_raw = os.getenv("HERMES_DISCORD_TTS_LISTEN_MAX_BYTES", raw_cfg.get("max_bytes", _DISCORD_TTS_LISTEN_DEFAULT_MAX_BYTES))
+        try:
+            max_bytes = max(0, int(max_bytes_raw))
+        except (TypeError, ValueError):
+            max_bytes = _DISCORD_TTS_LISTEN_DEFAULT_MAX_BYTES
         return {
             "enabled": enabled,
             "ttl_days": ttl_days,
             "ephemeral": ephemeral,
             "label": label,
+            "max_files": max_files,
+            "max_bytes": max_bytes,
         }
 
-    def _build_tts_listen_view(self, text: str):
+    def _should_attach_tts_listen_view(self, metadata: Optional[Dict[str, Any]] = None, *, finalize: bool = False) -> bool:
+        """Return whether this delivery is an appropriate final answer for TTS."""
+        if not self._tts_listen_button_enabled:
+            return False
+        if metadata and metadata.get("streaming"):
+            return bool(metadata.get("final"))
+        return True
+
+    def _maybe_cleanup_tts_listen_cache(self) -> None:
+        now = time.monotonic()
+        if now - self._tts_listen_last_cleanup < _DISCORD_TTS_LISTEN_CLEANUP_INTERVAL_SECONDS:
+            return
+        self._tts_listen_last_cleanup = now
+        try:
+            _cleanup_discord_tts_listen_cache(
+                ttl_days=self._tts_listen_button_ttl_days,
+                max_files=self._tts_listen_button_max_files,
+                max_bytes=self._tts_listen_button_max_bytes,
+            )
+            _cleanup_discord_tts_listen_memory_cache(
+                max_entries=self._tts_listen_button_max_files,
+            )
+        except Exception:
+            logger.debug("Discord TTS listen cache cleanup failed", exc_info=True)
+
+    def _build_tts_listen_view(self, text: str, *, metadata: Optional[Dict[str, Any]] = None, finalize: bool = False):
         """Return a Discord view with a lazy TTS button, or None when disabled."""
-        if not self._tts_listen_button_enabled or not text or not text.strip():
+        if not self._should_attach_tts_listen_view(metadata, finalize=finalize):
+            return None
+        if not text or not text.strip():
             return None
         view_cls = globals().get("DiscordTTSListenView")
         if view_cls is None:
             return None
+        self._maybe_cleanup_tts_listen_cache()
         return view_cls(
             text=text,
             allowed_user_ids=self._allowed_user_ids,
             allowed_role_ids=self._allowed_role_ids,
             ttl_days=self._tts_listen_button_ttl_days,
+            max_files=self._tts_listen_button_max_files,
+            max_bytes=self._tts_listen_button_max_bytes,
             ephemeral=self._tts_listen_button_ephemeral,
             label=self._tts_listen_button_label,
         )
@@ -1596,6 +1750,8 @@ class DiscordAdapter(BasePlatformAdapter):
         if not self._client:
             return SendResult(success=False, error="Not connected")
 
+        tts_listen_view = None
+        tts_listen_view_attached = False
         try:
             # Determine target channel: thread_id in metadata takes precedence.
             thread_id = None
@@ -1627,7 +1783,7 @@ class DiscordAdapter(BasePlatformAdapter):
 
             message_ids = []
             reference = None
-            tts_listen_view = self._build_tts_listen_view(content)
+            tts_listen_view = self._build_tts_listen_view(content, metadata=metadata)
 
             if reply_to and self._reply_to_mode != "off":
                 try:
@@ -1652,6 +1808,8 @@ class DiscordAdapter(BasePlatformAdapter):
                     if i == 0 and tts_listen_view is not None:
                         send_kwargs["view"] = tts_listen_view
                     msg = await channel.send(**send_kwargs)
+                    if i == 0 and tts_listen_view is not None:
+                        tts_listen_view_attached = True
                 except Exception as e:
                     err_text = str(e)
                     if (
@@ -1677,6 +1835,8 @@ class DiscordAdapter(BasePlatformAdapter):
                         if i == 0 and tts_listen_view is not None:
                             retry_kwargs["view"] = tts_listen_view
                         msg = await channel.send(**retry_kwargs)
+                        if i == 0 and tts_listen_view is not None:
+                            tts_listen_view_attached = True
                     else:
                         raise
                 message_ids.append(str(msg.id))
@@ -1694,6 +1854,10 @@ class DiscordAdapter(BasePlatformAdapter):
             )
 
         except Exception as e:  # pragma: no cover - defensive logging
+            if tts_listen_view is not None and not tts_listen_view_attached:
+                release = getattr(tts_listen_view, "release", None)
+                if callable(release):
+                    release()
             logger.error("[%s] Failed to send Discord message: %s", self.name, e, exc_info=True)
             return SendResult(success=False, error=str(e))
 
@@ -1820,10 +1984,12 @@ class DiscordAdapter(BasePlatformAdapter):
         content: str,
         *,
         finalize: bool = False,
+        metadata: Optional[Dict[str, Any]] = None,
     ) -> SendResult:
         """Edit a previously sent Discord message."""
         if not self._client:
             return SendResult(success=False, error="Not connected")
+        tts_listen_view = None
         try:
             channel = self._client.get_channel(int(chat_id))
             if not channel:
@@ -1832,9 +1998,21 @@ class DiscordAdapter(BasePlatformAdapter):
             formatted = self.format_message(content)
             if len(formatted) > self.MAX_MESSAGE_LENGTH:
                 formatted = formatted[:self.MAX_MESSAGE_LENGTH - 3] + "..."
-            await msg.edit(content=formatted)
+            edit_kwargs: Dict[str, Any] = {"content": formatted}
+            tts_listen_view = (
+                self._build_tts_listen_view(content, metadata=metadata, finalize=finalize)
+                if finalize
+                else None
+            )
+            if tts_listen_view is not None:
+                edit_kwargs["view"] = tts_listen_view
+            await msg.edit(**edit_kwargs)
             return SendResult(success=True, message_id=message_id)
         except Exception as e:  # pragma: no cover - defensive logging
+            if tts_listen_view is not None:
+                release = getattr(tts_listen_view, "release", None)
+                if callable(release):
+                    release()
             logger.error("[%s] Failed to edit Discord message %s: %s", self.name, message_id, e, exc_info=True)
             return SendResult(success=False, error=str(e))
 
@@ -5505,11 +5683,12 @@ def _define_discord_view_classes() -> None:
     global ExecApprovalView, SlashConfirmView, UpdatePromptView, ModelPickerView, ClarifyChoiceView, DiscordTTSListenView
 
     class DiscordTTSListenView(discord.ui.View):
-        """Lazy, per-message TTS button for Discord replies.
+        """Lazy, bounded-lifetime TTS button for Discord replies.
 
-        The response text is stored in memory with the view. TTS is generated
-        only after a user clicks the button, then cached as MP3 in a dedicated
-        Hermes cache directory for a short TTL.
+        The answer text is kept in an expiring module-level cache keyed by a
+        random entry id instead of being stored directly on the long-lived view
+        object. Audio is generated on first click and cached under a dedicated
+        cache stem for the view timeout / disk TTL.
         """
 
         def __init__(
@@ -5518,28 +5697,58 @@ def _define_discord_view_classes() -> None:
             allowed_user_ids: set,
             allowed_role_ids: Optional[set] = None,
             ttl_days: float = _DISCORD_TTS_LISTEN_DEFAULT_TTL_DAYS,
+            max_files: int = _DISCORD_TTS_LISTEN_DEFAULT_MAX_FILES,
+            max_bytes: int = _DISCORD_TTS_LISTEN_DEFAULT_MAX_BYTES,
             ephemeral: bool = True,
             label: str = "듣기",
         ):
-            super().__init__(timeout=None)
-            self.text = text
+            super().__init__(timeout=_DISCORD_TTS_LISTEN_VIEW_TIMEOUT_SECONDS)
+            self.entry_id = secrets.token_urlsafe(18)
             self.allowed_user_ids = allowed_user_ids
             self.allowed_role_ids = allowed_role_ids or set()
             self.ttl_days = ttl_days
+            self.max_files = max_files
+            self.max_bytes = max_bytes
             self.ephemeral = ephemeral
             self.label = label or "듣기"
-            digest = hashlib.sha256(text.encode("utf-8", errors="ignore")).hexdigest()[:24]
-            self.cache_stem = f"tts_listen_{digest}"
+            self.cache_stem = f"tts_listen_{self.entry_id}"
             self.cache_path = _discord_tts_listen_cache_dir() / f"{self.cache_stem}.mp3"
+            self._lock = _DISCORD_TTS_LISTEN_LOCKS.setdefault(self.entry_id, asyncio.Lock())
+            expires_at = time.time() + _DISCORD_TTS_LISTEN_VIEW_TIMEOUT_SECONDS
+            _DISCORD_TTS_LISTEN_TEXT_CACHE[self.entry_id] = (text, expires_at)
 
             button = discord.ui.Button(
                 label=self.label,
                 emoji="🔊",
                 style=discord.ButtonStyle.secondary,
-                custom_id=f"hermes:tts_listen:{digest}",
+                custom_id=f"hermes:tts_listen:{self.entry_id}",
             )
             button.callback = self._handle_click
             self.add_item(button)
+
+        @property
+        def text(self) -> str:
+            entry = _DISCORD_TTS_LISTEN_TEXT_CACHE.get(self.entry_id)
+            if entry is None:
+                return ""
+            text, expires_at = entry
+            if expires_at < time.time():
+                _DISCORD_TTS_LISTEN_TEXT_CACHE.pop(self.entry_id, None)
+                _DISCORD_TTS_LISTEN_LOCKS.pop(self.entry_id, None)
+                return ""
+            return text
+
+        def release(self) -> None:
+            _DISCORD_TTS_LISTEN_TEXT_CACHE.pop(self.entry_id, None)
+            _DISCORD_TTS_LISTEN_LOCKS.pop(self.entry_id, None)
+
+        async def on_timeout(self) -> None:
+            self.release()
+            for child in self.children:
+                try:
+                    child.disabled = True
+                except Exception:
+                    pass
 
         def _check_auth(self, interaction: discord.Interaction) -> bool:
             return _component_check_auth(
@@ -5559,9 +5768,22 @@ def _define_discord_view_classes() -> None:
         async def _send_ephemeral_error(self, interaction: discord.Interaction, message: str) -> None:
             response = getattr(interaction, "response", None)
             send_message = getattr(response, "send_message", None)
-            if callable(send_message):
-                await send_message(message, ephemeral=True)
-                return
+            is_done = getattr(response, "is_done", None)
+            response_done = False
+            if callable(is_done):
+                try:
+                    response_done = bool(is_done())
+                except Exception:
+                    response_done = False
+            elif isinstance(is_done, bool):
+                response_done = is_done
+
+            if callable(send_message) and not response_done:
+                try:
+                    await send_message(message, ephemeral=True)
+                    return
+                except Exception:
+                    logger.debug("Discord TTS error initial response failed; using followup", exc_info=True)
             followup = getattr(interaction, "followup", None)
             followup_send = getattr(followup, "send", None)
             if callable(followup_send):
@@ -5576,7 +5798,8 @@ def _define_discord_view_classes() -> None:
 
             try:
                 audio_path = await self._get_or_generate_audio_path()
-                file = discord.File(str(audio_path), filename=audio_path.name)
+                filename = f"hermes-tts{audio_path.suffix.lower()}"
+                file = discord.File(str(audio_path), filename=filename)
                 await interaction.followup.send(
                     content="🔊 음성으로 듣기",
                     file=file,
@@ -5586,53 +5809,105 @@ def _define_discord_view_classes() -> None:
                 logger.error("Discord TTS listen button failed: %s", exc, exc_info=True)
                 await self._send_ephemeral_error(interaction, f"TTS 생성 실패: {exc}")
 
+        def _validated_cache_path(self, path: _Path) -> Optional[_Path]:
+            try:
+                cache_dir = self.cache_path.parent.resolve(strict=True)
+                candidate = path.expanduser()
+                if candidate.is_symlink():
+                    return None
+                resolved = candidate.resolve(strict=True)
+                if cache_dir not in (resolved.parent, *resolved.parents):
+                    return None
+                if resolved.parent != cache_dir:
+                    return None
+                if resolved.name != f"{self.cache_stem}{resolved.suffix.lower()}":
+                    return None
+                if resolved.suffix.lower() not in _DISCORD_TTS_LISTEN_AUDIO_SUFFIXES:
+                    return None
+                if not resolved.is_file() or resolved.stat().st_size <= 0:
+                    return None
+                return resolved
+            except OSError:
+                return None
+
+        def _validate_provider_output_path(self, path: _Path) -> _Path:
+            try:
+                cache_dir = self.cache_path.parent.resolve(strict=True)
+                candidate = path.expanduser()
+                if candidate.is_symlink():
+                    raise RuntimeError("TTS output path is a symlink")
+                resolved = candidate.resolve(strict=True)
+            except OSError as exc:
+                raise RuntimeError(f"TTS output file missing: {path}") from exc
+            if cache_dir not in (resolved.parent, *resolved.parents) or resolved.parent != cache_dir:
+                raise RuntimeError(f"TTS output path outside Discord TTS cache: {resolved}")
+            if resolved.suffix.lower() not in _DISCORD_TTS_LISTEN_AUDIO_SUFFIXES:
+                raise RuntimeError(f"TTS output has unsupported audio suffix: {resolved.suffix}")
+            if not resolved.is_file() or resolved.stat().st_size <= 0:
+                raise RuntimeError(f"TTS output file missing: {resolved}")
+            return resolved
+
         def _find_cached_audio_path(self) -> Optional[_Path]:
             cache_dir = self.cache_path.parent
-            if not cache_dir.exists():
+            if not cache_dir.exists() or not cache_dir.is_dir():
                 return None
             candidates = []
-            for suffix in (".mp3", ".ogg", ".wav", ".flac"):
+            for suffix in sorted(_DISCORD_TTS_LISTEN_AUDIO_SUFFIXES):
                 candidate = cache_dir / f"{self.cache_stem}{suffix}"
-                try:
-                    if candidate.exists() and candidate.stat().st_size > 0:
-                        candidates.append(candidate)
-                except OSError:
-                    continue
+                validated = self._validated_cache_path(candidate)
+                if validated is not None:
+                    candidates.append(validated)
             if not candidates:
                 return None
-            # Prefer the newest in case the configured provider changed formats.
             return max(candidates, key=lambda path: path.stat().st_mtime)
 
         async def _get_or_generate_audio_path(self) -> _Path:
             cache_dir = self.cache_path.parent
             cache_dir.mkdir(parents=True, exist_ok=True)
-            _cleanup_discord_tts_listen_cache(cache_dir, ttl_days=self.ttl_days)
+            _cleanup_discord_tts_listen_cache(
+                cache_dir,
+                ttl_days=self.ttl_days,
+                max_files=self.max_files,
+                max_bytes=self.max_bytes,
+            )
 
-            cached = self._find_cached_audio_path()
-            if cached is not None:
+            async with self._lock:
+                cached = self._find_cached_audio_path()
+                if cached is not None:
+                    return cached
+
+                text = self.text
+                if not text:
+                    raise RuntimeError("TTS text expired")
+
+                temp_token = secrets.token_hex(8)
+                output_path = cache_dir / f"{self.cache_stem}.tmp_{temp_token}.mp3"
+                loop = asyncio.get_running_loop()
+
+                def _generate() -> str:
+                    from tools.tts_tool import text_to_speech_tool
+
+                    return text_to_speech_tool(text, output_path=str(output_path))
+
+                raw = await loop.run_in_executor(None, _generate)
+                try:
+                    data = json.loads(raw)
+                except json.JSONDecodeError as exc:
+                    raise RuntimeError(f"TTS returned invalid JSON: {raw[:120]}") from exc
+
+                if not data.get("success"):
+                    raise RuntimeError(str(data.get("error") or "unknown TTS error"))
+
+                result_path = self._validate_provider_output_path(
+                    _Path(data.get("file_path") or output_path)
+                )
+                final_path = cache_dir / f"{self.cache_stem}{result_path.suffix.lower()}"
+                if result_path != final_path:
+                    os.replace(result_path, final_path)
+                cached = self._validated_cache_path(final_path)
+                if cached is None:
+                    raise RuntimeError(f"TTS output file missing: {final_path}")
                 return cached
-
-            output_path = str(self.cache_path)
-            loop = asyncio.get_running_loop()
-
-            def _generate() -> str:
-                from tools.tts_tool import text_to_speech_tool
-
-                return text_to_speech_tool(self.text, output_path=output_path)
-
-            raw = await loop.run_in_executor(None, _generate)
-            try:
-                data = json.loads(raw)
-            except json.JSONDecodeError as exc:
-                raise RuntimeError(f"TTS returned invalid JSON: {raw[:120]}") from exc
-
-            if not data.get("success"):
-                raise RuntimeError(str(data.get("error") or "unknown TTS error"))
-
-            result_path = _Path(data.get("file_path") or output_path).expanduser()
-            if not result_path.exists() or result_path.stat().st_size == 0:
-                raise RuntimeError(f"TTS output file missing: {result_path}")
-            return result_path
 
     class ExecApprovalView(discord.ui.View):
         """
@@ -6840,6 +7115,14 @@ def _apply_yaml_config(yaml_cfg: dict, discord_cfg: dict) -> dict | None:
                 os.environ["HERMES_DISCORD_TTS_LISTEN_BUTTON"] = str(tts_listen_cfg["enabled"]).lower()
             if "ttl_days" in tts_listen_cfg and not os.getenv("HERMES_DISCORD_TTS_LISTEN_TTL_DAYS"):
                 os.environ["HERMES_DISCORD_TTS_LISTEN_TTL_DAYS"] = str(tts_listen_cfg["ttl_days"])
+            if "ephemeral" in tts_listen_cfg and not os.getenv("HERMES_DISCORD_TTS_LISTEN_EPHEMERAL"):
+                os.environ["HERMES_DISCORD_TTS_LISTEN_EPHEMERAL"] = str(tts_listen_cfg["ephemeral"]).lower()
+            if "label" in tts_listen_cfg and not os.getenv("HERMES_DISCORD_TTS_LISTEN_LABEL"):
+                os.environ["HERMES_DISCORD_TTS_LISTEN_LABEL"] = str(tts_listen_cfg["label"])
+            if "max_files" in tts_listen_cfg and not os.getenv("HERMES_DISCORD_TTS_LISTEN_MAX_FILES"):
+                os.environ["HERMES_DISCORD_TTS_LISTEN_MAX_FILES"] = str(tts_listen_cfg["max_files"])
+            if "max_bytes" in tts_listen_cfg and not os.getenv("HERMES_DISCORD_TTS_LISTEN_MAX_BYTES"):
+                os.environ["HERMES_DISCORD_TTS_LISTEN_MAX_BYTES"] = str(tts_listen_cfg["max_bytes"])
         elif not os.getenv("HERMES_DISCORD_TTS_LISTEN_BUTTON"):
             os.environ["HERMES_DISCORD_TTS_LISTEN_BUTTON"] = str(tts_listen_cfg).lower()
     _discord_rtm = (

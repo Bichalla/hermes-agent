@@ -1,0 +1,7 @@
+# Graphify hidden-path allowlist for Hermes Agent
+# Keep SSOT documents in project-local hidden operating folders while indexing only curated markdown.
+# Sensitive-looking files are still hard-skipped by Graphify even when allowlisted.
+
+.hermes/plans/**/*.md
+.hermes/reports/**/*.md
+.hermes/reviews/**/*.md

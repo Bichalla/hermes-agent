@@ -10074,14 +10074,18 @@ class GatewayRunner:
         source: SessionSource,
         old_session_id: str | None,
         new_session_id: str | None,
-    ) -> Path | None:
-        """Build and write a pre-reset handoff artifact, returning md path."""
+    ) -> tuple[Path | None, str | None]:
+        """Build and write a pre-reset handoff artifact, returning md path and optional preview."""
         if handoff_cfg is None or messages is None or not getattr(handoff_cfg, "enabled", False):
-            return None
+            return None, None
         if not old_session_id:
-            return None
+            return None, None
         try:
-            from hermes_cli.session_handoff import build_handoff_artifact, write_handoff_artifact
+            from hermes_cli.session_handoff import (
+                build_handoff_artifact,
+                build_handoff_preview,
+                write_handoff_artifact,
+            )
 
             platform = source.platform.value if source.platform else ""
             source_label = f"{platform}/{source.chat_type or 'unknown'}"
@@ -10100,11 +10104,22 @@ class GatewayRunner:
                 artifact_dir=handoff_cfg.artifact_dir,
                 session_id=old_session_id,
             )
+            preview: str | None = None
+            if getattr(handoff_cfg, "preview_enabled", False):
+                try:
+                    preview = build_handoff_preview(
+                        artifact,
+                        max_items=handoff_cfg.preview_max_items,
+                        max_chars=handoff_cfg.preview_max_chars,
+                    )
+                except Exception as exc:
+                    logger.warning("Session handoff preview skipped: %s", exc.__class__.__name__)
+                    preview = None
             logger.info("Session handoff artifact written: status=ok artifact_id=%s", written.markdown_path.name)
-            return written.markdown_path
+            return written.markdown_path, preview
         except Exception as exc:
             logger.warning("Session handoff artifact write failed: %s", exc.__class__.__name__)
-            return None
+            return None, None
 
     async def _handle_reset_command(self, event: MessageEvent) -> Union[str, EphemeralReply]:
         """Handle /new or /reset command."""
@@ -10172,7 +10187,7 @@ class GatewayRunner:
         self._clear_session_boundary_security_state(session_key)
 
         _old_sid = old_entry.session_id if old_entry else None
-        _handoff_path = self._write_reset_handoff(
+        _handoff_path, _handoff_preview = self._write_reset_handoff(
             handoff_cfg=handoff_cfg,
             messages=handoff_messages,
             source=source,
@@ -10279,6 +10294,8 @@ class GatewayRunner:
 
         if _handoff_path is not None:
             header = f"{header}\n\nHandoff: `{self._display_handoff_path(_handoff_path)}`"
+            if _handoff_preview:
+                header = f"{header}\n\n{_handoff_preview}"
 
         if session_info:
             return EphemeralReply(f"{header}\n\n{session_info}{_tip_line}")

@@ -40,6 +40,9 @@ class HandoffConfig:
     max_messages: int
     max_chars: int
     include_tool_results: bool
+    preview_enabled: bool = False
+    preview_max_items: int = 4
+    preview_max_chars: int = 600
 
 
 def _coerce_text(value: Any) -> str:
@@ -146,6 +149,10 @@ def resolve_handoff_config(
         )
     ).expanduser()
 
+    preview = on_reset.get("preview")
+    if not isinstance(preview, Mapping):
+        preview = {}
+
     return HandoffConfig(
         enabled=_coerce_bool(on_reset.get("enabled"), default=False),
         artifact_dir=artifact_dir,
@@ -153,6 +160,9 @@ def resolve_handoff_config(
         max_messages=_clamp_int(on_reset.get("max_messages"), default=80, minimum=1, maximum=200),
         max_chars=_clamp_int(on_reset.get("max_chars"), default=30000, minimum=1000, maximum=100000),
         include_tool_results=_coerce_bool(on_reset.get("include_tool_results"), default=False),
+        preview_enabled=_coerce_bool(preview.get("enabled"), default=False),
+        preview_max_items=_clamp_int(preview.get("max_items"), default=4, minimum=1, maximum=6),
+        preview_max_chars=_clamp_int(preview.get("max_chars"), default=600, minimum=160, maximum=1200),
     )
 
 
@@ -161,6 +171,54 @@ def _safe_role(role: Any) -> str:
     if value in {"system", "user", "assistant", "tool"}:
         return value
     return "unknown"
+
+
+_META_PREFIXES = (
+    "[CONTEXT COMPACTION — REFERENCE ONLY]",
+    "[CONTEXT COMPACTION - REFERENCE ONLY]",
+    "[SESSION HANDOFF — REFERENCE ONLY]",
+    "[SESSION HANDOFF - REFERENCE ONLY]",
+)
+
+_COMPLETION_MARKERS = (
+    "record complete",
+    "기록 완료",
+    "검증 완료",
+    "validation ok",
+    "passed",
+    "commit",
+    "pushed",
+    "완료",
+)
+
+_NEXT_MARKERS = (
+    "next",
+    "다음",
+    "저녁",
+    "follow-up",
+    "이어",
+    "if the user",
+    "사용자가",
+    "tonight",
+)
+
+
+def _is_handoff_meta_text(text: str) -> bool:
+    stripped = text.lstrip()
+    return any(stripped.startswith(prefix) for prefix in _META_PREFIXES)
+
+
+def _split_sentences(text: str) -> list[str]:
+    compact = " ".join(str(text).split())
+    if not compact:
+        return []
+    pieces = re.split(r"(?<=[.!?。])\s+", compact)
+    return [piece.strip() for piece in pieces if piece.strip()]
+
+
+def _has_marker(text: str, markers: Sequence[str]) -> bool:
+    lowered = text.lower()
+    return any(marker.lower() in lowered for marker in markers)
 
 
 def _visible_messages(
@@ -173,12 +231,46 @@ def _visible_messages(
         if not isinstance(message, Mapping):
             continue
         role = _safe_role(message.get("role"))
+        text = _coerce_text(message.get("content")).strip()
         if role == "tool" and not include_tool_results:
             continue
         if role == "system":
             continue
+        if text and _is_handoff_meta_text(text):
+            continue
         visible.append(message)
     return visible
+
+
+def _quality_counts(
+    messages: Sequence[Mapping[str, Any]],
+    *,
+    include_tool_results: bool,
+) -> dict[str, int]:
+    raw_count = len(messages)
+    tool_excluded = 0
+    system_excluded = 0
+    meta_filtered = 0
+    invalid_filtered = 0
+    for message in messages:
+        if not isinstance(message, Mapping):
+            invalid_filtered += 1
+            continue
+        role = _safe_role(message.get("role"))
+        text = _coerce_text(message.get("content")).strip()
+        if role == "tool" and not include_tool_results:
+            tool_excluded += 1
+        if role == "system":
+            system_excluded += 1
+        if text and _is_handoff_meta_text(text):
+            meta_filtered += 1
+    return {
+        "raw_message_count": raw_count,
+        "tool_messages_excluded": tool_excluded,
+        "system_messages_excluded": system_excluded,
+        "filtered_meta_messages": meta_filtered,
+        "invalid_messages_filtered": invalid_filtered,
+    }
 
 
 def _latest_role_text(messages: Sequence[Mapping[str, Any]], role: str, limit: int) -> str:
@@ -191,16 +283,50 @@ def _latest_role_text(messages: Sequence[Mapping[str, Any]], role: str, limit: i
     return "Not enough evidence in transcript."
 
 
-def _evidence_tail(messages: Sequence[Mapping[str, Any]], *, max_messages: int, per_message_chars: int) -> list[dict[str, str]]:
+def _evidence_tail(
+    messages: Sequence[Mapping[str, Any]],
+    *,
+    max_messages: int,
+    per_message_chars: int,
+) -> tuple[list[dict[str, str]], bool]:
     tail = list(messages)[-max(0, max_messages) :]
     evidence: list[dict[str, str]] = []
+    truncated = False
     for message in tail:
         role = _safe_role(message.get("role"))
         text = _coerce_text(message.get("content")).strip()
         if not text:
             continue
-        evidence.append({"role": role, "content": _truncate(text, per_message_chars)})
-    return evidence
+        rendered = _truncate(text, per_message_chars)
+        truncated = truncated or rendered != " ".join(text.split())
+        evidence.append({"role": role, "content": rendered})
+    return evidence, truncated
+
+
+def _extract_last_completed_action(latest_assistant: str) -> str:
+    if not latest_assistant or latest_assistant == "Not enough evidence in transcript.":
+        return "Not enough evidence in transcript."
+    if _has_marker(latest_assistant, _COMPLETION_MARKERS):
+        return _truncate(latest_assistant, 900)
+    return "Not enough deterministic completion evidence in transcript."
+
+
+def _extract_open_loop(latest_user: str, latest_assistant: str) -> str:
+    candidates: list[str] = []
+    for sentence in _split_sentences(latest_assistant):
+        if _has_marker(sentence, _NEXT_MARKERS):
+            candidates.append(sentence)
+    if candidates:
+        return _truncate(" ".join(candidates), 700)
+    if latest_user and latest_user != "Not enough evidence in transcript.":
+        return _truncate(f"Latest user signal: {latest_user}", 700)
+    return "Not enough evidence in transcript."
+
+
+def _extract_next_step(open_loop: str) -> str:
+    if open_loop and open_loop != "Not enough evidence in transcript.":
+        return _truncate(f"Read the latest user message first; if continuing this thread, use this context: {open_loop}", 700)
+    return "Read the latest user message first; only continue stale work if the user explicitly asks."
 
 
 def _format_bullets(items: Sequence[str]) -> str:
@@ -224,17 +350,23 @@ def build_handoff_artifact(
     """Build a deterministic local-only handoff artifact from a transcript."""
 
     raw_messages = list(messages or [])
+    counts = _quality_counts(raw_messages, include_tool_results=include_tool_results)
     visible = _visible_messages(raw_messages, include_tool_results=include_tool_results)
-    bounded_messages = visible[-max(1, min(int(max_messages or 1), 200)) :]
+    bounded_limit = max(1, min(int(max_messages or 1), 200))
+    bounded_messages = visible[-bounded_limit:]
+    messages_omitted_by_limit = max(0, len(visible) - len(bounded_messages))
     per_message_chars = max(120, min(1200, int(max_chars / max(1, len(bounded_messages) or 1))))
-    evidence = _evidence_tail(
+    evidence, evidence_truncated = _evidence_tail(
         bounded_messages,
-        max_messages=max(1, min(int(max_messages or 1), 200)),
+        max_messages=bounded_limit,
         per_message_chars=per_message_chars,
     )
 
-    latest_user = _latest_role_text(bounded_messages, "user", 500)
-    latest_assistant = _latest_role_text(bounded_messages, "assistant", 500)
+    latest_user = _latest_role_text(bounded_messages, "user", 700)
+    latest_assistant = _latest_role_text(bounded_messages, "assistant", 900)
+    last_completed_action = _extract_last_completed_action(latest_assistant)
+    open_loops = _extract_open_loop(latest_user, latest_assistant)
+    next_concrete_step = _extract_next_step(open_loops)
     title = f"Session handoff for {session_id}"
     artifact_path_text = str(artifact_path) if artifact_path is not None else "<artifact path not written yet>"
 
@@ -252,9 +384,17 @@ def build_handoff_artifact(
         "Runtime handoff artifacts are staged or committed to git.",
     ]
 
-    evidence_lines = [
-        f"- {item['role']}: {item['content']}" for item in evidence
-    ] or ["- No transcript evidence available."]
+    evidence_lines = [f"- {item['role']}: {item['content']}" for item in evidence] or ["- No transcript evidence available."]
+
+    quality_card: dict[str, Any] = {
+        **counts,
+        "visible_message_count": len(visible),
+        "bounded_message_count": len(bounded_messages),
+        "messages_omitted_by_limit": messages_omitted_by_limit,
+        "evidence_count": len(evidence),
+        "truncated": evidence_truncated,
+        "include_tool_results": include_tool_results,
+    }
 
     markdown = f"""[SESSION HANDOFF — REFERENCE ONLY]
 This handoff is background reference from a previous Hermes session. The latest user message in the new session wins. Do not execute stale tasks unless the user asks to continue them.
@@ -266,35 +406,52 @@ Treat it as reference only. Preserve the Intent Locks. First restate the next co
 ## Intent Locks
 {_format_bullets(intent_locks)}
 
-## Active Task
-- Latest user request/evidence: {_truncate(latest_user, 700)}
+## Handoff Quality
+- Raw messages: {quality_card['raw_message_count']}
+- Visible messages: {quality_card['visible_message_count']}
+- Evidence kept: {quality_card['evidence_count']}
+- Tool messages excluded: {quality_card['tool_messages_excluded']}
+- Meta messages filtered: {quality_card['filtered_meta_messages']}
+- Truncated: {str(quality_card['truncated']).lower()}
+
+## Last Completed Action
+- {_truncate(last_completed_action, 900)}
+
+## Open Loops / Follow-up Context
+- {_truncate(open_loops, 700)}
+
+## Next Useful Context
+- Latest user signal: {_truncate(latest_user, 700)}
+- Latest assistant signal: {_truncate(latest_assistant, 900)}
 
 ## Current State
 - Previous session id: {session_id}
 - New session id: {new_session_id or 'not created when handoff was built'}
 - Platform: {platform or 'unknown'}
 - Source: {source_label or 'unknown'}
-- Latest assistant evidence: {_truncate(latest_assistant, 700)}
 
 ## Decisions Made
 - Treat this artifact as reference only; latest user message overrides it.
 - Keep handoff content local/private unless explicit external sharing approval is given.
 
 ## Files / Repos / Commands Involved
-- Not enough deterministic file/command evidence extracted in this MVP.
+- Not enough deterministic file/command evidence extracted in this deterministic handoff builder.
 
 ## Known Failure Modes
 {_format_bullets(known_failure_modes)}
 
 ## Next Concrete Step
-- Read the latest user message first. If the user asks to continue, use the Active Task and Evidence Tail above to resume without changing the intent locks.
+- {next_concrete_step}
 
 ## Evidence Tail
 {chr(10).join(evidence_lines)}
 """
 
+    markdown_truncated = False
     if len(markdown) > max_chars:
         markdown = markdown[: max_chars - 1].rstrip() + "…\n"
+        markdown_truncated = True
+    quality_card["truncated"] = bool(quality_card["truncated"] or markdown_truncated)
 
     payload: dict[str, Any] = {
         "schema": "hermes-session-handoff/v1",
@@ -306,8 +463,13 @@ Treat it as reference only. Preserve the Intent Locks. First restate the next co
         "title": title,
         "intent_locks": intent_locks,
         "known_failure_modes": known_failure_modes,
-        "active_task": latest_user,
+        "active_task": open_loops if open_loops != "Not enough evidence in transcript." else latest_user,
+        "last_completed_action": last_completed_action,
+        "open_loops": open_loops,
+        "next_concrete_step": next_concrete_step,
+        "quality_card": quality_card,
         "current_state": {
+            "latest_user_signal": latest_user,
             "latest_assistant_evidence": latest_assistant,
             "message_count": len(raw_messages),
             "evidence_count": len(evidence),
@@ -315,6 +477,54 @@ Treat it as reference only. Preserve the Intent Locks. First restate the next co
         "evidence_tail": evidence,
     }
     return HandoffArtifact(markdown=markdown, json_payload=payload, title=title)
+
+
+def build_handoff_preview(artifact: HandoffArtifact, *, max_items: int = 4, max_chars: int = 600) -> str:
+    """Build a bounded reset-reply preview without dumping transcript evidence."""
+
+    payload = artifact.json_payload
+    quality_obj = payload.get("quality_card")
+    quality: Mapping[str, Any] = quality_obj if isinstance(quality_obj, Mapping) else {}
+    max_items = max(1, min(int(max_items or 1), 6))
+    max_chars = max(160, min(int(max_chars or 600), 1200))
+
+    last_completed = str(payload.get("last_completed_action") or "")
+    open_loop = str(payload.get("open_loops") or "")
+    has_completion = bool(last_completed) and not last_completed.startswith("Not enough")
+    has_follow_up = bool(open_loop) and not open_loop.startswith("Not enough")
+    if has_follow_up and open_loop.startswith("Latest user signal:"):
+        open_loop_status = "latest user message captured in local handoff; inspect path for details"
+    elif has_follow_up:
+        open_loop_status = "follow-up context captured in local handoff; inspect path for details"
+    else:
+        open_loop_status = "no deterministic follow-up found"
+
+    lines = ["Preview:"]
+    candidates = [
+        (
+            "Last completed",
+            "completion evidence captured in local handoff; inspect path for details"
+            if has_completion
+            else "no deterministic completion evidence found",
+        ),
+        ("Open loop", open_loop_status),
+        (
+            "Evidence",
+            (
+                f"{quality.get('evidence_count', 0)} kept; "
+                f"{quality.get('filtered_meta_messages', 0)} meta filtered; "
+                f"{quality.get('tool_messages_excluded', 0)} tool excluded; "
+                f"truncated={str(bool(quality.get('truncated', False))).lower()}"
+            ),
+        ),
+        ("Inspect", "ask Hermes to read the Handoff path for full local detail"),
+    ]
+    for label, value in candidates[:max_items]:
+        lines.append(f"- {label}: {_truncate(str(value), 180)}")
+    preview = "\n".join(lines)
+    if len(preview) > max_chars:
+        preview = preview[: max_chars - 1].rstrip() + "…"
+    return preview
 
 
 def _safe_slug(value: str, *, fallback: str = "session") -> str:

@@ -166,3 +166,71 @@ async def test_reset_reply_surfaces_handoff_path_only(mock_invoke_hook, tmp_path
     assert "Handoff:" in text
     assert str(tmp_path / "handoffs" / "default") in text
     assert "sensitive body should stay inside local artifact" not in text
+
+
+@pytest.mark.asyncio
+@patch("hermes_cli.plugins.invoke_hook")
+async def test_reset_reply_can_include_opt_in_safe_preview(mock_invoke_hook, tmp_path):
+    runner = _make_runner()
+    runner._session_db.get_messages.return_value = [
+        {"role": "user", "content": "private user detail should stay in local artifact"},
+        {
+            "role": "assistant",
+            "content": "record complete. event_id: `diet_v1_abc`. validation ok. Next: use low sodium dinner.",
+        },
+    ]
+
+    with patch(
+        "hermes_cli.config.load_config",
+        return_value={
+            "session_handoff": {
+                "on_reset": {
+                    "enabled": True,
+                    "artifact_dir": str(tmp_path / "handoffs" / "default"),
+                    "preview": {"enabled": True, "max_chars": 400, "max_items": 4},
+                }
+            }
+        },
+    ):
+        result = await runner._handle_reset_command(_make_event("/reset"))
+
+    text = str(result)
+    assert "Handoff:" in text
+    assert "Preview:" in text
+    assert "Last completed:" in text
+    assert "Open loop:" in text
+    assert "Evidence:" in text
+    assert "private user detail should stay in local artifact" not in text
+
+
+@pytest.mark.asyncio
+@patch("hermes_cli.plugins.invoke_hook")
+async def test_reset_preview_failure_keeps_handoff_path_and_reset_success(mock_invoke_hook, tmp_path, caplog):
+    runner = _make_runner()
+    runner._session_db.get_messages.return_value = [
+        {"role": "assistant", "content": "record complete. validation ok."},
+    ]
+
+    def boom(*args, **kwargs):
+        raise RuntimeError("SECRET preview body")
+
+    with caplog.at_level(logging.WARNING), patch(
+        "hermes_cli.config.load_config",
+        return_value={
+            "session_handoff": {
+                "on_reset": {
+                    "enabled": True,
+                    "artifact_dir": str(tmp_path / "handoffs" / "default"),
+                    "preview": {"enabled": True},
+                }
+            }
+        },
+    ), patch("hermes_cli.session_handoff.build_handoff_preview", side_effect=boom):
+        result = await runner._handle_reset_command(_make_event("/reset"))
+
+    text = str(result)
+    assert "Session reset" in text or "New session" in text
+    assert "Handoff:" in text
+    assert "Preview:" not in text
+    assert "SECRET preview body" not in caplog.text
+    assert "RuntimeError" in caplog.text

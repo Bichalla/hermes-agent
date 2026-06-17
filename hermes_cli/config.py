@@ -816,6 +816,13 @@ DEFAULT_CONFIG = {
             "max_messages": 80,
             "max_chars": 30000,
             "include_tool_results": False,
+            "preview": {
+                # Optional small reply preview with counts and high-level status.
+                # Disabled by default; it must not include evidence tail or raw transcript.
+                "enabled": False,
+                "max_items": 4,
+                "max_chars": 600,
+            },
         },
     },
     "agent": {

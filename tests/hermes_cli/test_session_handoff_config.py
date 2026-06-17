@@ -98,9 +98,42 @@ def test_handoff_config_infers_profile_from_explicit_named_profile_home(tmp_path
     assert cfg.artifact_dir == home / "handoffs" / "worker"
 
 
+def test_handoff_preview_config_disabled_by_default():
+    from hermes_cli.session_handoff import resolve_handoff_config
+
+    cfg = resolve_handoff_config({})
+
+    assert cfg.preview_enabled is False
+    assert cfg.preview_max_items == 4
+    assert cfg.preview_max_chars == 600
+
+
+def test_handoff_preview_config_parses_booleans_fail_closed():
+    from hermes_cli.session_handoff import resolve_handoff_config
+
+    cfg = resolve_handoff_config(
+        {"session_handoff": {"on_reset": {"preview": {"enabled": "unexpected"}}}}
+    )
+    assert cfg.preview_enabled is False
+
+    cfg = resolve_handoff_config(
+        {
+            "session_handoff": {
+                "on_reset": {"preview": {"enabled": "true", "max_chars": 999999}}
+            }
+        }
+    )
+    assert cfg.preview_enabled is True
+    assert cfg.preview_max_chars <= 1200
+
+
 def test_default_config_contains_disabled_session_handoff_section():
     from hermes_cli.config import DEFAULT_CONFIG
 
     on_reset = DEFAULT_CONFIG["session_handoff"]["on_reset"]
     assert on_reset["enabled"] is False
     assert on_reset["surface"] == "path_only"
+    assert on_reset["include_tool_results"] is False
+    assert on_reset["preview"]["enabled"] is False
+    assert on_reset["preview"]["max_items"] == 4
+    assert on_reset["preview"]["max_chars"] == 600

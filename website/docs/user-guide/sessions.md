@@ -165,7 +165,51 @@ display:
 ```
 
 :::tip
-Session IDs follow the format `YYYYMMDD_HHMMSS_<hex>` — CLI/TUI sessions use a 6-char hex suffix (e.g. `20250305_091523_a1b2c3`), gateway sessions use an 8-char suffix (e.g. `20250305_091523_a1b2c3d4`). You can resume by ID (full or unique prefix) or by title — both work with `-c` and `-r`.
+Session IDs follow the format `YYYYMMDD_HHMMSS_<hex>` — CLI/TUI sessions use a 6-char hex suffix (e.g. `20250305_091523_a1b2c3`), gateway sessions use an 8-char hex suffix (e.g. `20250305_091523_a1b2c3d4`). You can resume by ID (full or unique prefix) or by title — both work with `-c` and `-r`.
+:::
+
+## Reset Handoff Artifacts
+
+Gateways can create a local handoff artifact immediately before `/new` or `/reset` rotates a session. This is an opt-in safety net for long conversations: the old session transcript is converted into a deterministic Markdown/JSON handoff so a fresh session can recover the active task, intent locks, failure modes, and evidence tail.
+
+Handoff generation is disabled by default. To enable it for the active profile, set:
+
+```yaml
+session_handoff:
+  on_reset:
+    enabled: true
+    artifact_dir: "{hermes_home}/handoffs/{profile}"
+    surface: path_only
+    max_messages: 80
+    max_chars: 30000
+    include_tool_results: false
+```
+
+Behavior when enabled:
+
+- `/new` and `/reset` load the old session transcript before `reset_session()` creates the new session id.
+- Artifacts are written under the profile-local `{hermes_home}/handoffs/<profile>/` by default, with private permissions: directory `0700`, files `0600`.
+- `latest.md` is a convenience copy of the latest Markdown handoff body in that directory.
+- The reset reply shows only a local artifact path, never the full handoff body, evidence tail, transcript snippets, or tool results.
+- If handoff creation fails, reset still succeeds. Logs record only sanitized status and exception class names.
+- The generated Markdown starts with `[SESSION HANDOFF — REFERENCE ONLY]`; the latest user message in the new session always wins over stale handoff content.
+
+To continue from a handoff in a fresh session, ask Hermes to read the saved file as reference only, for example:
+
+```text
+Please read the handoff artifact path shown in the reset reply, or `{hermes_home}/handoffs/{profile}/latest.md`, then continue only if my latest message asks you to continue.
+```
+
+To disable automatic reset handoffs, remove the block or set:
+
+```yaml
+session_handoff:
+  on_reset:
+    enabled: false
+```
+
+:::warning
+Handoff artifacts may contain sensitive local transcript context. Do not commit, publish, paste, or send their body to external channels without explicit approval.
 :::
 
 ## Cross-Platform Handoff

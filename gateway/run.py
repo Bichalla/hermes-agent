@@ -10021,6 +10021,91 @@ class GatewayRunner:
 
         return "\n".join(lines)
 
+    def _display_handoff_path(self, path: Path) -> str:
+        """Return a compact path for reset replies without exposing body content."""
+        try:
+            home = Path.home().resolve()
+            resolved = path.expanduser().resolve()
+            if resolved.is_relative_to(home):
+                return "~" + os.sep + str(resolved.relative_to(home))
+        except Exception:
+            pass
+        return str(path)
+
+    def _capture_reset_handoff_input(
+        self,
+        *,
+        old_entry: Any,
+    ) -> tuple[Any | None, list[dict[str, Any]] | None]:
+        """Load handoff config and old transcript before reset_session rotates ids.
+
+        Fail-open by design: handoff generation must never block /new or /reset.
+        Logs include only exception class names, not transcript/body/path payloads.
+        """
+        try:
+            from hermes_cli.config import load_config as _load_config
+            from hermes_cli.session_handoff import resolve_handoff_config
+
+            handoff_cfg = resolve_handoff_config(_load_config())
+        except Exception as exc:
+            logger.warning("Session handoff config skipped: %s", exc.__class__.__name__)
+            return None, None
+
+        if not getattr(handoff_cfg, "enabled", False):
+            return handoff_cfg, None
+
+        old_session_id = getattr(old_entry, "session_id", None)
+        session_db = getattr(self, "_session_db", None)
+        if not old_session_id or session_db is None:
+            return handoff_cfg, []
+
+        try:
+            messages = session_db.get_messages(old_session_id)
+        except Exception as exc:
+            logger.warning("Session handoff transcript capture failed: %s", exc.__class__.__name__)
+            return handoff_cfg, None
+        return handoff_cfg, list(messages or [])
+
+    def _write_reset_handoff(
+        self,
+        *,
+        handoff_cfg: Any | None,
+        messages: list[dict[str, Any]] | None,
+        source: SessionSource,
+        old_session_id: str | None,
+        new_session_id: str | None,
+    ) -> Path | None:
+        """Build and write a pre-reset handoff artifact, returning md path."""
+        if handoff_cfg is None or messages is None or not getattr(handoff_cfg, "enabled", False):
+            return None
+        if not old_session_id:
+            return None
+        try:
+            from hermes_cli.session_handoff import build_handoff_artifact, write_handoff_artifact
+
+            platform = source.platform.value if source.platform else ""
+            source_label = f"{platform}/{source.chat_type or 'unknown'}"
+            artifact = build_handoff_artifact(
+                session_id=old_session_id,
+                new_session_id=new_session_id,
+                platform=platform,
+                source_label=source_label,
+                messages=messages,
+                max_messages=handoff_cfg.max_messages,
+                max_chars=handoff_cfg.max_chars,
+                include_tool_results=handoff_cfg.include_tool_results,
+            )
+            written = write_handoff_artifact(
+                artifact,
+                artifact_dir=handoff_cfg.artifact_dir,
+                session_id=old_session_id,
+            )
+            logger.info("Session handoff artifact written: status=ok artifact_id=%s", written.markdown_path.name)
+            return written.markdown_path
+        except Exception as exc:
+            logger.warning("Session handoff artifact write failed: %s", exc.__class__.__name__)
+            return None
+
     async def _handle_reset_command(self, event: MessageEvent) -> Union[str, EphemeralReply]:
         """Handle /new or /reset command."""
         source = event.source
@@ -10038,6 +10123,7 @@ class GatewayRunner:
         # Snapshot the old entry so on_session_finalize can report the
         # expiring session id before reset_session() rotates it.
         old_entry = self.session_store._entries.get(session_key)
+        handoff_cfg, handoff_messages = self._capture_reset_handoff_input(old_entry=old_entry)
 
         # Close tool resources on the old agent (terminal sandboxes, browser
         # daemons, background processes) before evicting from cache.
@@ -10086,6 +10172,13 @@ class GatewayRunner:
         self._clear_session_boundary_security_state(session_key)
 
         _old_sid = old_entry.session_id if old_entry else None
+        _handoff_path = self._write_reset_handoff(
+            handoff_cfg=handoff_cfg,
+            messages=handoff_messages,
+            source=source,
+            old_session_id=_old_sid,
+            new_session_id=new_entry.session_id if new_entry else None,
+        )
 
         # Fire plugin on_session_finalize hook (session boundary)
         try:
@@ -10183,6 +10276,9 @@ class GatewayRunner:
             _tip_line = t("gateway.reset.tip", tip=get_random_tip())
         except Exception:
             _tip_line = ""
+
+        if _handoff_path is not None:
+            header = f"{header}\n\nHandoff: `{self._display_handoff_path(_handoff_path)}`"
 
         if session_info:
             return EphemeralReply(f"{header}\n\n{session_info}{_tip_line}")

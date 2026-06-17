@@ -805,6 +805,19 @@ DEFAULT_CONFIG = {
     "fallback_providers": [],
     "credential_pool_strategies": {},
     "toolsets": ["hermes-cli"],
+    "session_handoff": {
+        "on_reset": {
+            "enabled": False,
+            # Local-only handoff artifacts created immediately before /new or /reset.
+            # The reply surface is intentionally path-only; the body may include
+            # sensitive transcript evidence and must not be broadcast by config.
+            "artifact_dir": "{hermes_home}/handoffs/{profile}",
+            "surface": "path_only",
+            "max_messages": 80,
+            "max_chars": 30000,
+            "include_tool_results": False,
+        },
+    },
     "agent": {
         "max_turns": 90,
         # Inactivity timeout for gateway agent execution (seconds).

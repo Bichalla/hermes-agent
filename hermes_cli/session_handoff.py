@@ -178,6 +178,8 @@ _META_PREFIXES = (
     "[CONTEXT COMPACTION - REFERENCE ONLY]",
     "[SESSION HANDOFF — REFERENCE ONLY]",
     "[SESSION HANDOFF - REFERENCE ONLY]",
+    "[Your active task list was preserved across context compression]",
+    "[Your active task list was preserved across context compaction]",
 )
 
 _COMPLETION_MARKERS = (
@@ -185,9 +187,11 @@ _COMPLETION_MARKERS = (
     "기록 완료",
     "검증 완료",
     "validation ok",
+    "event_id",
     "passed",
     "commit",
     "pushed",
+    "updated",
     "완료",
 )
 
@@ -202,6 +206,35 @@ _NEXT_MARKERS = (
     "tonight",
 )
 
+_SENSITIVE_HINTS = (
+    "secret",
+    "token",
+    "password",
+    "passwd",
+    "api_key",
+    "api-key",
+    "apikey",
+    "access_key",
+    "access-key",
+    "accesskey",
+    "bearer",
+    "authorization",
+)
+_COMMAND_PREFIXES = (
+    "scripts/run_tests.sh",
+    "python ",
+    "python3 ",
+    "pytest ",
+    "hermes ",
+    "git ",
+    "npm ",
+    "uv ",
+)
+_ABS_PATH_RE = re.compile(r"(?<![A-Za-z0-9_])/(?:Users|home|tmp|var|opt|srv)/[^\s`)'\",]+")
+_CODE_SPAN_RE = re.compile(r"`([^`]{1,400})`")
+_COMMIT_RE = re.compile(r"\b[0-9a-f]{7,40}\b", re.IGNORECASE)
+_CONFIG_KEY_RE = re.compile(r"\b[a-zA-Z_][\w-]*(?:\.[a-zA-Z_][\w-]*){2,}(?:=(?:true|false|[\w./:-]+))?\b")
+
 
 def _is_handoff_meta_text(text: str) -> bool:
     stripped = text.lstrip()
@@ -209,16 +242,94 @@ def _is_handoff_meta_text(text: str) -> bool:
 
 
 def _split_sentences(text: str) -> list[str]:
-    compact = " ".join(str(text).split())
-    if not compact:
-        return []
-    pieces = re.split(r"(?<=[.!?。])\s+", compact)
-    return [piece.strip() for piece in pieces if piece.strip()]
+    raw = str(text).replace("\r\n", "\n").replace("\r", "\n")
+    pieces: list[str] = []
+    for raw_line in raw.split("\n"):
+        line = raw_line.strip()
+        if not line:
+            continue
+        line = re.sub(r"^(?:[-*•]\s+|\d+[.)]\s+)(?:\[[ xX>!-]\]\s*)?", "", line).strip()
+        if not line:
+            continue
+        for piece in re.split(r"(?<=[.!?。])\s+", line):
+            compact = " ".join(piece.split()).strip()
+            if compact:
+                pieces.append(compact)
+    return pieces
 
 
 def _has_marker(text: str, markers: Sequence[str]) -> bool:
     lowered = text.lower()
     return any(marker.lower() in lowered for marker in markers)
+
+
+def _safe_inventory_item(value: str, *, limit: int = 240) -> str | None:
+    compact = " ".join(str(value).split()).strip().rstrip(".,;:")
+    if not compact:
+        return None
+    lowered = compact.lower()
+    if any(hint in lowered for hint in _SENSITIVE_HINTS):
+        return None
+    return _truncate(compact, limit)
+
+
+def _extract_evidence_inventory(messages: Sequence[Mapping[str, Any]]) -> dict[str, list[str]]:
+    inventory: dict[str, list[str]] = {
+        "files": [],
+        "repos": [],
+        "commands": [],
+        "config_keys": [],
+        "commits": [],
+    }
+    seen: dict[str, set[str]] = {key: set() for key in inventory}
+
+    def add(key: str, value: str) -> None:
+        item = _safe_inventory_item(value)
+        if item is None or item in seen[key] or len(inventory[key]) >= 12:
+            return
+        seen[key].add(item)
+        inventory[key].append(item)
+
+    for message in messages:
+        text = _coerce_text(message.get("content"))
+        for path_match in _ABS_PATH_RE.findall(text):
+            add("files", path_match)
+        for span in _CODE_SPAN_RE.findall(text):
+            stripped = span.strip()
+            if stripped.startswith(_COMMAND_PREFIXES):
+                add("commands", stripped)
+            if _CONFIG_KEY_RE.fullmatch(stripped):
+                add("config_keys", stripped.split("=", 1)[0])
+            if sha_match := _COMMIT_RE.match(stripped):
+                add("commits", sha_match.group(0))
+        for key_match in _CONFIG_KEY_RE.findall(text):
+            add("config_keys", key_match.split("=", 1)[0])
+        if "commit" in text.lower():
+            for sha in _COMMIT_RE.findall(text):
+                add("commits", sha)
+
+    for path in list(inventory["files"]):
+        marker = "/hermes-agent/"
+        if marker in path:
+            add("repos", path.split(marker, 1)[0] + "/hermes-agent")
+    return inventory
+
+
+def _format_inventory_section(inventory: Mapping[str, Sequence[str]]) -> str:
+    labels = {
+        "repos": "Repos",
+        "files": "Files",
+        "commands": "Commands",
+        "config_keys": "Config keys",
+        "commits": "Commits",
+    }
+    lines: list[str] = []
+    for key, label in labels.items():
+        values = list(inventory.get(key) or [])
+        if values:
+            rendered = ", ".join(f"`{value}`" for value in values[:12])
+            lines.append(f"- {label}: {rendered}")
+    return "\n".join(lines) if lines else "- Not enough deterministic file/command evidence extracted."
 
 
 def _visible_messages(
@@ -283,6 +394,16 @@ def _latest_role_text(messages: Sequence[Mapping[str, Any]], role: str, limit: i
     return "Not enough evidence in transcript."
 
 
+def _latest_role_raw_text(messages: Sequence[Mapping[str, Any]], role: str) -> str:
+    for message in reversed(messages):
+        if _safe_role(message.get("role")) != role:
+            continue
+        text = _coerce_text(message.get("content")).strip()
+        if text:
+            return text
+    return ""
+
+
 def _evidence_tail(
     messages: Sequence[Mapping[str, Any]],
     *,
@@ -311,6 +432,24 @@ def _extract_last_completed_action(latest_assistant: str) -> str:
     return "Not enough deterministic completion evidence in transcript."
 
 
+def _extract_completed_actions(latest_assistant: str, *, max_items: int = 5) -> list[str]:
+    if not latest_assistant or latest_assistant == "Not enough evidence in transcript.":
+        return []
+    actions: list[str] = []
+    for sentence in _split_sentences(latest_assistant):
+        if _has_marker(sentence, _NEXT_MARKERS):
+            continue
+        if _has_marker(sentence, _COMPLETION_MARKERS):
+            actions.append(_truncate(sentence, 240))
+        if len(actions) >= max_items:
+            break
+    if actions:
+        return actions
+    if _has_marker(latest_assistant, _COMPLETION_MARKERS):
+        return [_truncate(latest_assistant, 240)]
+    return []
+
+
 def _extract_open_loop(latest_user: str, latest_assistant: str) -> str:
     candidates: list[str] = []
     for sentence in _split_sentences(latest_assistant):
@@ -318,8 +457,6 @@ def _extract_open_loop(latest_user: str, latest_assistant: str) -> str:
             candidates.append(sentence)
     if candidates:
         return _truncate(" ".join(candidates), 700)
-    if latest_user and latest_user != "Not enough evidence in transcript.":
-        return _truncate(f"Latest user signal: {latest_user}", 700)
     return "Not enough evidence in transcript."
 
 
@@ -361,11 +498,16 @@ def build_handoff_artifact(
         max_messages=bounded_limit,
         per_message_chars=per_message_chars,
     )
+    evidence_inventory = _extract_evidence_inventory(bounded_messages)
 
     latest_user = _latest_role_text(bounded_messages, "user", 700)
     latest_assistant = _latest_role_text(bounded_messages, "assistant", 900)
-    last_completed_action = _extract_last_completed_action(latest_assistant)
-    open_loops = _extract_open_loop(latest_user, latest_assistant)
+    raw_latest_assistant = _latest_role_raw_text(bounded_messages, "assistant")
+    completed_actions = _extract_completed_actions(raw_latest_assistant)
+    last_completed_action = (
+        "; ".join(completed_actions) if completed_actions else _extract_last_completed_action(raw_latest_assistant)
+    )
+    open_loops = _extract_open_loop(latest_user, raw_latest_assistant)
     next_concrete_step = _extract_next_step(open_loops)
     title = f"Session handoff for {session_id}"
     artifact_path_text = str(artifact_path) if artifact_path is not None else "<artifact path not written yet>"
@@ -392,6 +534,10 @@ def build_handoff_artifact(
         "bounded_message_count": len(bounded_messages),
         "messages_omitted_by_limit": messages_omitted_by_limit,
         "evidence_count": len(evidence),
+        "structured_file_count": len(evidence_inventory["files"]),
+        "structured_command_count": len(evidence_inventory["commands"]),
+        "structured_config_key_count": len(evidence_inventory["config_keys"]),
+        "structured_commit_count": len(evidence_inventory["commits"]),
         "truncated": evidence_truncated,
         "include_tool_results": include_tool_results,
     }
@@ -415,7 +561,7 @@ Treat it as reference only. Preserve the Intent Locks. First restate the next co
 - Truncated: {str(quality_card['truncated']).lower()}
 
 ## Last Completed Action
-- {_truncate(last_completed_action, 900)}
+{_format_bullets(completed_actions or [last_completed_action])}
 
 ## Open Loops / Follow-up Context
 - {_truncate(open_loops, 700)}
@@ -435,7 +581,7 @@ Treat it as reference only. Preserve the Intent Locks. First restate the next co
 - Keep handoff content local/private unless explicit external sharing approval is given.
 
 ## Files / Repos / Commands Involved
-- Not enough deterministic file/command evidence extracted in this deterministic handoff builder.
+{_format_inventory_section(evidence_inventory)}
 
 ## Known Failure Modes
 {_format_bullets(known_failure_modes)}
@@ -463,11 +609,15 @@ Treat it as reference only. Preserve the Intent Locks. First restate the next co
         "title": title,
         "intent_locks": intent_locks,
         "known_failure_modes": known_failure_modes,
-        "active_task": open_loops if open_loops != "Not enough evidence in transcript." else latest_user,
+        "active_task": open_loops
+        if open_loops != "Not enough evidence in transcript."
+        else "Not enough deterministic active task evidence in transcript.",
         "last_completed_action": last_completed_action,
+        "completed_actions": completed_actions,
         "open_loops": open_loops,
         "next_concrete_step": next_concrete_step,
         "quality_card": quality_card,
+        "evidence_inventory": evidence_inventory,
         "current_state": {
             "latest_user_signal": latest_user,
             "latest_assistant_evidence": latest_assistant,
@@ -500,6 +650,16 @@ def build_handoff_preview(artifact: HandoffArtifact, *, max_items: int = 4, max_
         open_loop_status = "no deterministic follow-up found"
 
     lines = ["Preview:"]
+    structured_counts = (
+        f"; structured files={quality.get('structured_file_count', 0)} "
+        f"commands={quality.get('structured_command_count', 0)} "
+        f"commits={quality.get('structured_commit_count', 0)}"
+        if any(
+            int(quality.get(key, 0) or 0)
+            for key in ("structured_file_count", "structured_command_count", "structured_commit_count")
+        )
+        else ""
+    )
     candidates = [
         (
             "Last completed",
@@ -515,6 +675,7 @@ def build_handoff_preview(artifact: HandoffArtifact, *, max_items: int = 4, max_
                 f"{quality.get('filtered_meta_messages', 0)} meta filtered; "
                 f"{quality.get('tool_messages_excluded', 0)} tool excluded; "
                 f"truncated={str(bool(quality.get('truncated', False))).lower()}"
+                f"{structured_counts}"
             ),
         ),
         ("Inspect", "ask Hermes to read the Handoff path for full local detail"),

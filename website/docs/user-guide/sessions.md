@@ -195,9 +195,10 @@ Behavior when enabled:
 - Artifacts are written under the profile-local `{hermes_home}/handoffs/<profile>/` by default, with private permissions: directory `0700`, files `0600`.
 - `latest.md` is a convenience copy of the latest Markdown handoff body in that directory.
 - The reset reply shows only a local artifact path, never the full handoff body, evidence tail, transcript snippets, or tool results.
-- If `preview.enabled` is true, the reset reply also includes a bounded safe preview with high-level fields only: last completed action, open loop, evidence counts, and an inspect hint. The preview never includes the raw Evidence Tail or tool results.
-- The generated Markdown separates `Last Completed Action`, `Open Loops / Follow-up Context`, `Next Useful Context`, `Handoff Quality`, and `Evidence Tail` so completed work is not mislabeled as an active task.
-- Context-compaction and prior handoff meta blocks are filtered out of the latest-task and evidence-tail signals.
+- If `preview.enabled` is true, the reset reply also includes a bounded safe preview with high-level fields only: last completed action, open loop status, evidence counts, structured inventory counts, and an inspect hint. The preview never includes the raw Evidence Tail, tool results, file paths, commands, commit SHAs, or transcript values.
+- The generated Markdown separates `Last Completed Action`, `Open Loops / Follow-up Context`, `Next Useful Context`, `Handoff Quality`, `Files / Repos / Commands Involved`, and `Evidence Tail` so completed work is not mislabeled as an active task. Completed assistant actions are rendered as capped bullets.
+- `Open Loops / Follow-up Context` is populated only from deterministic assistant follow-up language. A raw latest user message is kept under `Next Useful Context`, not promoted to an actionable open loop.
+- Context-compaction, prior handoff, and active-task-preserved meta blocks are filtered out of the latest-task and evidence-tail signals.
 - If handoff creation fails, reset still succeeds. Logs record only sanitized status and exception class names.
 - The generated Markdown starts with `[SESSION HANDOFF — REFERENCE ONLY]`; the latest user message in the new session always wins over stale handoff content.
 
@@ -218,7 +219,7 @@ Example preview:
 Preview:
 - Last completed: completion evidence captured in local handoff; inspect path for details
 - Open loop: follow-up context captured in local handoff; inspect path for details
-- Evidence: 5 kept; 1 meta filtered; 0 tool excluded; truncated=false
+- Evidence: 5 kept; 1 meta filtered; 0 tool excluded; truncated=false; structured files=2 commands=1 commits=1
 - Inspect: ask Hermes to read the Handoff path for full local detail
 ```
 

@@ -669,8 +669,21 @@ def build_handoff_preview(artifact: HandoffArtifact, *, max_items: int = 4, max_
     payload = artifact.json_payload
     quality_obj = payload.get("quality_card")
     quality: Mapping[str, Any] = quality_obj if isinstance(quality_obj, Mapping) else {}
+    handoff_quality_obj = payload.get("handoff_quality")
+    handoff_quality: Mapping[str, Any] = (
+        handoff_quality_obj if isinstance(handoff_quality_obj, Mapping) else {}
+    )
+    truncation_obj = handoff_quality.get("truncation")
+    truncation: Mapping[str, Any] = truncation_obj if isinstance(truncation_obj, Mapping) else {}
+    extraction_obj = handoff_quality.get("extraction")
+    extraction: Mapping[str, Any] = extraction_obj if isinstance(extraction_obj, Mapping) else {}
     max_items = max(1, min(int(max_items or 1), 6))
     max_chars = max(160, min(int(max_chars or 600), 1200))
+
+    def quality_value(phase1_key: str, legacy_key: str, default: Any = 0) -> Any:
+        if phase1_key in handoff_quality:
+            return handoff_quality.get(phase1_key)
+        return quality.get(legacy_key, default)
 
     last_completed = str(payload.get("last_completed_action") or "")
     open_loop = str(payload.get("open_loops") or "")
@@ -694,6 +707,42 @@ def build_handoff_preview(artifact: HandoffArtifact, *, max_items: int = 4, max_
         )
         else ""
     )
+    evidence_count = int(quality.get("evidence_count", 0) or 0)
+    meta_filtered = int(quality_value("meta_messages_filtered", "filtered_meta_messages", 0) or 0)
+    tool_excluded = int(quality_value("tool_messages_excluded", "tool_messages_excluded", 0) or 0)
+    max_messages_applied = bool(
+        truncation.get("max_messages_applied", bool(quality.get("messages_omitted_by_limit", 0)))
+    )
+    max_chars_applied = bool(
+        truncation.get("max_chars_applied", bool(quality.get("truncated", False)))
+    )
+    preview_truncated = bool(max_messages_applied or max_chars_applied or quality.get("truncated", False))
+    completed_detector = str(extraction.get("completed_action_detector") or "unknown")
+    open_loop_detector = str(extraction.get("open_loop_detector") or "unknown")
+    detector_policy = (
+        completed_detector
+        if completed_detector == open_loop_detector
+        else f"completed:{completed_detector}/open_loop:{open_loop_detector}"
+    )
+    latest_user_suppressed = bool(
+        extraction.get("latest_user_fallback_suppressed_in_remote_preview", True)
+    )
+    evidence_summary = (
+        f"{evidence_count} kept; "
+        f"{meta_filtered} meta filtered; "
+        f"{tool_excluded} tool excluded; "
+        f"truncated={str(preview_truncated).lower()}; "
+        f"max_messages={str(max_messages_applied).lower()}; "
+        f"max_chars={str(max_chars_applied).lower()}"
+    )
+    if structured_counts:
+        evidence_summary = f"{evidence_summary}{structured_counts}"
+    elif max_chars >= 500:
+        evidence_summary = (
+            f"{evidence_summary}; "
+            f"detectors={detector_policy}; "
+            f"latest_user_fallback_suppressed={str(latest_user_suppressed).lower()}"
+        )
     candidates = [
         (
             "Last completed",
@@ -702,16 +751,7 @@ def build_handoff_preview(artifact: HandoffArtifact, *, max_items: int = 4, max_
             else "no deterministic completion evidence found",
         ),
         ("Open loop", open_loop_status),
-        (
-            "Evidence",
-            (
-                f"{quality.get('evidence_count', 0)} kept; "
-                f"{quality.get('filtered_meta_messages', 0)} meta filtered; "
-                f"{quality.get('tool_messages_excluded', 0)} tool excluded; "
-                f"truncated={str(bool(quality.get('truncated', False))).lower()}"
-                f"{structured_counts}"
-            ),
-        ),
+        ("Evidence", evidence_summary),
         ("Inspect", "ask Hermes to read the Handoff path for full local detail"),
     ]
     for label, value in candidates[:max_items]:

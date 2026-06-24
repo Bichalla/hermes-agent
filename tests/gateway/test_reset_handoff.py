@@ -205,6 +205,63 @@ async def test_reset_reply_can_include_opt_in_safe_preview(mock_invoke_hook, tmp
 
 @pytest.mark.asyncio
 @patch("hermes_cli.plugins.invoke_hook")
+async def test_reset_preview_surfaces_phase1_quality_contract_without_transcript_body(
+    mock_invoke_hook,
+    tmp_path,
+):
+    runner = _make_runner()
+    runner._session_db.get_messages.return_value = [
+        {
+            "role": "user",
+            "content": "private approval body should stay local only",
+        },
+        {
+            "role": "assistant",
+            "content": "record complete. validation ok. Next: inspect local artifact only.",
+        },
+        {
+            "role": "tool",
+            "content": "SECRET tool result must stay out of remote preview",
+        },
+        {
+            "role": "user",
+            "content": "[SESSION HANDOFF — REFERENCE ONLY] stale handoff meta",
+        },
+    ]
+
+    with patch(
+        "hermes_cli.config.load_config",
+        return_value={
+            "session_handoff": {
+                "on_reset": {
+                    "enabled": True,
+                    "artifact_dir": str(tmp_path / "handoffs" / "default"),
+                    "max_messages": 1,
+                    "max_chars": 1000,
+                    "preview": {"enabled": True, "max_chars": 600, "max_items": 4},
+                }
+            }
+        },
+    ):
+        result = await runner._handle_reset_command(_make_event("/reset"))
+
+    text = str(result)
+    assert "Preview:" in text
+    assert "Evidence:" in text
+    assert "1 meta filtered" in text
+    assert "1 tool excluded" in text
+    assert "max_messages=true" in text
+    assert "detectors=bullet_and_newline_aware" in text
+    assert "latest_user_fallback_suppressed=true" in text
+    assert "private approval body should stay local only" not in text
+    assert "record complete. validation ok" not in text
+    assert "inspect local artifact only" not in text
+    assert "SECRET tool result" not in text
+    assert "stale handoff meta" not in text
+
+
+@pytest.mark.asyncio
+@patch("hermes_cli.plugins.invoke_hook")
 async def test_reset_preview_failure_keeps_handoff_path_and_reset_success(mock_invoke_hook, tmp_path, caplog):
     runner = _make_runner()
     runner._session_db.get_messages.return_value = [

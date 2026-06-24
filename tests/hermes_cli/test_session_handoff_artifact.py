@@ -131,6 +131,44 @@ def test_build_handoff_includes_quality_card_counts_and_truncation_flags():
     assert "## Handoff Quality" in artifact.markdown
 
 
+def test_build_handoff_exports_phase1_handoff_quality_contract():
+    from hermes_cli.session_handoff import build_handoff_artifact
+
+    artifact = build_handoff_artifact(
+        session_id="sess-old",
+        messages=[
+            {"role": "user", "content": "old context"},
+            {"role": "tool", "content": "tool result excluded"},
+            {"role": "user", "content": "[SESSION HANDOFF — REFERENCE ONLY] previous handoff meta"},
+            {"role": "assistant", "content": "Config updated. Tests passed. Next: wait for user approval."},
+        ],
+        artifact_path="/tmp/handoff.md",
+        max_messages=1,
+        max_chars=1800,
+        include_tool_results=False,
+    )
+
+    quality = artifact.json_payload["handoff_quality"]
+    assert quality == {
+        "raw_message_count": 4,
+        "visible_message_count": 2,
+        "meta_messages_filtered": 1,
+        "tool_messages_excluded": 1,
+        "truncation": {
+            "max_messages_applied": True,
+            "max_chars_applied": True,
+        },
+        "extraction": {
+            "completed_action_detector": "bullet_and_newline_aware",
+            "open_loop_detector": "bullet_and_newline_aware",
+            "latest_user_fallback_suppressed_in_remote_preview": True,
+        },
+    }
+    assert "Max messages applied: true" in artifact.markdown
+    assert "Max chars applied: true" in artifact.markdown
+    assert "latest_user_fallback_suppressed_in_remote_preview: true" in artifact.markdown
+
+
 def test_build_handoff_extracts_structured_file_command_commit_config_inventory():
     from hermes_cli.session_handoff import build_handoff_artifact
 

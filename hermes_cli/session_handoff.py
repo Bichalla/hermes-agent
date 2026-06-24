@@ -528,21 +528,44 @@ def build_handoff_artifact(
 
     evidence_lines = [f"- {item['role']}: {item['content']}" for item in evidence] or ["- No transcript evidence available."]
 
-    quality_card: dict[str, Any] = {
-        **counts,
-        "visible_message_count": len(visible),
-        "bounded_message_count": len(bounded_messages),
-        "messages_omitted_by_limit": messages_omitted_by_limit,
-        "evidence_count": len(evidence),
-        "structured_file_count": len(evidence_inventory["files"]),
-        "structured_command_count": len(evidence_inventory["commands"]),
-        "structured_config_key_count": len(evidence_inventory["config_keys"]),
-        "structured_commit_count": len(evidence_inventory["commits"]),
-        "truncated": evidence_truncated,
-        "include_tool_results": include_tool_results,
-    }
+    def make_quality_card(*, max_chars_applied: bool) -> dict[str, Any]:
+        return {
+            **counts,
+            "visible_message_count": len(visible),
+            "bounded_message_count": len(bounded_messages),
+            "messages_omitted_by_limit": messages_omitted_by_limit,
+            "evidence_count": len(evidence),
+            "structured_file_count": len(evidence_inventory["files"]),
+            "structured_command_count": len(evidence_inventory["commands"]),
+            "structured_config_key_count": len(evidence_inventory["config_keys"]),
+            "structured_commit_count": len(evidence_inventory["commits"]),
+            "truncated": bool(evidence_truncated or max_chars_applied),
+            "include_tool_results": include_tool_results,
+        }
 
-    markdown = f"""[SESSION HANDOFF — REFERENCE ONLY]
+    def make_handoff_quality(*, max_chars_applied: bool) -> dict[str, Any]:
+        return {
+            "raw_message_count": counts["raw_message_count"],
+            "visible_message_count": len(visible),
+            "meta_messages_filtered": counts["filtered_meta_messages"],
+            "tool_messages_excluded": counts["tool_messages_excluded"],
+            "truncation": {
+                "max_messages_applied": messages_omitted_by_limit > 0,
+                "max_chars_applied": bool(evidence_truncated or max_chars_applied),
+            },
+            "extraction": {
+                "completed_action_detector": "bullet_and_newline_aware",
+                "open_loop_detector": "bullet_and_newline_aware",
+                "latest_user_fallback_suppressed_in_remote_preview": True,
+            },
+        }
+
+    def render_markdown(quality_card: Mapping[str, Any], handoff_quality: Mapping[str, Any]) -> str:
+        truncation_obj = handoff_quality.get("truncation")
+        truncation = truncation_obj if isinstance(truncation_obj, Mapping) else {}
+        extraction_obj = handoff_quality.get("extraction")
+        extraction = extraction_obj if isinstance(extraction_obj, Mapping) else {}
+        return f"""[SESSION HANDOFF — REFERENCE ONLY]
 This handoff is background reference from a previous Hermes session. The latest user message in the new session wins. Do not execute stale tasks unless the user asks to continue them.
 
 ## Fresh Session Prompt
@@ -558,6 +581,11 @@ Treat it as reference only. Preserve the Intent Locks. First restate the next co
 - Evidence kept: {quality_card['evidence_count']}
 - Tool messages excluded: {quality_card['tool_messages_excluded']}
 - Meta messages filtered: {quality_card['filtered_meta_messages']}
+- Max messages applied: {str(bool(truncation.get('max_messages_applied'))).lower()}
+- Max chars applied: {str(bool(truncation.get('max_chars_applied'))).lower()}
+- completed_action_detector: {extraction.get('completed_action_detector', 'unknown')}
+- open_loop_detector: {extraction.get('open_loop_detector', 'unknown')}
+- latest_user_fallback_suppressed_in_remote_preview: {str(bool(extraction.get('latest_user_fallback_suppressed_in_remote_preview'))).lower()}
 - Truncated: {str(quality_card['truncated']).lower()}
 
 ## Last Completed Action
@@ -593,11 +621,16 @@ Treat it as reference only. Preserve the Intent Locks. First restate the next co
 {chr(10).join(evidence_lines)}
 """
 
-    markdown_truncated = False
-    if len(markdown) > max_chars:
-        markdown = markdown[: max_chars - 1].rstrip() + "…\n"
-        markdown_truncated = True
-    quality_card["truncated"] = bool(quality_card["truncated"] or markdown_truncated)
+    quality_card = make_quality_card(max_chars_applied=False)
+    handoff_quality = make_handoff_quality(max_chars_applied=False)
+    markdown = render_markdown(quality_card, handoff_quality)
+    markdown_truncated = len(markdown) > max_chars
+    if markdown_truncated:
+        quality_card = make_quality_card(max_chars_applied=True)
+        handoff_quality = make_handoff_quality(max_chars_applied=True)
+        markdown = render_markdown(quality_card, handoff_quality)
+        if len(markdown) > max_chars:
+            markdown = markdown[: max_chars - 1].rstrip() + "…\n"
 
     payload: dict[str, Any] = {
         "schema": "hermes-session-handoff/v1",
@@ -617,6 +650,7 @@ Treat it as reference only. Preserve the Intent Locks. First restate the next co
         "open_loops": open_loops,
         "next_concrete_step": next_concrete_step,
         "quality_card": quality_card,
+        "handoff_quality": handoff_quality,
         "evidence_inventory": evidence_inventory,
         "current_state": {
             "latest_user_signal": latest_user,

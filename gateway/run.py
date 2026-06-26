@@ -16260,6 +16260,7 @@ class GatewayRunner:
         ("compression", "target_ratio"),
         ("compression", "protect_last_n"),
         ("agent", "disabled_toolsets"),
+        ("agent", "runtime_live_enforcement"),
         ("memory", "provider"),
     )
 

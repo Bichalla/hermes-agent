@@ -1205,8 +1205,9 @@ def init_agent(
     agent._task_completion_guidance = bool(_agent_section.get("task_completion_guidance", True))
 
     # Runtime-live enforcement soft guard.  Default True because it only adds
-    # prompt-level approval discipline; operators can disable it globally with
-    # agent.runtime_live_enforcement: false if they need leaner prompts.
+    # prompt-level approval discipline.  The config toggle removes the shared
+    # main-agent guard from CLI/gateway prompts; delegate child prompts keep
+    # their non-disableable live-action boundary.
     agent._runtime_live_enforcement = _agent_section.get("runtime_live_enforcement", True)
 
     # Local Python toolchain probe toggle.  Default True.  When False,

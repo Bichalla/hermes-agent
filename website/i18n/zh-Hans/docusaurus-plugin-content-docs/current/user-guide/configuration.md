@@ -1079,9 +1079,9 @@ agent:
 
 该 guard 覆盖实时 workflow promotion 和其他有副作用的表面，例如 cron/job 创建、更新、恢复或运行，外部消息发送，公开部署或路由变更，凭据读取，实时数据库写入、导入或迁移，Graphify 重建或导出，状态或注册表 mutation，NAS 备份 mutation，以及破坏性或面向公众的命令。
 
-这是提示词级软 guard，不是硬沙箱。它通过共享系统提示词作用于 CLI 和 gateway session；`delegate_task` 子 agent 提示词也包含同样边界，因此 subagent 可以 scout、draft、test，但不能静默执行实时 mutation。如果批准缺失或已过期，agent 应返回 approval-needed 摘要，说明操作、目标、风险以及批准后的验证计划。
+这是提示词级软 guard，不是硬沙箱。它通过共享系统提示词作用于 CLI 和 gateway session。`delegate_task` 子 agent 提示词也包含实时操作边界，因此 subagent 可以 scout、draft、test，但不能静默执行实时 mutation。如果批准缺失或已过期，agent 应返回 approval-needed 摘要，说明操作、目标、风险以及批准后的验证计划。
 
-仅当您明确想从提示词中移除该 guard 时，才设置 `runtime_live_enforcement: false`。
+仅当您明确想从 CLI 和 gateway 系统提示词中移除共享主 agent guard 时，才设置 `runtime_live_enforcement: false`。`delegate_task` 子提示词会保留不可禁用的实时操作边界，防止 subagent 在没有父级批准范围的情况下静默执行实时 mutation。
 
 ## TTS 配置
 

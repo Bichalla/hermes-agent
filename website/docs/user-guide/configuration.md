@@ -1158,9 +1158,9 @@ agent:
 
 The guard covers live workflow promotion and other side-effecting surfaces such as cron/job mutation, external message delivery, public deploy or route changes, credential reads, live database writes/imports/migrations, Graphify rebuild/export, state or registry mutation, NAS backup mutation, and destructive or public-facing commands.
 
-This is a prompt-level soft guard, not a hard sandbox. It applies to CLI and gateway sessions through the shared system prompt, and `delegate_task` child prompts include the same boundary so subagents can scout, draft, and test without silently performing live mutations. If approval is missing or stale, the agent should return an approval-needed summary with the action, target, risk, and post-approval verification plan.
+This is a prompt-level soft guard, not a hard sandbox. It applies to CLI and gateway sessions through the shared system prompt. `delegate_task` child prompts also include a live-action boundary so subagents can scout, draft, and test without silently performing live mutations. If approval is missing or stale, the agent should return an approval-needed summary with the action, target, risk, and post-approval verification plan.
 
-Set `runtime_live_enforcement: false` only if you explicitly want to remove this guard from the prompt.
+Set `runtime_live_enforcement: false` only if you explicitly want to remove the shared main-agent guard from CLI and gateway system prompts. `delegate_task` child prompts keep a non-disableable live-action boundary so subagents cannot silently perform live mutations without parent-approved scope.
 
 ## TTS Configuration
 

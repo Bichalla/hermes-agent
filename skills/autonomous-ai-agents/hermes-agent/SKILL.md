@@ -361,7 +361,7 @@ Edit with `hermes config edit` or `hermes config set section.key value`.
 | Section | Key options |
 |---------|-------------|
 | `model` | `default`, `provider`, `base_url`, `api_key`, `context_length` |
-| `agent` | `max_turns` (90), `tool_use_enforcement` |
+| `agent` | `max_turns` (90), `tool_use_enforcement`, `runtime_live_enforcement` |
 | `terminal` | `backend` (local/docker/ssh/modal), `cwd`, `timeout` (180) |
 | `compression` | `enabled`, `threshold` (0.50), `target_ratio` (0.20) |
 | `display` | `skin`, `tool_progress`, `show_reasoning`, `show_cost` |

@@ -1068,6 +1068,21 @@ agent:
   tool_use_enforcement: ["gpt", "codex", "gemini", "grok", "my-custom-model"]
 ```
 
+## 运行时实时强制
+
+默认情况下，Hermes 会为可使用工具的 agent 在系统提示词中加入一小段运行时实时操作 guard。它会提醒 agent：除非最新用户消息对精确操作和目标给出了当前轮明确批准，否则必须在实时副作用之前停止。
+
+```yaml
+agent:
+  runtime_live_enforcement: true   # true（默认）| false
+```
+
+该 guard 覆盖实时 workflow promotion 和其他有副作用的表面，例如 cron/job 创建、更新、恢复或运行，外部消息发送，公开部署或路由变更，凭据读取，实时数据库写入、导入或迁移，Graphify 重建或导出，状态或注册表 mutation，NAS 备份 mutation，以及破坏性或面向公众的命令。
+
+这是提示词级软 guard，不是硬沙箱。它通过共享系统提示词作用于 CLI 和 gateway session；`delegate_task` 子 agent 提示词也包含同样边界，因此 subagent 可以 scout、draft、test，但不能静默执行实时 mutation。如果批准缺失或已过期，agent 应返回 approval-needed 摘要，说明操作、目标、风险以及批准后的验证计划。
+
+仅当您明确想从提示词中移除该 guard 时，才设置 `runtime_live_enforcement: false`。
+
 ## TTS 配置
 
 ```yaml

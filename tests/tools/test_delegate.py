@@ -2521,6 +2521,19 @@ class TestOrchestratorEndToEnd(unittest.TestCase):
         self.assertFalse(built_agents[2]["is_orchestrator_prompt"])
 
 
+class TestChildSystemPromptRuntimeLiveEnforcement(unittest.TestCase):
+    def test_child_prompt_includes_live_action_boundary(self):
+        prompt = _build_child_system_prompt(
+            "prepare a cron workflow",
+            "do not run live jobs",
+            role="leaf",
+        )
+
+        self.assertIn("Runtime-live action guard", prompt)
+        self.assertIn("current-turn explicit approval", prompt)
+        self.assertIn("Return an approval-needed summary", prompt)
+
+
 class TestSubagentApprovalCallback(unittest.TestCase):
     """Subagent worker threads must have a non-interactive approval callback
     installed so dangerous-command prompts don't fall back to input() and

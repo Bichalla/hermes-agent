@@ -34,6 +34,7 @@ from agent.prompt_builder import (
     MEMORY_GUIDANCE,
     OPENAI_MODEL_EXECUTION_GUIDANCE,
     PLATFORM_HINTS,
+    RUNTIME_LIVE_ENFORCEMENT_GUIDANCE,
     SESSION_SEARCH_GUIDANCE,
     SKILLS_GUIDANCE,
     TASK_COMPLETION_GUIDANCE,
@@ -56,6 +57,19 @@ def _ra():
     """
     import run_agent
     return run_agent
+
+
+def _runtime_live_enforcement_enabled(value: Any) -> bool:
+    """Normalize config/agent values for the runtime-live soft guard."""
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, str):
+        normalized = value.strip().lower()
+        if normalized in {"false", "never", "no", "off", "0", "disabled"}:
+            return False
+        if normalized in {"true", "always", "yes", "on", "1", "enabled", "auto"}:
+            return True
+    return bool(value) if value is not None else True
 
 
 def build_system_prompt_parts(agent: Any, system_message: Optional[str] = None) -> Dict[str, str]:
@@ -109,6 +123,15 @@ def build_system_prompt_parts(agent: Any, system_message: Optional[str] = None) 
     # users who want a leaner prompt can turn it off.
     if getattr(agent, "_task_completion_guidance", True) and agent.valid_tool_names:
         stable_parts.append(TASK_COMPLETION_GUIDANCE)
+
+    # Runtime-live soft guard.  This is intentionally system-prompt level,
+    # not a hard tool wrapper: it applies uniformly to CLI/gateway agents and
+    # keeps allowed read/scout/test work flowing while forcing approval checks
+    # before cron/Discord/DB/Graphify/public/credential/destructive mutations.
+    if agent.valid_tool_names and _runtime_live_enforcement_enabled(
+        getattr(agent, "_runtime_live_enforcement", True)
+    ):
+        stable_parts.append(RUNTIME_LIVE_ENFORCEMENT_GUIDANCE)
 
     # Tool-aware behavioral guidance: only inject when the tools are loaded
     tool_guidance = []

@@ -864,6 +864,13 @@ DEFAULT_CONFIG = {
         # plausible-looking output when a real path is blocked.  Costs ~80
         # tokens in the cached system prompt.  Set False to disable globally.
         "task_completion_guidance": True,
+        # Runtime-live enforcement: prompt-level approval discipline for live
+        # side-effecting workflow actions (cron/job mutation, external delivery,
+        # public deploy/route changes, credential reads, live DB/import/migration,
+        # Graphify rebuild/export, state/registry mutation, NAS backup mutation,
+        # and destructive/public-facing commands). This is a soft runtime guard
+        # shared by CLI and gateway agents; set False to disable globally.
+        "runtime_live_enforcement": True,
         # Local-environment toolchain probe — surfaces Python/pip/uv/PEP-668
         # state in the system prompt when something non-default is detected
         # (e.g. python3 has no pip module, pip→python version mismatch, PEP

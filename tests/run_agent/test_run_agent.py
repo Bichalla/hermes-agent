@@ -1418,6 +1418,44 @@ class TestTaskCompletionGuidance:
             assert TASK_COMPLETION_GUIDANCE not in a._build_system_prompt()
 
 
+class TestRuntimeLiveEnforcementIntegration:
+    """Tests for agent.runtime_live_enforcement config wiring."""
+
+    def _make_agent(self, runtime_live_enforcement=True):
+        with (
+            patch(
+                "run_agent.get_tool_definitions",
+                return_value=_make_tool_defs("terminal", "cronjob", "send_message", "delegate_task"),
+            ),
+            patch("run_agent.check_toolset_requirements", return_value={}),
+            patch("run_agent.OpenAI"),
+            patch(
+                "hermes_cli.config.load_config",
+                return_value={"agent": {"runtime_live_enforcement": runtime_live_enforcement}},
+            ),
+        ):
+            a = AIAgent(
+                model="anthropic/claude-opus-4.8",
+                api_key="test-key-1234567890",
+                base_url="https://openrouter.ai/api/v1",
+                quiet_mode=True,
+                skip_context_files=True,
+                skip_memory=True,
+            )
+            a.client = MagicMock()
+            return a
+
+    def test_default_config_injects_runtime_live_guard(self):
+        from agent.prompt_builder import RUNTIME_LIVE_ENFORCEMENT_GUIDANCE
+        agent = self._make_agent(runtime_live_enforcement=True)
+        assert RUNTIME_LIVE_ENFORCEMENT_GUIDANCE in agent._build_system_prompt()
+
+    def test_false_disables_runtime_live_guard(self):
+        from agent.prompt_builder import RUNTIME_LIVE_ENFORCEMENT_GUIDANCE
+        agent = self._make_agent(runtime_live_enforcement=False)
+        assert RUNTIME_LIVE_ENFORCEMENT_GUIDANCE not in agent._build_system_prompt()
+
+
 class TestEnvironmentProbeIntegration:
     """Tests for the local Python toolchain probe wiring (config.yaml
     ``agent.environment_probe``).  The probe itself is unit-tested in

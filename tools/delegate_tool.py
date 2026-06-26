@@ -597,6 +597,19 @@ def _build_child_system_prompt(
             "Use this exact path for local repository/workdir operations unless the task explicitly says otherwise."
         )
     parts.append(
+        "\n## Runtime-live action guard\n"
+        "Before any live side-effecting workflow action, verify that your task "
+        "context contains current-turn explicit approval for the exact action "
+        "and target. Live actions include cron/job create-update-resume-run, "
+        "external message delivery, public deploy/route changes, credential "
+        "reads, live DB writes/imports/migrations, Graphify rebuild/export, "
+        "state/registry mutation, NAS backup mutation, and destructive or "
+        "public-facing commands. If approval is missing, stale, ambiguous, or "
+        "only implied by a plan/handoff, do not perform the mutation. Return "
+        "an approval-needed summary naming the action, target, risk, and "
+        "verification you would run after approval."
+    )
+    parts.append(
         "\nComplete this task using the tools available to you. "
         "When finished, provide a clear, concise summary of:\n"
         "- What you did\n"

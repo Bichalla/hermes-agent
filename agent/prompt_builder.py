@@ -304,6 +304,23 @@ TASK_COMPLETION_GUIDANCE = (
     "is always better than inventing a result."
 )
 
+RUNTIME_LIVE_ENFORCEMENT_GUIDANCE = (
+    "# Runtime-live action guard\n"
+    "Before any live side-effecting workflow action, verify that the latest user "
+    "message contains current-turn explicit approval for the exact action and "
+    "target. Live actions include cron/job create-update-resume-run, external "
+    "message delivery, public deploy/route changes, credential reads, live DB "
+    "writes/imports/migrations, Graphify rebuild/export, state/registry mutation, "
+    "NAS backup mutation, and destructive or public-facing commands.\n"
+    "If approval is missing, stale, ambiguous, or only implied by a plan/handoff, "
+    "stop before the mutation and return an approval-needed summary naming the "
+    "action, target, risk, and verification you would run after approval.\n"
+    "Delegate/subagent boundary: do not let delegate_task or child agents bypass "
+    "this guard. Subagents may scout, draft, test, and report; they must not "
+    "perform live side effects unless the parent task context explicitly includes "
+    "the same current-turn approval and scope."
+)
+
 # OpenAI GPT/Codex-specific execution guidance.  Addresses known failure modes
 # where GPT models abandon work on partial results, skip prerequisite lookups,
 # hallucinate instead of using tools, and declare "done" without verification.

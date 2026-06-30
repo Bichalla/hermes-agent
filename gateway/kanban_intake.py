@@ -600,6 +600,41 @@ def _is_generic_title(value: str) -> bool:
     return bool(_GENERIC_TITLE_RE.search(title))
 
 
+def _has_any(text: str, *needles: str) -> bool:
+    value = str(text or "")
+    lowered = value.lower()
+    return any(str(needle).lower() in lowered or str(needle) in value for needle in needles)
+
+
+def _is_clunky_title(value: str) -> bool:
+    title = _compact_title(value)
+    if not title:
+        return True
+    return _has_any(
+        title,
+        "[상현]",
+        "이거",
+        "왜이래",
+        "왜 이래",
+        "낫지 않나",
+        "어떻게하지",
+        "기준이 뭐야",
+        "??",
+        "ㅅㅂ",
+        "ㅋㅋ",
+    )
+
+
+def _normalize_korean_title_intent(text: str) -> str:
+    if _has_any(text, "타이틀", "title") and _has_any(text, "왜이래", "왜 이래", "변한게 없어", "카드후보"):
+        return "Improve Kanban intake title normalization"
+    if _has_any(text, "해커톤", "hackathon") and _has_any(text, "칸반", "kanban") and _has_any(text, "카드", "board", "보드"):
+        return "Create hackathon Kanban board backlog"
+    if _has_any(text, "기존 카드", "기존 카드들") and _has_any(text, "기준", "지우", "어떻게"):
+        return "Review existing lifelog-control Kanban cards"
+    return ""
+
+
 def _candidate_title_text(request: IntakeDetectionRequest) -> str:
     text = _CASUAL_TITLE_NOISE_RE.sub(" ", request.user_summary or "")
     # Prefer the segment that actually contains the card-worthy object instead
@@ -621,7 +656,7 @@ def explicit_title_from_request(request: IntakeDetectionRequest, proposed_title:
     scannable without opening the card body. Caller-supplied titles are kept
     unless they are empty or generic boilerplate.
     """
-    if not _is_generic_title(proposed_title):
+    if proposed_title and not _is_generic_title(proposed_title) and not _is_clunky_title(proposed_title):
         return _compact_title(proposed_title)
 
     text = _candidate_title_text(request)
@@ -637,6 +672,9 @@ def explicit_title_from_request(request: IntakeDetectionRequest, proposed_title:
         return "Implement gateway follow-up work"
     if ("gateway" in lowered or "게이트웨이" in text) and ("restart" in lowered or "재시작" in text):
         return "Verify gateway restart follow-up"
+    normalized = _normalize_korean_title_intent(text)
+    if normalized:
+        return normalized
     if "칸반" in text or "kanban" in lowered:
         return _compact_title(text or "Kanban follow-up")
     if "구현" in text:

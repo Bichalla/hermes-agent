@@ -18,6 +18,7 @@ def test_no_live_smoke_script_outputs_safe_booleans(tmp_path, monkeypatch):
     assert data["cron_mutated"] is False
     assert data["lifelog_db_mutated"] is False
     assert data["graphify_run"] is False
+    assert data["jokl_public_customer_mutation"] is False
     assert data["kanban_env_overrides_cleared"] is True
     assert data["card_created_in_temp_home"] is True
     assert data["card_status"] == "blocked"

@@ -1,3 +1,5 @@
+import pytest
+
 from gateway.kanban_intake import (
     AuxiliaryLLMDetector,
     KanbanIntakeConfig,
@@ -55,6 +57,95 @@ def test_title_generator_names_live_smoke_scope():
         default_tenant="lifelog",
     )
     assert explicit_title_from_request(request) == "Verify Discord live smoke for lifelog-control"
+
+
+def test_title_generator_names_hackathon_kanban_backlog_request():
+    request = IntakeDetectionRequest(
+        platform="discord",
+        session_key="s1",
+        source_ref="kp_safe",
+        user_summary="이거 해커톤 관련해서 칸반보드 만들고 카드 만드는게 낫지 않나??",
+        assistant_summary="칸반은 만드는 게 낫다.",
+        default_board="lifelog-control",
+        default_tenant="lifelog",
+    )
+    assert explicit_title_from_request(request) == "Create hackathon Kanban board backlog"
+
+
+def test_title_generator_rewrites_raw_clunky_proposed_title():
+    request = IntakeDetectionRequest(
+        platform="discord",
+        session_key="s1",
+        source_ref="kp_safe",
+        user_summary="이거 해커톤 관련해서 칸반보드 만들고 카드 만드는게 낫지 않나??",
+        assistant_summary="칸반은 만드는 게 낫다.",
+        default_board="lifelog-control",
+        default_tenant="lifelog",
+    )
+    raw_title = "[상현] 이거 해커톤 관련해서 칸반보드 만들고 카드 만드는게 낫지 않나??"
+    assert explicit_title_from_request(request, raw_title) == "Create hackathon Kanban board backlog"
+
+
+def test_title_generator_names_existing_card_review_request():
+    request = IntakeDetectionRequest(
+        platform="discord",
+        session_key="s1",
+        source_ref="kp_safe",
+        user_summary="기존 카드들은 어떻게하지? 지우면 되나? 카드후보 기준이 뭐야?",
+        assistant_summary="기준을 정리하자.",
+        default_board="lifelog-control",
+        default_tenant="lifelog",
+    )
+    assert explicit_title_from_request(request) == "Review existing lifelog-control Kanban cards"
+
+
+def test_title_generator_names_title_normalization_complaint():
+    request = IntakeDetectionRequest(
+        platform="discord",
+        session_key="s1",
+        source_ref="kp_safe",
+        user_summary="방금 다른 스레드에서 또 카드후보 타이틀 줬는데 변한게 없어 이거 왜이래?? ㅅㅂ",
+        assistant_summary="원인을 확인했다.",
+        default_board="lifelog-control",
+        default_tenant="lifelog",
+    )
+    assert explicit_title_from_request(request) == "Improve Kanban intake title normalization"
+
+
+@pytest.mark.parametrize(
+    ("user_summary", "expected", "forbidden_fragments"),
+    [
+        (
+            "이거 해커톤 관련해서 칸반보드 만들고 카드 만드는게 낫지 않나??",
+            "Create hackathon Kanban board backlog",
+            ["이거", "낫지 않나", "??", "[상현]"],
+        ),
+        (
+            "방금 다른 스레드에서 또 카드후보 타이틀 줬는데 변한게 없어 이거 왜이래?? ㅅㅂ",
+            "Improve Kanban intake title normalization",
+            ["왜이래", "ㅅㅂ", "??", "[상현]"],
+        ),
+        (
+            "기존 카드들은 어떻게하지? 지우면 되나? 카드후보 기준이 뭐야?",
+            "Review existing lifelog-control Kanban cards",
+            ["어떻게하지", "지우면", "기준이 뭐야", "?"],
+        ),
+    ],
+)
+def test_title_generator_removes_clunky_chat_fragments(user_summary, expected, forbidden_fragments):
+    request = IntakeDetectionRequest(
+        platform="discord",
+        session_key="s1",
+        source_ref="kp_safe",
+        user_summary=user_summary,
+        assistant_summary="확인했다.",
+        default_board="lifelog-control",
+        default_tenant="lifelog",
+    )
+    title = explicit_title_from_request(request, f"[상현] {user_summary}")
+    assert title == expected
+    for fragment in forbidden_fragments:
+        assert fragment not in title
 
 
 def test_title_generator_preserves_specific_human_or_auxiliary_title():

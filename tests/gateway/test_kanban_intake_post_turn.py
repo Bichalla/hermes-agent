@@ -60,6 +60,31 @@ async def test_post_turn_rewrites_generic_detector_title(tmp_path):
 
 
 @pytest.mark.asyncio
+async def test_post_turn_rewrites_raw_clunky_korean_detector_title(tmp_path):
+    cfg = KanbanIntakeConfig(enabled=True, default_board="lifelog-control", store_path=tmp_path / "pending.db")
+    runner = object.__new__(GatewayRunner)
+    runner._kanban_intake_config = lambda: cfg
+    runner._kanban_intake_store = lambda _cfg=None: __import__("gateway.kanban_intake", fromlist=["PendingKanbanStore"]).PendingKanbanStore(cfg.store_path)
+    raw_title = "[상현] 이거 해커톤 관련해서 칸반보드 만들고 카드 만드는게 낫지 않나??"
+    runner._kanban_intake_detector = Detector(DetectorDecision(
+        True,
+        title=raw_title,
+        body={"source_ref": "kp_safe"},
+    ))
+    event = MessageEvent(
+        text="이거 해커톤 관련해서 칸반보드 만들고 카드 만드는게 낫지 않나??",
+        message_type=MessageType.TEXT,
+        source=source(),
+        message_id="1521543610456084602",
+    )
+    msg = await runner._maybe_build_kanban_intake_proposal_message(event, "s1", event.text, "칸반은 만드는 게 낫다.")
+    assert msg is not None
+    assert "Create hackathon Kanban board backlog" in msg
+    assert "이거 해커톤 관련" not in msg
+    assert "낫지 않나" not in msg
+
+
+@pytest.mark.asyncio
 async def test_post_turn_noop_for_false_unsafe_empty_or_command(tmp_path):
     cfg = KanbanIntakeConfig(enabled=True, default_board="lifelog-control", store_path=tmp_path / "pending.db")
     runner = object.__new__(GatewayRunner)

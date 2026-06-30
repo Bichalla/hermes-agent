@@ -32,7 +32,7 @@ def _captured_context_cwd(agent):
     """The cwd build_system_prompt_parts hands to build_context_files_prompt."""
     captured = {}
 
-    def fake_context_files(cwd=None, skip_soul=False):
+    def fake_context_files(cwd=None, skip_soul=False, context_length=None):
         captured["cwd"] = cwd
         return ""
 
@@ -58,21 +58,56 @@ class TestContextFileCwd:
         assert _captured_context_cwd(_make_agent()) == tmp_path
 
 
-class TestRuntimeLiveEnforcement:
-    def _stable_prompt(self, agent):
-        with (
-            patch("run_agent.load_soul_md", return_value=""),
-            patch("run_agent.build_nous_subscription_prompt", return_value=""),
-            patch("run_agent.build_environment_hints", return_value=""),
-            patch("run_agent.build_context_files_prompt", return_value=""),
-        ):
-            return build_system_prompt_parts(agent)["stable"]
+def _stable_prompt(agent):
+    with (
+        patch("run_agent.load_soul_md", return_value=""),
+        patch("run_agent.build_nous_subscription_prompt", return_value=""),
+        patch("run_agent.build_environment_hints", return_value=""),
+        patch("run_agent.build_context_files_prompt", return_value=""),
+    ):
+        return build_system_prompt_parts(agent)["stable"]
 
+
+def _init_code_repo(path):
+    """A git repo that actually holds code — the coding posture requires a source
+    file (or manifest), not a bare ``.git`` (a prose/notes repo stays general)."""
+    import subprocess
+
+    subprocess.run(["git", "-C", str(path), "init", "-q"], check=True)
+    (path / "main.py").write_text("print('hi')\n")
+
+
+class TestCodingContextBlock:
+    def test_injected_when_active(self, monkeypatch, tmp_path):
+        _init_code_repo(tmp_path)
+        monkeypatch.setenv("TERMINAL_CWD", str(tmp_path))
+        agent = _make_agent(valid_tool_names=["read_file"], platform="cli")
+        stable = _stable_prompt(agent)
+        assert "coding agent" in stable
+        assert "Workspace" in stable
+
+    def test_absent_when_off(self, monkeypatch, tmp_path):
+        _init_code_repo(tmp_path)
+        monkeypatch.setenv("TERMINAL_CWD", str(tmp_path))
+        agent = _make_agent(valid_tool_names=["read_file"], platform="cli")
+        # Drive the real path: force the resolved mode to "off" via config.
+        with patch("agent.coding_context._coding_mode", return_value="off"):
+            stable = _stable_prompt(agent)
+        assert "coding agent" not in stable
+
+    def test_absent_without_tools(self, monkeypatch, tmp_path):
+        _init_code_repo(tmp_path)
+        monkeypatch.setenv("TERMINAL_CWD", str(tmp_path))
+        agent = _make_agent(valid_tool_names=[], platform="cli")
+        assert "coding agent" not in _stable_prompt(agent)
+
+class TestRuntimeLiveEnforcement:
     def test_runtime_live_guard_injected_for_tool_capable_agents(self):
-        stable = self._stable_prompt(
+        stable = _stable_prompt(
             _make_agent(
                 valid_tool_names=["terminal", "cronjob", "send_message", "delegate_task"],
                 _runtime_live_enforcement=True,
+                _parallel_tool_call_guidance=False,
             )
         )
 
@@ -81,10 +116,11 @@ class TestRuntimeLiveEnforcement:
         assert "Delegate/subagent boundary" in stable
 
     def test_runtime_live_guard_can_be_disabled(self):
-        stable = self._stable_prompt(
+        stable = _stable_prompt(
             _make_agent(
                 valid_tool_names=["terminal", "cronjob", "send_message", "delegate_task"],
                 _runtime_live_enforcement=False,
+                _parallel_tool_call_guidance=False,
             )
         )
 

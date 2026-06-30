@@ -10,6 +10,7 @@ Gateway conversational intake is a default-off guardrail for proposing Kanban ca
 - `취소`, `ㄴㄴ`, or `보류` denies the pending proposal without creating a card.
 - Created cards are `blocked` by default, never `ready` or `running`.
 - This path never dispatches a worker by itself; blocked intake cards require an explicit human promotion/unblock before worker execution.
+- Generated titles use an action/object summary from the user request and replace generic boilerplate such as `Review ... follow-up and define next action`.
 
 ## Configuration
 

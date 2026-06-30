@@ -41,6 +41,15 @@ _SENSITIVE_PATTERNS = (
     re.compile(r"(?:의료|진단|처방|복용|열|해수|아이|자녀|가족|아내|수지|가치관|정체성|비밀번호|토큰|시크릿)"),
 )
 _ID_LIKE_RE = re.compile(r"\b\d{8,}\b")
+_TITLE_MAX_CHARS = 72
+_GENERIC_TITLE_RE = re.compile(
+    r"(?:review\s+.*follow[-\s]?up|define\s+next\s+action|safe\s+ops\s+follow[-\s]?up|conversational\s+kanban\s+follow[-\s]?up)",
+    re.I,
+)
+_CASUAL_TITLE_NOISE_RE = re.compile(
+    r"(?:ㅋㅋ+|ㅎㅎ+|ㅠㅠ+|너무\s*허접하다|허접하다|왜\s*이래\??|게이트웨이\s*재시작\s*했고|게이트웨이재시작했고)",
+    re.I,
+)
 
 
 @dataclass(frozen=True)
@@ -576,6 +585,67 @@ def minimize_for_detector(text: str, *, max_chars: int = 500) -> str:
     return value
 
 
+def _compact_title(value: str, *, max_chars: int = _TITLE_MAX_CHARS) -> str:
+    title = " ".join(str(value or "").replace("\n", " ").split())
+    title = _ID_LIKE_RE.sub("[id]", title).strip(" -:;,.，。")
+    if len(title) > max_chars:
+        title = title[: max_chars - 1].rstrip(" -:;,.，。") + "…"
+    return title
+
+
+def _is_generic_title(value: str) -> bool:
+    title = _compact_title(value)
+    if not title:
+        return True
+    return bool(_GENERIC_TITLE_RE.search(title))
+
+
+def _candidate_title_text(request: IntakeDetectionRequest) -> str:
+    text = _CASUAL_TITLE_NOISE_RE.sub(" ", request.user_summary or "")
+    # Prefer the segment that actually contains the card-worthy object instead
+    # of carrying preceding conversational acknowledgements/restart chatter into
+    # the card title.
+    segments = [s.strip(" -:;,.，。") for s in re.split(r"(?:그리고|근데|,|，|\.|。|;|；)", text) if s.strip()]
+    title_words = ("title generator", "타이틀", "제목", "kanban", "칸반", "gateway", "lifelog", "smoke")
+    for segment in segments:
+        if any(word.lower() in segment.lower() for word in title_words):
+            return segment
+    return text
+
+
+def explicit_title_from_request(request: IntakeDetectionRequest, proposed_title: str = "") -> str:
+    """Return a compact, action/object title for a Kanban intake card.
+
+    Heuristic intake must not create vague cards like "Review ... follow-up and
+    define next action". Titles should name the actual work item so the board is
+    scannable without opening the card body. Caller-supplied titles are kept
+    unless they are empty or generic boilerplate.
+    """
+    if not _is_generic_title(proposed_title):
+        return _compact_title(proposed_title)
+
+    text = _candidate_title_text(request)
+    lowered = text.lower()
+
+    if "title generator" in lowered and ("kanban" in lowered or "칸반" in text):
+        return "Improve Kanban intake title generator"
+    if "live smoke" in lowered and ("lifelog-control" in lowered or "discord" in lowered):
+        return "Verify Discord live smoke for lifelog-control"
+    if "conversational intake" in lowered and ("kanban" in lowered or "칸반" in text):
+        return "Improve conversational Kanban intake"
+    if "gateway" in lowered and ("구현" in text or "implement" in lowered):
+        return "Implement gateway follow-up work"
+    if ("gateway" in lowered or "게이트웨이" in text) and ("restart" in lowered or "재시작" in text):
+        return "Verify gateway restart follow-up"
+    if "칸반" in text or "kanban" in lowered:
+        return _compact_title(text or "Kanban follow-up")
+    if "구현" in text:
+        return _compact_title(f"Implement {text.replace('구현', '').strip() or 'follow-up work'}")
+    if "검증" in text:
+        return _compact_title(f"Verify {text.replace('검증', '').strip() or 'follow-up work'}")
+    return _compact_title(text or "Follow up on conversation")
+
+
 class KeywordHeuristicDetector:
     """Small deterministic detector for tests/local smoke; fails closed by default."""
 
@@ -585,7 +655,7 @@ class KeywordHeuristicDetector:
         haystack = f"{request.user_summary}\n{request.assistant_summary}".lower()
         if not any(word.lower() in haystack for word in self._CARD_WORDS):
             return DetectorDecision(False)
-        title = request.user_summary[:80].strip() or "Conversational Kanban follow-up"
+        title = explicit_title_from_request(request)
         return DetectorDecision(
             True,
             title=title,
@@ -681,7 +751,7 @@ def build_detection_request(
 def proposal_from_decision(decision: DetectorDecision, request: IntakeDetectionRequest, binding: SourceBinding, cfg: KanbanIntakeConfig) -> KanbanCardProposal:
     return KanbanCardProposal(
         board=request.default_board,
-        title=decision.title,
+        title=explicit_title_from_request(request, decision.title),
         body=decision.body or {
             "source_ref": request.source_ref,
             "acceptance_criteria": ["review and define follow-up"],

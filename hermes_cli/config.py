@@ -1401,14 +1401,14 @@ DEFAULT_CONFIG = {
         "auto_subscribe_on_create": True,
         # Default-off gateway conversational intake. When enabled, the
         # gateway can store a source-bound pending Kanban proposal and a
-        # same-user short approval can create a triage/blocked card.
+        # same-user short approval can create a blocked review card by default.
         "conversational_intake": {
             "enabled": False,
             "platforms": ["discord"],
             "default_board": "",
             "default_assignee": "default",
             "default_tenant": "lifelog",
-            "default_status": "triage",
+            "default_status": "blocked",
             "proposal_ttl_seconds": 1800,
             "max_pending_per_session": 1,
             "short_approval_phrases": ["승인", "ㅇㅇ", "고고", "그렇게 해", "좋아", "진행"],

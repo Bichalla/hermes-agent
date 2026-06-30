@@ -8,8 +8,8 @@ Gateway conversational intake is a default-off guardrail for proposing Kanban ca
 - When enabled, the gateway can detect card-worthy work after an agent turn and store one source-bound pending proposal.
 - A short same-user reply such as `승인`, `ㅇㅇ`, or `고고` executes only that stored pending proposal.
 - `취소`, `ㄴㄴ`, or `보류` denies the pending proposal without creating a card.
-- Created cards are `triage` by default, never `ready` or `running`.
-- This path never dispatches a worker.
+- Created cards are `blocked` by default, never `ready` or `running`.
+- This path never dispatches a worker by itself; blocked intake cards require an explicit human promotion/unblock before worker execution.
 
 ## Configuration
 
@@ -23,7 +23,7 @@ kanban:
     default_board: ""
     default_assignee: default
     default_tenant: lifelog
-    default_status: triage
+    default_status: blocked
     proposal_ttl_seconds: 1800
     max_pending_per_session: 1
     detector: heuristic
@@ -59,6 +59,10 @@ Expected booleans include:
 - `graphify_run: false`
 - `kanban_env_overrides_cleared: true`
 - `card_created_in_temp_home: true`
+- `card_status: blocked`
+- `card_blocked_by_default: true`
+- `card_unclaimed_before_dispatch: true`
+- `blocked_card_not_dispatched: true`
 - `approved_short_phrase: true`
 - `cross_user_fail_closed: true`
 - `missing_user_id_fail_closed: true`

@@ -50,7 +50,7 @@ class KanbanIntakeConfig:
     default_board: str = ""
     default_assignee: str = "default"
     default_tenant: str = "lifelog"
-    default_status: str = "triage"
+    default_status: str = "blocked"
     proposal_ttl_seconds: int = 1800
     max_pending_per_session: int = 1
     short_approval_phrases: tuple[str, ...] = ("승인", "ㅇㅇ", "고고", "그렇게 해", "좋아", "진행")
@@ -95,9 +95,9 @@ def parse_config(config: Optional[dict[str, Any]]) -> KanbanIntakeConfig:
     if not isinstance(block, dict):
         block = {}
 
-    status = str(block.get("default_status") or "triage").strip().lower()
+    status = str(block.get("default_status") or "blocked").strip().lower()
     if status not in _ALLOWED_STATUSES:
-        status = "triage"
+        status = "blocked"
 
     platforms_raw = block.get("platforms", ("discord",))
     if isinstance(platforms_raw, str):
@@ -174,7 +174,7 @@ class KanbanCardProposal:
     body: dict[str, Any]
     source_ref: str
     user_id: str
-    proposed_status: str = "triage"
+    proposed_status: str = "blocked"
     domain: str = "lifelog-core"
     tenant: str = "lifelog"
     assignee: str = "default"
@@ -184,7 +184,7 @@ class KanbanCardProposal:
 
     def normalized(self, cfg: KanbanIntakeConfig) -> "KanbanCardProposal":
         self.board = (self.board or cfg.default_board).strip()
-        self.proposed_status = (self.proposed_status or cfg.default_status or "triage").strip().lower()
+        self.proposed_status = (self.proposed_status or cfg.default_status or "blocked").strip().lower()
         self.tenant = (self.tenant or cfg.default_tenant).strip()
         self.assignee = (self.assignee or cfg.default_assignee).strip()
         if not self.idempotency_key:
@@ -237,7 +237,7 @@ class DetectorDecision:
     title: str = ""
     domain: str = "lifelog-core"
     tenant: str = "lifelog"
-    proposed_status: str = "triage"
+    proposed_status: str = "blocked"
     why: str = ""
     body: dict[str, Any] = field(default_factory=dict)
 
@@ -326,12 +326,14 @@ def _safe_contract_body(proposal: KanbanCardProposal) -> str:
 
 
 def render_proposal_message(proposal: KanbanCardProposal) -> str:
+    status_label = "blocked review" if proposal.proposed_status == "blocked" else proposal.proposed_status
     return (
-        "카드 후보 감지: 이건 Kanban에 triage로 남기는 게 좋다.\n"
+        f"카드 후보 감지: 이건 Kanban에 {status_label} 카드로 남기는 게 좋다.\n"
         f"- board: {proposal.board}\n"
         f"- title: {proposal.title}\n"
         f"- domain: {proposal.domain}\n"
         f"- tenant: {proposal.tenant}\n"
+        f"- status: {proposal.proposed_status}\n"
         f"- why: {proposal.why}\n"
         "- safety: dispatch 없음, ready/running 아님, live DB/cron/Graphify/JÖKL public mutation 없음\n\n"
         "승인하려면 “승인/ㅇㅇ/고고”, 취소하려면 “취소”."
@@ -537,7 +539,7 @@ def execute_pending_approval(pending: PendingKanbanApproval, cfg: KanbanIntakeCo
         conn.close()
     if not verified:
         return ApprovalResult(True, f"Kanban 카드 생성 후 검증 실패: {task_id}", task_id=task_id, verified=False, action=APPROVAL)
-    return ApprovalResult(True, f"Kanban triage 카드 생성/검증 완료: {task_id}", task_id=task_id, verified=True, action=APPROVAL)
+    return ApprovalResult(True, f"Kanban {proposal.proposed_status} 카드 생성/검증 완료: {task_id}", task_id=task_id, verified=True, action=APPROVAL)
 
 
 def handle_reply(
@@ -589,13 +591,13 @@ class KeywordHeuristicDetector:
             title=title,
             domain="lifelog-core",
             tenant=request.default_tenant or "lifelog",
-            proposed_status="triage",
+            proposed_status="blocked",
             why="multi-step or follow-up work detected",
             body={
                 "source_ref": request.source_ref,
                 "acceptance_criteria": ["review proposed scope", "define next action"],
                 "stop_conditions": ["live DB/cron/Graphify/public mutation needs separate approval"],
-                "verification": "triage card exists on configured board",
+                "verification": "blocked review card exists on configured board",
             },
         )
 
@@ -628,7 +630,7 @@ def parse_detector_json(raw: str) -> DetectorDecision:
         return DetectorDecision(False)
     if not isinstance(data, dict) or not data.get("card_worthy"):
         return DetectorDecision(False)
-    status = str(data.get("status") or data.get("proposed_status") or "triage").strip().lower()
+    status = str(data.get("status") or data.get("proposed_status") or "blocked").strip().lower()
     title = str(data.get("title") or "").strip()
     if not title or status not in _ALLOWED_STATUSES:
         return DetectorDecision(False)
@@ -682,7 +684,7 @@ def proposal_from_decision(decision: DetectorDecision, request: IntakeDetectionR
         title=decision.title,
         body=decision.body or {
             "source_ref": request.source_ref,
-            "acceptance_criteria": ["triage and define follow-up"],
+            "acceptance_criteria": ["review and define follow-up"],
             "stop_conditions": ["separate approval for live side effects"],
         },
         source_ref=request.source_ref,

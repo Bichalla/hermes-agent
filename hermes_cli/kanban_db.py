@@ -2680,6 +2680,17 @@ def create_task(
                         "goal_mode": bool(goal_mode) or None,
                     },
                 )
+                if task_status == "blocked":
+                    # A task created directly in ``blocked`` is an explicit
+                    # human-review hold, not a dependency wait. Record the
+                    # sticky block marker so recompute_ready/dispatch ticks do
+                    # not auto-promote it to ready.
+                    _append_event(
+                        conn,
+                        task_id,
+                        "blocked",
+                        {"reason": "created_blocked", "sticky": True},
+                    )
             return task_id
         except sqlite3.IntegrityError:
             if attempt == 1:

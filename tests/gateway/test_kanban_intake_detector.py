@@ -23,14 +23,20 @@ def req():
 def test_heuristic_detects_card_worthy_work():
     decision = KeywordHeuristicDetector().detect(req())
     assert decision.card_worthy is True
-    assert decision.proposed_status == "triage"
+    assert decision.proposed_status == "blocked"
 
 
 def test_strict_json_parser_fail_closed():
     assert parse_detector_json('{"card_worthy": true, "status": "ready", "title": "x"}').card_worthy is False
     assert parse_detector_json('{"card_worthy": true}').card_worthy is False
-    good = parse_detector_json('{"card_worthy": true, "title": "Safe follow-up", "status": "triage", "body": {"source_ref": "kp"}}')
+    good = parse_detector_json('{"card_worthy": true, "title": "Safe follow-up", "status": "blocked", "body": {"source_ref": "kp"}}')
     assert good.card_worthy is True
+
+
+def test_strict_json_parser_defaults_to_blocked_when_status_omitted():
+    decision = parse_detector_json('{"card_worthy": true, "title": "Safe follow-up", "body": {"source_ref": "kp"}}')
+    assert decision.card_worthy is True
+    assert decision.proposed_status == "blocked"
 
 
 def test_redaction_minimizes_sensitive_payload_and_ids():

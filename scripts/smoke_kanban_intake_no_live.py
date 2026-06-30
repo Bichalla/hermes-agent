@@ -60,6 +60,12 @@ def main() -> int:
         conn = kb.connect(board=board)
         try:
             tasks = kb.list_tasks(conn, include_archived=True)
+            task_status = tasks[0].status if tasks else None
+            worker_pid = tasks[0].worker_pid if tasks else None
+            claim_lock = tasks[0].claim_lock if tasks else None
+            spawned = []
+            dispatch = kb.dispatch_once(conn, board=board, spawn_fn=lambda task, workspace, board=None: spawned.append(task.id) or 12345)
+            after_dispatch = kb.get_task(conn, tasks[0].id) if tasks else None
         finally:
             conn.close()
         body = tasks[0].body if tasks else ""
@@ -87,6 +93,10 @@ def main() -> int:
             "graphify_run": False,
             "kanban_env_overrides_cleared": cleared,
             "card_created_in_temp_home": bool(tasks),
+            "card_status": task_status,
+            "card_blocked_by_default": task_status == "blocked",
+            "card_unclaimed_before_dispatch": worker_pid is None and claim_lock is None,
+            "blocked_card_not_dispatched": bool(after_dispatch and after_dispatch.status == "blocked" and not spawned and not dispatch.spawned),
             "approved_short_phrase": bool(approved.verified),
             "cross_user_fail_closed": cross.handled is False,
             "missing_user_id_fail_closed": missing_user_ok,
@@ -105,6 +115,9 @@ def main() -> int:
             not result["graphify_run"],
             result["kanban_env_overrides_cleared"],
             result["card_created_in_temp_home"],
+            result["card_blocked_by_default"],
+            result["card_unclaimed_before_dispatch"],
+            result["blocked_card_not_dispatched"],
             result["approved_short_phrase"],
             result["cross_user_fail_closed"],
             result["missing_user_id_fail_closed"],

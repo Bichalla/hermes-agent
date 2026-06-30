@@ -113,6 +113,44 @@ async def test_reset_handoff_captures_old_transcript_before_reset(mock_invoke_ho
 
 @pytest.mark.asyncio
 @patch("hermes_cli.plugins.invoke_hook")
+async def test_reset_handoff_awaits_async_session_db_get_messages(mock_invoke_hook, tmp_path):
+    """Gateway uses AsyncSessionDB in production; get_messages returns a coroutine."""
+    runner = _make_runner()
+    order: list[str] = []
+
+    async def _get_messages(session_id: str):
+        order.append(f"get_messages:{session_id}")
+        return [
+            {"role": "user", "content": "async transcript survives reset"},
+        ]
+
+    runner._session_db.get_messages = _get_messages
+    runner.session_store.reset_session.side_effect = lambda session_key: order.append(
+        "reset_session"
+    ) or runner.session_store.get_or_create_session.return_value
+
+    with patch(
+        "hermes_cli.config.load_config",
+        return_value={
+            "session_handoff": {
+                "on_reset": {
+                    "enabled": True,
+                    "artifact_dir": str(tmp_path / "handoffs" / "default"),
+                }
+            }
+        },
+    ):
+        result = await runner._handle_reset_command(_make_event("/new"))
+
+    assert "Session reset" in str(result) or "New session" in str(result)
+    assert order == ["get_messages:sess-old", "reset_session"]
+    handoffs = sorted(p for p in (tmp_path / "handoffs" / "default").glob("*.md") if p.name != "latest.md")
+    assert len(handoffs) == 1
+    assert "async transcript survives reset" in handoffs[0].read_text(encoding="utf-8")
+
+
+@pytest.mark.asyncio
+@patch("hermes_cli.plugins.invoke_hook")
 async def test_reset_handoff_failure_does_not_block_reset_and_logs_safely(
     mock_invoke_hook,
     tmp_path,

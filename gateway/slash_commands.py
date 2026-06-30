@@ -107,7 +107,7 @@ class GatewaySlashCommandsMixin:
             pass
         return str(path)
 
-    def _capture_reset_handoff_input(
+    async def _capture_reset_handoff_input(
         self,
         *,
         old_entry: Any,
@@ -118,6 +118,8 @@ class GatewaySlashCommandsMixin:
         Logs include only exception class names, not transcript/body/path payloads.
         """
         try:
+            from inspect import isawaitable
+
             from hermes_cli.config import load_config as _load_config
             from hermes_cli.session_handoff import resolve_handoff_config
 
@@ -136,6 +138,8 @@ class GatewaySlashCommandsMixin:
 
         try:
             messages = session_db.get_messages(old_session_id)
+            if isawaitable(messages):
+                messages = await messages
         except Exception as exc:
             logger.warning("Session handoff transcript capture failed: %s", exc.__class__.__name__)
             return handoff_cfg, None
@@ -213,7 +217,7 @@ class GatewaySlashCommandsMixin:
         # Snapshot the old entry so on_session_finalize can report the
         # expiring session id before reset_session() rotates it.
         old_entry = self.session_store._entries.get(session_key)
-        handoff_cfg, handoff_messages = self._capture_reset_handoff_input(old_entry=old_entry)
+        handoff_cfg, handoff_messages = await self._capture_reset_handoff_input(old_entry=old_entry)
 
         # Close tool resources on the old agent (terminal sandboxes, browser
         # daemons, background processes) before evicting from cache.

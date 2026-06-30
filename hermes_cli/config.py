@@ -1399,6 +1399,26 @@ DEFAULT_CONFIG = {
         # behaviour — e.g. for a profile that prefers explicit
         # ``kanban_notify-subscribe`` calls per task.
         "auto_subscribe_on_create": True,
+        # Default-off gateway conversational intake. When enabled, the
+        # gateway can store a source-bound pending Kanban proposal and a
+        # same-user short approval can create a triage/blocked card.
+        "conversational_intake": {
+            "enabled": False,
+            "platforms": ["discord"],
+            "default_board": "",
+            "default_assignee": "default",
+            "default_tenant": "lifelog",
+            "default_status": "triage",
+            "proposal_ttl_seconds": 1800,
+            "max_pending_per_session": 1,
+            "short_approval_phrases": ["승인", "ㅇㅇ", "고고", "그렇게 해", "좋아", "진행"],
+            "deny_phrases": ["취소", "ㄴㄴ", "하지마", "보류"],
+            "detector": "heuristic",
+            "auxiliary_detector_enabled": False,
+            "redact_before_auxiliary": True,
+            "pending_retention_seconds": 86400,
+            "card_body_include_raw_source_ids": False,
+        },
     },
 
     # Anthropic prompt caching (Claude via OpenRouter or native Anthropic API).

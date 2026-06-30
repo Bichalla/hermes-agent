@@ -7892,6 +7892,112 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
 
         await adapter.send(source.chat_id, content, metadata=metadata)
 
+    def _kanban_intake_config(self):
+        from gateway.kanban_intake import parse_config
+        try:
+            return parse_config(_load_gateway_config())
+        except Exception:
+            logger.debug("kanban intake config parse failed", exc_info=True)
+            return parse_config({})
+
+    def _kanban_intake_store(self, cfg=None):
+        from gateway.kanban_intake import PendingKanbanStore
+        cfg = cfg or self._kanban_intake_config()
+        return PendingKanbanStore(cfg.store_path)
+
+    async def _maybe_handle_kanban_intake_reply(self, event: MessageEvent, session_key: str) -> Optional[str]:
+        from gateway.kanban_intake import (
+            SourceBinding,
+            classify_reply,
+            handle_reply,
+        )
+        cfg = self._kanban_intake_config()
+        if not cfg.enabled or event.message_type != MessageType.TEXT or event.get_command():
+            return None
+        platform = getattr(getattr(event.source, "platform", None), "value", getattr(event.source, "platform", ""))
+        if str(platform).lower() not in cfg.normalized_platforms:
+            return None
+        if classify_reply(event.text or "", cfg) == "none":
+            return None
+        try:
+            binding = SourceBinding.from_source(event.source, session_key, message_id=event.message_id)
+        except ValueError:
+            return None
+        store = self._kanban_intake_store(cfg)
+        result = await asyncio.to_thread(handle_reply, event.text or "", binding, cfg, store)
+        return result.message if result.handled else None
+
+    async def _maybe_build_kanban_intake_proposal_message(
+        self,
+        event: MessageEvent,
+        session_key: str,
+        user_message: str,
+        assistant_response: str,
+    ) -> Optional[str]:
+        from gateway.kanban_intake import (
+            KeywordHeuristicDetector,
+            SourceBinding,
+            build_detection_request,
+            proposal_from_decision,
+            render_proposal_message,
+            validate_proposal,
+        )
+        cfg = self._kanban_intake_config()
+        if (
+            not cfg.enabled
+            or not cfg.default_board
+            or event.message_type != MessageType.TEXT
+            or event.get_command()
+            or not (assistant_response or "").strip()
+        ):
+            return None
+        platform = getattr(getattr(event.source, "platform", None), "value", getattr(event.source, "platform", ""))
+        if str(platform).lower() not in cfg.normalized_platforms:
+            return None
+        try:
+            binding = SourceBinding.from_source(event.source, session_key, message_id=event.message_id)
+        except ValueError:
+            return None
+        request = build_detection_request(
+            source=event.source,
+            session_key=session_key,
+            user_message=user_message,
+            assistant_response=assistant_response,
+            cfg=cfg,
+        )
+        detector = getattr(self, "_kanban_intake_detector", None) or KeywordHeuristicDetector()
+        try:
+            decision = await asyncio.to_thread(detector.detect, request)
+        except Exception:
+            logger.debug("kanban intake detector failed", exc_info=True)
+            return None
+        if not getattr(decision, "card_worthy", False):
+            return None
+        proposal = proposal_from_decision(decision, request, binding, cfg)
+        ok, reason = validate_proposal(proposal, cfg)
+        if not ok:
+            logger.info("kanban intake proposal rejected: %s", reason)
+            return None
+        store = self._kanban_intake_store(cfg)
+        try:
+            await asyncio.to_thread(
+                store.put_pending,
+                proposal,
+                binding,
+                cfg,
+                source_ids={
+                    "platform": str(platform),
+                    "chat_id": getattr(event.source, "chat_id", None),
+                    "thread_id": getattr(event.source, "thread_id", None),
+                    "message_id": getattr(event, "message_id", None),
+                    "user_id": getattr(event.source, "user_id", None),
+                },
+            )
+        except Exception as exc:
+            logger.info("kanban intake pending store rejected proposal: %s", exc)
+            return None
+        return render_proposal_message(proposal)
+
     async def _handle_message(self, event: MessageEvent) -> Optional[str]:
         """
         Handle an incoming message from any platform.
@@ -8173,6 +8279,10 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             # the confirm doesn't block normal usage indefinitely.  The user
             # clearly moved on.
             _slash_confirm_mod.clear_if_stale(_quick_key)
+
+        _kanban_intake_reply = await self._maybe_handle_kanban_intake_reply(event, _quick_key)
+        if _kanban_intake_reply is not None:
+            return _kanban_intake_reply
 
         # PRIORITY handling when an agent is already running for this session.
         # Default behavior is to interrupt immediately so user text/stop messages
@@ -10557,6 +10667,19 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                         response = f"> 💭 **Reasoning:**\n{_quoted}\n\n{response}"
                     else:
                         response = f"💭 **Reasoning:**\n```\n{display_reasoning}\n```\n\n{response}"
+
+            if response and not agent_result.get("already_sent") and not _intentional_silence:
+                try:
+                    _proposal_message = await self._maybe_build_kanban_intake_proposal_message(
+                        event,
+                        session_key,
+                        message_text,
+                        response,
+                    )
+                    if _proposal_message:
+                        response = f"{response}\n\n---\n{_proposal_message}"
+                except Exception as _ki_err:
+                    logger.debug("kanban intake post-turn hook failed: %s", _ki_err)
 
             # Runtime-metadata footer — only on the FINAL message of the turn.
             # Off by default (display.runtime_footer.enabled=false).  When

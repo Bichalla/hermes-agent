@@ -63,6 +63,9 @@ def main() -> int:
 
         one_off_card_proposal_suppressed = not detector.detect(detector_request("이거 왜이래??")).card_worthy
         meta_kanban_card_proposal_suppressed = not detector.detect(detector_request("카드 생성 조건이 너무 후한거 아닌가?")).card_worthy
+        read_only_candidate_audit_suppressed = not detector.detect(detector_request(
+            "내 헤르메스 프로젝트 전체 좀 보고 보드 또는 카드 후보로 올릴 수 있는 대상 뭔지 확인하고 추천 목록 작성해서 알려줘봐. (실행은 금지)"
+        )).card_worthy
         store = PendingKanbanStore(cfg.store_path)
         binding = SourceBinding("discord", "raw_chat_123456789", "raw_thread_123456789", "u1", "s1")
         proposal = KanbanCardProposal(
@@ -121,6 +124,7 @@ def main() -> int:
             "missing_user_id_fail_closed": missing_user_ok,
             "one_off_card_proposal_suppressed": one_off_card_proposal_suppressed,
             "meta_kanban_card_proposal_suppressed": meta_kanban_card_proposal_suppressed,
+            "read_only_candidate_audit_suppressed": read_only_candidate_audit_suppressed,
             "raw_source_ids_in_card_body": any(raw in (body or "") for raw in ("raw_chat_123456789", "raw_thread_123456789", "u1")),
             "sensitive_payload_in_card_body": bool(sensitive_payload_in_card_body),
         }
@@ -146,6 +150,7 @@ def main() -> int:
             result["missing_user_id_fail_closed"],
             result["one_off_card_proposal_suppressed"],
             result["meta_kanban_card_proposal_suppressed"],
+            result["read_only_candidate_audit_suppressed"],
             not result["raw_source_ids_in_card_body"],
             not result["sensitive_payload_in_card_body"],
         ]) else "FAIL")

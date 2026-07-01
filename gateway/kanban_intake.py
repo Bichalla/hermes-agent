@@ -72,6 +72,14 @@ _CONCRETE_FOLLOWUP_RE = re.compile(
     r"(?:구현|테스트|커밋|리뷰|분석|수정|작성|검증|재발\s*방지|다듬|plan|writing plan|migration|cron|smoke)",
     re.I,
 )
+_READ_ONLY_ACTION_RE = re.compile(
+    r"(?:실행\s*(?:은\s*)?금지|실행하지\s*말|생성\s*금지|만\s*추천|추천\s*목록|확인만|목록만|read[-\s]?only|recommend(?:ation)?\s+only)",
+    re.I,
+)
+_CANDIDATE_AUDIT_RE = re.compile(
+    r"(?:(?:보드|카드)\s*(?:또는|/)?\s*(?:카드)?\s*후보|카드\s*후보|board/card\s+candidate|kanban\s+candidate)",
+    re.I,
+)
 
 
 @dataclass(frozen=True)
@@ -657,6 +665,8 @@ def _is_clunky_title(value: str) -> bool:
 def _normalize_korean_title_intent(text: str) -> str:
     if _has_any(text, "타이틀", "title") and _has_any(text, "왜이래", "왜 이래", "변한게 없어", "카드후보"):
         return "Improve Kanban intake title normalization"
+    if _has_any(text, "후보", "candidate") and _has_any(text, "보드", "카드", "kanban") and _has_any(text, "Hermes", "헤르메스"):
+        return "Review Hermes Kanban board/card candidates"
     if _has_any(text, "해커톤", "hackathon") and _has_any(text, "칸반", "kanban") and _has_any(text, "카드", "board", "보드"):
         return "Create hackathon Kanban board backlog"
     if _has_any(text, "기존 카드", "기존 카드들") and _has_any(text, "기준", "지우", "어떻게"):
@@ -670,6 +680,14 @@ def _clean_gate_text(request: IntakeDetectionRequest) -> str:
 
 def _has_explicit_card_request(text: str) -> bool:
     return bool(_EXPLICIT_CARD_REQUEST_RE.search(text))
+
+
+def _is_read_only_candidate_audit(text: str) -> bool:
+    return bool(_CANDIDATE_AUDIT_RE.search(text) and _READ_ONLY_ACTION_RE.search(text))
+
+
+def _has_explicit_user_card_request(request: IntakeDetectionRequest) -> bool:
+    return _has_explicit_card_request(request.user_summary or "")
 
 
 def _is_approved_live_smoke_request(text: str) -> bool:
@@ -698,11 +716,14 @@ def _has_concrete_followup_signal(text: str) -> bool:
 
 def card_proposal_eligibility(request: IntakeDetectionRequest, decision: Optional[DetectorDecision] = None) -> ProposalEligibility:
     text = _clean_gate_text(request)
+    user_text = " ".join(str(request.user_summary or "").split())
     if _is_meta_or_one_off(text):
         return ProposalEligibility(False, "meta discussion or one-off question", "negative_meta_one_off")
-    if _is_approved_live_smoke_request(text):
+    if _is_approved_live_smoke_request(user_text):
         return ProposalEligibility(True, "approved live smoke request", "approved_live_smoke_request")
-    if _has_explicit_card_request(text):
+    if _is_read_only_candidate_audit(user_text) and not _has_explicit_user_card_request(request):
+        return ProposalEligibility(False, "read-only candidate audit", "read_only_candidate_audit")
+    if _has_explicit_user_card_request(request):
         return ProposalEligibility(True, "explicit card request", "explicit_card_request")
     if _is_vague_board_creation_discussion(text):
         return ProposalEligibility(False, "board discussion requires explicit long-lived project request", "board_requires_explicit_request")

@@ -52,6 +52,24 @@ def test_heuristic_does_not_propose_for_one_off_or_meta_kanban_discussion(user_s
 
 
 @pytest.mark.parametrize("user_summary", [
+    "내 헤르메스 프로젝트 전체 좀 보고 보드 또는 카드 후보로 올릴 수 있는 대상 뭔지 확인하고 추천 목록 작성해서 알려줘봐. (실행은 금지)",
+    "보드/카드 후보만 추천해줘. 실행하지 말고 목록만.",
+    "현재 프로젝트 카드 후보 확인만 해줘. 생성 금지.",
+])
+def test_heuristic_does_not_propose_for_read_only_candidate_audits(user_summary):
+    request = IntakeDetectionRequest(
+        platform="discord",
+        session_key="s1",
+        source_ref="kp_safe",
+        user_summary=user_summary,
+        assistant_summary="추천 목록을 답변했다.",
+        default_board="lifelog-control",
+        default_tenant="lifelog",
+    )
+    assert KeywordHeuristicDetector().detect(request).card_worthy is False
+
+
+@pytest.mark.parametrize("user_summary", [
     "이 작업은 카드로 남겨줘: Kanban intake threshold hardening writing plan 리뷰 후 구현",
     "JÖKL 마케팅 패킷 생성기 다음 스프린트 작업을 정리하고 테스트/커밋까지 해야 해",
     "lifelog medication reminder cron 누락 원인 분석하고 재발 방지 테스트까지 해줘",
@@ -100,6 +118,53 @@ def test_title_generator_names_live_smoke_scope():
         default_tenant="lifelog",
     )
     assert explicit_title_from_request(request) == "Verify Discord live smoke for lifelog-control"
+
+
+def test_title_generator_names_project_wide_candidate_audit_when_explicit_card_requested():
+    request = IntakeDetectionRequest(
+        platform="discord",
+        session_key="s1",
+        source_ref="kp_safe",
+        user_summary="이 작업은 카드로 남겨줘: Hermes 프로젝트 전체 보드/카드 후보 추천 목록 정리",
+        assistant_summary="후보 목록을 정리했다.",
+        default_board="lifelog-control",
+        default_tenant="lifelog",
+    )
+    title = explicit_title_from_request(request, "[상현] Hermes 프로젝트 전체 보드 또는 카드 후보 추천 목록 작성")
+    assert title == "Review Hermes Kanban board/card candidates"
+    assert "[상현]" not in title
+    assert "추천 목록 작성" not in title
+
+
+def test_heuristic_keeps_explicit_candidate_audit_card_request_eligible_with_semantic_title():
+    request = IntakeDetectionRequest(
+        platform="discord",
+        session_key="s1",
+        source_ref="kp_safe",
+        user_summary="이 작업은 카드로 남겨줘: Hermes 프로젝트 전체 보드/카드 후보 추천 목록 정리",
+        assistant_summary="후보 목록을 정리했다.",
+        default_board="lifelog-control",
+        default_tenant="lifelog",
+    )
+    decision = KeywordHeuristicDetector().detect(request)
+    assert decision.card_worthy is True
+    assert decision.why == "explicit card request"
+    assert decision.title == "Review Hermes Kanban board/card candidates"
+
+
+def test_title_generator_does_not_label_non_hermes_candidate_audit_as_hermes():
+    request = IntakeDetectionRequest(
+        platform="discord",
+        session_key="s1",
+        source_ref="kp_safe",
+        user_summary="이 작업은 카드로 남겨줘: JÖKL 프로젝트 보드/카드 후보 추천 목록 정리",
+        assistant_summary="후보 목록을 정리했다.",
+        default_board="lifelog-control",
+        default_tenant="lifelog",
+    )
+    title = explicit_title_from_request(request, "[상현] JÖKL 프로젝트 보드 또는 카드 후보 추천 목록 작성")
+    assert title != "Review Hermes Kanban board/card candidates"
+    assert "Hermes" not in title
 
 
 def test_title_generator_names_hackathon_kanban_backlog_request():

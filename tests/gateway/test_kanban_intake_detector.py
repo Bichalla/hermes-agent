@@ -30,6 +30,49 @@ def test_heuristic_detects_card_worthy_work():
     assert decision.title == "Implement gateway follow-up work"
 
 
+@pytest.mark.parametrize("user_summary", [
+    "카드 생성 조건이 너무 후한거 아닌가?",
+    "칸반보드가 필요한거는 장기로 이어지는 프로젝트에 한정해야되는 거 아니야??",
+    "방금 다른 스레드에서 또 카드후보 타이틀 줬는데 변한게 없어 이거 왜이래??",
+    "이거 왜이래??",
+    "오늘 수면 기록 어떻게 하지?",
+    "해커톤 관련해서 칸반보드 만드는 게 낫지 않나?",
+])
+def test_heuristic_does_not_propose_for_one_off_or_meta_kanban_discussion(user_summary):
+    request = IntakeDetectionRequest(
+        platform="discord",
+        session_key="s1",
+        source_ref="kp_safe",
+        user_summary=user_summary,
+        assistant_summary="답변했다.",
+        default_board="lifelog-control",
+        default_tenant="lifelog",
+    )
+    assert KeywordHeuristicDetector().detect(request).card_worthy is False
+
+
+@pytest.mark.parametrize("user_summary", [
+    "이 작업은 카드로 남겨줘: Kanban intake threshold hardening writing plan 리뷰 후 구현",
+    "JÖKL 마케팅 패킷 생성기 다음 스프린트 작업을 정리하고 테스트/커밋까지 해야 해",
+    "lifelog medication reminder cron 누락 원인 분석하고 재발 방지 테스트까지 해줘",
+    "게이트웨이재시작했고 칸반보드 title generator를 더 명시적으로 다듬자. 구현/테스트까지 하자",
+    "승인: Discord live smoke 테스트 blocked card 1개 생성/검증해",
+])
+def test_heuristic_proposes_for_explicit_card_durable_followup_or_approved_smoke(user_summary):
+    request = IntakeDetectionRequest(
+        platform="discord",
+        session_key="s1",
+        source_ref="kp_safe",
+        user_summary=user_summary,
+        assistant_summary="후속 작업이 필요하다.",
+        default_board="lifelog-control",
+        default_tenant="lifelog",
+    )
+    decision = KeywordHeuristicDetector().detect(request)
+    assert decision.card_worthy is True
+    assert decision.proposed_status == "blocked"
+
+
 def test_title_generator_replaces_generic_boilerplate_with_specific_work_item():
     request = IntakeDetectionRequest(
         platform="discord",

@@ -7938,6 +7938,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             KeywordHeuristicDetector,
             SourceBinding,
             build_detection_request,
+            card_proposal_eligibility,
             proposal_from_decision,
             render_proposal_message,
             validate_proposal,
@@ -7972,6 +7973,10 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             logger.debug("kanban intake detector failed", exc_info=True)
             return None
         if not getattr(decision, "card_worthy", False):
+            return None
+        eligibility = card_proposal_eligibility(request, decision)
+        if not eligibility.eligible:
+            logger.debug("kanban intake proposal skipped: %s", eligibility.reason)
             return None
         proposal = proposal_from_decision(decision, request, binding, cfg)
         ok, reason = validate_proposal(proposal, cfg)

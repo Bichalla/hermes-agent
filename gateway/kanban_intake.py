@@ -50,6 +50,28 @@ _CASUAL_TITLE_NOISE_RE = re.compile(
     r"(?:ㅋㅋ+|ㅎㅎ+|ㅠㅠ+|너무\s*허접하다|허접하다|왜\s*이래\??|게이트웨이\s*재시작\s*했고|게이트웨이재시작했고)",
     re.I,
 )
+_EXPLICIT_CARD_REQUEST_RE = re.compile(
+    r"(?:카드로\s*남겨|카드\s*(?:만들|생성)(?:해|해줘|해주세요|하자|요청)|칸반에\s*추가|add\s+(?:a\s+)?kanban\s+card|create\s+(?:a\s+)?card)",
+    re.I,
+)
+_APPROVED_LIVE_SMOKE_RE = re.compile(
+    r"(?:승인|approved).*(?:live\s*smoke|라이브\s*스모크|smoke|스모크).*(?:blocked|차단|블록).*(?:card|카드)",
+    re.I,
+)
+_BOARD_REQUEST_RE = re.compile(r"(?:보드\s*생성|보드\s*만들|칸반보드\s*만들|create\s+(?:a\s+)?board)", re.I)
+_KANBAN_META_RE = re.compile(
+    r"(?:카드\s*생성\s*조건|조건이\s*너무\s*후|칸반보드가\s*필요한거|쓸데\s*없이|너무\s*후한|카드후보\s*타이틀)",
+    re.I,
+)
+_ONE_OFF_QUESTION_RE = re.compile(r"(?:어떻게\s*하지|왜\s*이래|뭐야\??|맞지\??|아니야\??|낫지\s*않나|\?\?)")
+_DURABLE_PROJECT_RE = re.compile(
+    r"(?:프로젝트|스프린트|장기|워크스트림|JÖKL|jokl|lifelog|gateway|게이트웨이|kanban\s*intake|칸반\s*intake|title\s*generator|cron|recurring|migration|implementation|구현|테스트|커밋|리뷰|재발\s*방지)",
+    re.I,
+)
+_CONCRETE_FOLLOWUP_RE = re.compile(
+    r"(?:구현|테스트|커밋|리뷰|분석|수정|작성|검증|재발\s*방지|다듬|plan|writing plan|migration|cron|smoke)",
+    re.I,
+)
 
 
 @dataclass(frozen=True)
@@ -249,6 +271,13 @@ class DetectorDecision:
     proposed_status: str = "blocked"
     why: str = ""
     body: dict[str, Any] = field(default_factory=dict)
+
+
+@dataclass(frozen=True)
+class ProposalEligibility:
+    eligible: bool
+    reason: str
+    matched_rule: str = ""
 
 
 class KanbanIntakeDetector(Protocol):
@@ -635,6 +664,53 @@ def _normalize_korean_title_intent(text: str) -> str:
     return ""
 
 
+def _clean_gate_text(request: IntakeDetectionRequest) -> str:
+    return " ".join(f"{request.user_summary}\n{request.assistant_summary}".split())
+
+
+def _has_explicit_card_request(text: str) -> bool:
+    return bool(_EXPLICIT_CARD_REQUEST_RE.search(text))
+
+
+def _is_approved_live_smoke_request(text: str) -> bool:
+    return bool(_APPROVED_LIVE_SMOKE_RE.search(text))
+
+
+def _is_vague_board_creation_discussion(text: str) -> bool:
+    if not (_BOARD_REQUEST_RE.search(text) or "칸반보드" in text or "kanban board" in text.lower()):
+        return False
+    if _DURABLE_PROJECT_RE.search(text) and _CONCRETE_FOLLOWUP_RE.search(text):
+        return False
+    return True
+
+
+def _is_meta_or_one_off(text: str) -> bool:
+    return bool(_KANBAN_META_RE.search(text) or _ONE_OFF_QUESTION_RE.search(text))
+
+
+def _has_durable_project_anchor(text: str) -> bool:
+    return bool(_DURABLE_PROJECT_RE.search(text))
+
+
+def _has_concrete_followup_signal(text: str) -> bool:
+    return bool(_CONCRETE_FOLLOWUP_RE.search(text))
+
+
+def card_proposal_eligibility(request: IntakeDetectionRequest, decision: Optional[DetectorDecision] = None) -> ProposalEligibility:
+    text = _clean_gate_text(request)
+    if _is_meta_or_one_off(text):
+        return ProposalEligibility(False, "meta discussion or one-off question", "negative_meta_one_off")
+    if _is_approved_live_smoke_request(text):
+        return ProposalEligibility(True, "approved live smoke request", "approved_live_smoke_request")
+    if _has_explicit_card_request(text):
+        return ProposalEligibility(True, "explicit card request", "explicit_card_request")
+    if _is_vague_board_creation_discussion(text):
+        return ProposalEligibility(False, "board discussion requires explicit long-lived project request", "board_requires_explicit_request")
+    if _has_durable_project_anchor(text) and _has_concrete_followup_signal(text):
+        return ProposalEligibility(True, "durable project follow-up", "durable_followup")
+    return ProposalEligibility(False, "insufficient durable follow-up signal", "insufficient_scope")
+
+
 def _candidate_title_text(request: IntakeDetectionRequest) -> str:
     text = _CASUAL_TITLE_NOISE_RE.sub(" ", request.user_summary or "")
     # Prefer the segment that actually contains the card-worthy object instead
@@ -693,6 +769,9 @@ class KeywordHeuristicDetector:
         haystack = f"{request.user_summary}\n{request.assistant_summary}".lower()
         if not any(word.lower() in haystack for word in self._CARD_WORDS):
             return DetectorDecision(False)
+        eligibility = card_proposal_eligibility(request)
+        if not eligibility.eligible:
+            return DetectorDecision(False, why=eligibility.reason)
         title = explicit_title_from_request(request)
         return DetectorDecision(
             True,
@@ -700,7 +779,7 @@ class KeywordHeuristicDetector:
             domain="lifelog-core",
             tenant=request.default_tenant or "lifelog",
             proposed_status="blocked",
-            why="multi-step or follow-up work detected",
+            why=eligibility.reason,
             body={
                 "source_ref": request.source_ref,
                 "acceptance_criteria": ["review proposed scope", "define next action"],

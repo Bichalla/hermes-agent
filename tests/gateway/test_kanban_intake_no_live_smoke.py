@@ -15,6 +15,7 @@ def test_no_live_smoke_script_outputs_safe_booleans(tmp_path, monkeypatch):
     data = json.loads(proc.stdout)
     assert data["gateway_restarted"] is False
     assert data["discord_sent_live"] is False
+    assert data["board_created_live"] is False
     assert data["cron_mutated"] is False
     assert data["lifelog_db_mutated"] is False
     assert data["graphify_run"] is False
@@ -28,5 +29,7 @@ def test_no_live_smoke_script_outputs_safe_booleans(tmp_path, monkeypatch):
     assert data["approved_short_phrase"] is True
     assert data["cross_user_fail_closed"] is True
     assert data["missing_user_id_fail_closed"] is True
+    assert data["one_off_card_proposal_suppressed"] is True
+    assert data["meta_kanban_card_proposal_suppressed"] is True
     assert data["raw_source_ids_in_card_body"] is False
     assert data["sensitive_payload_in_card_body"] is False

@@ -34,8 +34,10 @@ def main() -> int:
     with tempfile.TemporaryDirectory(prefix="hermes-kanban-intake-") as td:
         os.environ["HERMES_HOME"] = str(Path(td) / ".hermes")
         from gateway.kanban_intake import (
+            IntakeDetectionRequest,
             KanbanCardProposal,
             KanbanIntakeConfig,
+            KeywordHeuristicDetector,
             PendingKanbanStore,
             SourceBinding,
             handle_reply,
@@ -46,6 +48,21 @@ def main() -> int:
         board = "lifelog-control"
         kb.create_board(board, name="Lifelog Control")
         cfg = KanbanIntakeConfig(enabled=True, default_board=board, store_path=Path(td) / "pending.db")
+        detector = KeywordHeuristicDetector()
+
+        def detector_request(user_summary: str) -> IntakeDetectionRequest:
+            return IntakeDetectionRequest(
+                platform="discord",
+                session_key="s1",
+                source_ref="kp_safe",
+                user_summary=user_summary,
+                assistant_summary="답변했다.",
+                default_board=board,
+                default_tenant="lifelog",
+            )
+
+        one_off_card_proposal_suppressed = not detector.detect(detector_request("이거 왜이래??")).card_worthy
+        meta_kanban_card_proposal_suppressed = not detector.detect(detector_request("카드 생성 조건이 너무 후한거 아닌가?")).card_worthy
         store = PendingKanbanStore(cfg.store_path)
         binding = SourceBinding("discord", "raw_chat_123456789", "raw_thread_123456789", "u1", "s1")
         proposal = KanbanCardProposal(
@@ -88,6 +105,7 @@ def main() -> int:
         result = {
             "gateway_restarted": False,
             "discord_sent_live": False,
+            "board_created_live": False,
             "cron_mutated": False,
             "lifelog_db_mutated": False,
             "graphify_run": False,
@@ -101,6 +119,8 @@ def main() -> int:
             "approved_short_phrase": bool(approved.verified),
             "cross_user_fail_closed": cross.handled is False,
             "missing_user_id_fail_closed": missing_user_ok,
+            "one_off_card_proposal_suppressed": one_off_card_proposal_suppressed,
+            "meta_kanban_card_proposal_suppressed": meta_kanban_card_proposal_suppressed,
             "raw_source_ids_in_card_body": any(raw in (body or "") for raw in ("raw_chat_123456789", "raw_thread_123456789", "u1")),
             "sensitive_payload_in_card_body": bool(sensitive_payload_in_card_body),
         }
@@ -111,6 +131,7 @@ def main() -> int:
         print("PASS" if all([
             not result["gateway_restarted"],
             not result["discord_sent_live"],
+            not result["board_created_live"],
             not result["cron_mutated"],
             not result["lifelog_db_mutated"],
             not result["graphify_run"],
@@ -123,6 +144,8 @@ def main() -> int:
             result["approved_short_phrase"],
             result["cross_user_fail_closed"],
             result["missing_user_id_fail_closed"],
+            result["one_off_card_proposal_suppressed"],
+            result["meta_kanban_card_proposal_suppressed"],
             not result["raw_source_ids_in_card_body"],
             not result["sensitive_payload_in_card_body"],
         ]) else "FAIL")

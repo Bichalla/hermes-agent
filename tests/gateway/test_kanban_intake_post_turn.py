@@ -102,6 +102,32 @@ async def test_post_turn_read_only_candidate_audit_ignores_assistant_card_wordin
 
 
 @pytest.mark.asyncio
+async def test_post_turn_suppresses_current_turn_subagent_review_command_even_if_detector_says_true(tmp_path):
+    cfg = KanbanIntakeConfig(enabled=True, default_board="lifelog-control", store_path=tmp_path / "pending.db")
+    runner = object.__new__(GatewayRunner)
+    runner._kanban_intake_config = lambda: cfg
+    runner._kanban_intake_store = lambda _cfg=None: __import__("gateway.kanban_intake", fromlist=["PendingKanbanStore"]).PendingKanbanStore(cfg.store_path)
+    runner._kanban_intake_detector = Detector(DetectorDecision(
+        True,
+        title="[상현] 리뷰까지 서브에이전트 시켜서 진행해봐",
+        body={"source_ref": "kp_safe"},
+    ))
+    event = MessageEvent(
+        text="리뷰까지 서브에이전트 시켜서 진행해봐",
+        message_type=MessageType.TEXT,
+        source=source(),
+        message_id="1521543610456084604",
+    )
+    msg = await runner._maybe_build_kanban_intake_proposal_message(
+        event,
+        "s1",
+        event.text,
+        "리뷰 3개 서브에이전트로 병렬 발사함.",
+    )
+    assert msg is None
+
+
+@pytest.mark.asyncio
 async def test_post_turn_renders_semantic_title_for_explicit_candidate_audit_card_request(tmp_path):
     cfg = KanbanIntakeConfig(enabled=True, default_board="lifelog-control", store_path=tmp_path / "pending.db")
     runner = object.__new__(GatewayRunner)

@@ -65,7 +65,11 @@ _KANBAN_META_RE = re.compile(
 )
 _ONE_OFF_QUESTION_RE = re.compile(r"(?:어떻게\s*하지|왜\s*이래|뭐야\??|맞지\??|아니야\??|낫지\s*않나|\?\?)")
 _DURABLE_PROJECT_RE = re.compile(
-    r"(?:프로젝트|스프린트|장기|워크스트림|JÖKL|jokl|lifelog|gateway|게이트웨이|kanban\s*intake|칸반\s*intake|title\s*generator|cron|recurring|migration|implementation|구현|테스트|커밋|리뷰|재발\s*방지)",
+    # Durable anchors must name a project/system/workstream or implementation
+    # object. Generic workflow verbs like "리뷰" are intentionally excluded:
+    # "리뷰까지 서브에이전트 시켜서 진행해봐" is a current-turn instruction,
+    # not a durable Kanban follow-up.
+    r"(?:프로젝트|스프린트|장기|워크스트림|JÖKL|jokl|lifelog|gateway|게이트웨이|kanban\s*intake|칸반\s*intake|title\s*generator|cron|recurring|migration|implementation|구현|테스트|커밋|재발\s*방지)",
     re.I,
 )
 _CONCRETE_FOLLOWUP_RE = re.compile(
@@ -622,8 +626,23 @@ def minimize_for_detector(text: str, *, max_chars: int = 500) -> str:
     return value
 
 
+def _strip_chat_speaker_prefixes(value: str) -> str:
+    """Remove gateway/chat display-name prefixes from generated titles.
+
+    Multi-user Discord sessions show human messages to the model with labels like
+    ``[상현]``. Auxiliary title generators sometimes copy that label verbatim.
+    Titles are board artifacts, so speaker labels are noise and must never be
+    persisted or rendered as card titles.
+    """
+    text = str(value or "")
+    # Strip one or more short leading bracket labels, but do not remove bracketed
+    # content in the middle of a legitimate title.
+    return re.sub(r"^(?:\s*\[[^\]\n]{1,32}\]\s*)+", "", text).strip()
+
+
 def _compact_title(value: str, *, max_chars: int = _TITLE_MAX_CHARS) -> str:
-    title = " ".join(str(value or "").replace("\n", " ").split())
+    title = _strip_chat_speaker_prefixes(str(value or "").replace("\n", " "))
+    title = " ".join(title.split())
     title = _ID_LIKE_RE.sub("[id]", title).strip(" -:;,.，。")
     if len(title) > max_chars:
         title = title[: max_chars - 1].rstrip(" -:;,.，。") + "…"
@@ -753,8 +772,14 @@ def explicit_title_from_request(request: IntakeDetectionRequest, proposed_title:
     scannable without opening the card body. Caller-supplied titles are kept
     unless they are empty or generic boilerplate.
     """
-    if proposed_title and not _is_generic_title(proposed_title) and not _is_clunky_title(proposed_title):
-        return _compact_title(proposed_title)
+    proposed_compact = _compact_title(proposed_title)
+    proposed_normalized = _normalize_korean_title_intent(
+        "\n".join(part for part in (request.user_summary or "", proposed_compact) if part)
+    )
+    if proposed_normalized:
+        return proposed_normalized
+    if proposed_compact and not _is_generic_title(proposed_compact) and not _is_clunky_title(proposed_compact):
+        return proposed_compact
 
     text = _candidate_title_text(request)
     lowered = text.lower()

@@ -5,6 +5,7 @@ from gateway.kanban_intake import (
     KanbanIntakeConfig,
     KeywordHeuristicDetector,
     IntakeDetectionRequest,
+    card_proposal_eligibility,
     explicit_title_from_request,
     minimize_for_detector,
     parse_detector_json,
@@ -67,6 +68,43 @@ def test_heuristic_does_not_propose_for_read_only_candidate_audits(user_summary)
         default_tenant="lifelog",
     )
     assert KeywordHeuristicDetector().detect(request).card_worthy is False
+
+
+def test_review_subagent_current_turn_command_is_not_durable_kanban_followup():
+    request = IntakeDetectionRequest(
+        platform="discord",
+        session_key="s1",
+        source_ref="kp_safe",
+        user_summary="리뷰까지 서브에이전트 시켜서 진행해봐",
+        assistant_summary="리뷰 3개 서브에이전트로 병렬 발사함.",
+        default_board="lifelog-control",
+        default_tenant="lifelog",
+    )
+
+    eligibility = card_proposal_eligibility(request)
+    assert eligibility.eligible is False
+    assert eligibility.matched_rule == "insufficient_scope"
+    assert KeywordHeuristicDetector().detect(request).card_worthy is False
+
+
+def test_title_generator_strips_discord_sender_prefix_even_for_unmapped_titles():
+    request = IntakeDetectionRequest(
+        platform="discord",
+        session_key="s1",
+        source_ref="kp_safe",
+        user_summary="리뷰까지 서브에이전트 시켜서 진행해봐",
+        assistant_summary="리뷰 3개 서브에이전트로 병렬 발사함.",
+        default_board="lifelog-control",
+        default_tenant="lifelog",
+    )
+
+    title = explicit_title_from_request(
+        request,
+        "[상현] 리뷰까지 서브에이전트 시켜서 진행해봐",
+    )
+
+    assert title == "리뷰까지 서브에이전트 시켜서 진행해봐"
+    assert "[상현]" not in title
 
 
 @pytest.mark.parametrize("user_summary", [

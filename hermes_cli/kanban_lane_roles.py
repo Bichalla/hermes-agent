@@ -53,6 +53,7 @@ class LaneRoleContract:
     recommended_assignee: Optional[str] = None
     recommended_skills: list[str] = field(default_factory=list)
     subagent_task_role: Optional[str] = None
+    review_source_pointer: Optional[str] = None
     parseable: bool = True
 
 
@@ -68,6 +69,11 @@ class ReadyCheckResult:
 
 
 def _task_get(task: Any, name: str, default: Any = None) -> Any:
+    try:
+        if hasattr(task, "keys") and name in task.keys():
+            return task[name]
+    except Exception:
+        pass
     if isinstance(task, dict):
         return task.get(name, default)
     return getattr(task, name, default)
@@ -118,6 +124,44 @@ def _contract_payload(body: dict[str, Any]) -> dict[str, Any]:
     return body
 
 
+def contract_body_has_signal(body: Any) -> bool:
+    """Return True when a body contains actual lane/role contract metadata."""
+    parsed = _body_to_dict(body)
+    if parsed is None:
+        return False
+    if isinstance(parsed.get("contract"), dict):
+        return True
+    contract_keys = {
+        "lane",
+        "type",
+        "card_type",
+        "risk_class",
+        "human_required",
+        "approval_boundary",
+        "repository_or_root",
+        "acceptance_criteria",
+        "verification",
+        "stop_conditions",
+        "recommended_assignee",
+        "recommended_skills",
+        "subagent_task_role",
+    }
+    return any(key in parsed for key in contract_keys)
+
+
+def _first_text(*values: Any) -> Optional[str]:
+    for value in values:
+        if isinstance(value, (list, tuple, set)):
+            joined = ", ".join(str(item).strip() for item in value if str(item).strip())
+            if joined:
+                return joined
+            continue
+        text = str(value or "").strip()
+        if text:
+            return text
+    return None
+
+
 def parse_contract_body(body: Any) -> LaneRoleContract:
     """Parse top-level or conversational-intake-envelope contract metadata."""
     parsed = _body_to_dict(body)
@@ -137,8 +181,29 @@ def parse_contract_body(body: Any) -> LaneRoleContract:
         recommended_assignee=str(payload.get("recommended_assignee") or "").strip() or None,
         recommended_skills=_as_list(payload.get("recommended_skills")),
         subagent_task_role=str(payload.get("subagent_task_role") or "").strip() or None,
+        review_source_pointer=_first_text(
+            payload.get("reviewed_artifact"),
+            payload.get("reviewed_artifacts"),
+            payload.get("source_plan_path"),
+            payload.get("source_plan"),
+            payload.get("artifact_path"),
+            payload.get("artifact"),
+            parsed.get("source_ref") if isinstance(parsed, dict) else None,
+        ),
         parseable=True,
     )
+
+
+def _task_skills(task: Any) -> list[str]:
+    raw = _task_get(task, "skills", None)
+    if isinstance(raw, str):
+        try:
+            parsed = json.loads(raw)
+        except json.JSONDecodeError:
+            parsed = None
+        if isinstance(parsed, list):
+            return _as_list(parsed)
+    return _as_list(raw)
 
 
 def _discover_profile_names() -> set[str]:
@@ -206,8 +271,11 @@ def ready_check_task(
         missing.append("assignee_profile")
     if contract.subagent_task_role and contract.subagent_task_role not in SUBAGENT_TASK_ROLES:
         errors.append("invalid_subagent_task_role")
-    if any(skill.casefold() in toolsets for skill in contract.recommended_skills):
+    all_skills = contract.recommended_skills + _task_skills(task)
+    if any(skill.casefold() in toolsets for skill in all_skills):
         errors.append("skill_is_toolset")
+    if contract.lane == "review_safety" and not contract.review_source_pointer:
+        errors.append("review_source_pointer")
     if contract.lane and contract.lane == assignee and contract.lane in VIRTUAL_LANES:
         errors.append("lane_used_as_assignee")
 

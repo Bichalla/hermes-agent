@@ -9,6 +9,7 @@ engine works on sqlite3.Row objects as well as dataclasses.
 
 from __future__ import annotations
 
+import json
 import time
 from pathlib import Path
 
@@ -614,6 +615,188 @@ def test_stranded_in_ready_works_on_real_db_row(kanban_home):
     finally:
         conn.close()
 
+
+
+# ---------------------------------------------------------------------------
+# lane_role_contract rule — Kanban control-surface readiness
+# ---------------------------------------------------------------------------
+
+
+def _lane_contract(**overrides):
+    body = {
+        "lane": "implementation",
+        "type": "code_change",
+        "risk_class": "S3",
+        "human_required": True,
+        "approval_boundary": ["commit", "push"],
+        "repository_or_root": "/tmp/repo",
+        "acceptance_criteria": ["focused tests pass"],
+        "verification": {"command": "pytest"},
+        "stop_conditions": ["no live mutation without approval"],
+        "recommended_assignee": "default",
+        "recommended_skills": ["software-development-lifecycle-operations"],
+        "subagent_task_role": "implementer",
+    }
+    body.update(overrides)
+    return body
+
+
+def _lane_cfg():
+    return {"profiles": ["default"], "toolset_names": ["terminal", "web", "browser"]}
+
+
+def test_lane_role_contract_diagnostic_rejects_recommended_assignee_as_executable():
+    task = _task(
+        status="ready",
+        assignee="",
+        body=json.dumps(_lane_contract(recommended_assignee="default")),
+    )
+
+    diags = kd.compute_task_diagnostics(task, [], [], config=_lane_cfg())
+    contract = [d for d in diags if d.kind == "lane_role_contract"]
+
+    assert len(contract) == 1
+    d = contract[0]
+    assert d.severity == "error"
+    assert d.data["pickup_ready"] is False
+    assert d.data["assignee_valid"] is False
+    assert "assignee_profile" in d.data["missing_fields"]
+    assert d.data["recommended_next_action"] == "assign_real_profile"
+
+
+def test_lane_role_contract_diagnostic_reports_missing_verification_and_stop_conditions():
+    task = _task(
+        status="ready",
+        assignee="default",
+        body=json.dumps(_lane_contract(verification=None, stop_conditions=[])),
+    )
+
+    diags = kd.compute_task_diagnostics(task, [], [], config=_lane_cfg())
+    d = [d for d in diags if d.kind == "lane_role_contract"][0]
+
+    assert d.severity == "error"
+    assert "verification" in d.data["missing_fields"]
+    assert "stop_conditions" in d.data["missing_fields"]
+    assert d.data["lane"] == "implementation"
+
+
+def test_lane_role_contract_diagnostic_rejects_toolsets_as_recommended_skills():
+    task = _task(
+        status="ready",
+        assignee="default",
+        body=json.dumps(_lane_contract(recommended_skills=["terminal"])),
+    )
+
+    diags = kd.compute_task_diagnostics(task, [], [], config=_lane_cfg())
+    d = [d for d in diags if d.kind == "lane_role_contract"][0]
+
+    assert d.severity == "error"
+    assert "skill_is_toolset" in d.data["errors"]
+
+
+def test_lane_role_contract_diagnostic_rejects_toolsets_in_task_skills():
+    task = _task(
+        status="ready",
+        assignee="default",
+        skills=["terminal"],
+        body=json.dumps(_lane_contract()),
+    )
+
+    diags = kd.compute_task_diagnostics(task, [], [], config=_lane_cfg())
+    d = [d for d in diags if d.kind == "lane_role_contract"][0]
+
+    assert d.severity == "error"
+    assert "skill_is_toolset" in d.data["errors"]
+
+
+def test_lane_role_contract_diagnostic_warns_blocked_contract_is_not_dispatchable():
+    task = _task(
+        status="blocked",
+        assignee="default",
+        body=json.dumps(_lane_contract(lane="planning", type="implementation_plan")),
+    )
+
+    diags = kd.compute_task_diagnostics(task, [], [], config=_lane_cfg())
+    d = [d for d in diags if d.kind == "lane_role_contract"][0]
+
+    assert d.severity == "warning"
+    assert d.data["recommended_next_action"] == "keep_blocked"
+    assert "blocked cards are not dispatchable" in d.data["warnings"]
+
+
+def test_lane_role_contract_diagnostic_silent_for_pickup_ready_contract():
+    task = _task(
+        status="ready",
+        assignee="default",
+        body=json.dumps(_lane_contract()),
+    )
+
+    diags = kd.compute_task_diagnostics(task, [], [], config=_lane_cfg())
+
+    assert [d for d in diags if d.kind == "lane_role_contract"] == []
+
+
+def test_lane_role_contract_diagnostic_requires_review_safety_source_pointer():
+    task = _task(
+        status="ready",
+        assignee="default",
+        body=json.dumps(_lane_contract(lane="review_safety", type="spec_review")),
+    )
+
+    diags = kd.compute_task_diagnostics(task, [], [], config=_lane_cfg())
+    d = [d for d in diags if d.kind == "lane_role_contract"][0]
+
+    assert d.severity == "error"
+    assert "review_source_pointer" in d.data["errors"]
+
+
+def test_lane_role_contract_diagnostic_accepts_review_safety_source_plan_pointer():
+    task = _task(
+        status="ready",
+        assignee="default",
+        body=json.dumps(_lane_contract(
+            lane="review_safety",
+            type="spec_review",
+            source_plan_path="docs/plans/example.md",
+        )),
+    )
+
+    diags = kd.compute_task_diagnostics(task, [], [], config=_lane_cfg())
+
+    assert [d for d in diags if d.kind == "lane_role_contract"] == []
+
+
+def test_lane_role_contract_diagnostic_stays_silent_for_legacy_contract_prose():
+    task = _task(
+        status="ready",
+        assignee="default",
+        body="Review the vendor contract before implementation.",
+    )
+
+    diags = kd.compute_task_diagnostics(task, [], [], config=_lane_cfg())
+
+    assert [d for d in diags if d.kind == "lane_role_contract"] == []
+
+
+def test_lane_role_contract_diagnostic_works_on_sqlite_rows_without_false_gaps(kanban_home):
+    conn = kb.connect()
+    try:
+        tid = kb.create_task(
+            conn,
+            title="valid lane role row",
+            body=json.dumps(_lane_contract()),
+            assignee="default",
+            initial_status="blocked",
+        )
+        conn.execute("UPDATE tasks SET status = 'ready' WHERE id = ?", (tid,))
+        conn.commit()
+        task_row = conn.execute("SELECT * FROM tasks WHERE id = ?", (tid,)).fetchone()
+
+        diags = kd.compute_task_diagnostics(task_row, [], [], config=_lane_cfg())
+
+        assert [d for d in diags if d.kind == "lane_role_contract"] == []
+    finally:
+        conn.close()
 
 
 # ---------------------------------------------------------------------------

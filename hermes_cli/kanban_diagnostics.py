@@ -481,6 +481,85 @@ def _rule_triage_aux_unavailable(task, events, runs, now, cfg) -> list[Diagnosti
     )]
 
 
+def _rule_lane_role_contract(task, events, runs, now, cfg) -> list[Diagnostic]:
+    """Surface Phase 1 lane/role contract gaps without mutating the card.
+
+    Stay quiet for legacy cards with no contract signal at all; otherwise older
+    boards would light up simply because they predate lane/role metadata. When
+    metadata is present, delegate readiness semantics to kanban_lane_roles so
+    diagnostics and future CLI ready-check share one source of truth.
+    """
+    body = _task_field(task, "body", None)
+    if not body:
+        return []
+
+    try:
+        from hermes_cli import kanban_lane_roles as lane_roles
+    except Exception:
+        return []
+    if not lane_roles.contract_body_has_signal(body):
+        return []
+
+    profiles = cfg.get("profiles") or cfg.get("existing_profiles")
+    existing_profiles = {str(p) for p in profiles} if profiles is not None else None
+    toolsets = cfg.get("toolset_names")
+    toolset_names = {str(t) for t in toolsets} if toolsets is not None else None
+    result = lane_roles.ready_check_task(
+        task,
+        existing_profiles=existing_profiles,
+        toolset_names=toolset_names,
+    )
+    if result.pickup_ready:
+        return []
+    if not (
+        result.missing_fields
+        or result.errors
+        or result.warnings
+        or result.recommended_next_action != "pickup_ready"
+    ):
+        return []
+
+    task_id = _task_field(task, "id") or "<task_id>"
+    severity = "warning"
+    if result.errors or str(_task_field(task, "status", "")).lower() == "ready":
+        severity = "error"
+
+    actions = [
+        DiagnosticAction(
+            kind="cli_hint",
+            label="Inspect lane/role contract",
+            payload={"command": f"hermes kanban show {task_id} --json"},
+            suggested=True,
+        ),
+    ]
+
+    return [Diagnostic(
+        kind="lane_role_contract",
+        severity=severity,
+        title="Lane/role contract is not pickup-ready",
+        detail=(
+            "This card has lane/role contract metadata, but the read-only "
+            "pickup-readiness check found gaps. Lanes are metadata only; the "
+            "dispatcher should still rely on status=ready plus a real task "
+            "assignee profile, not recommended assignee metadata."
+        ),
+        actions=actions,
+        first_seen_at=now,
+        last_seen_at=now,
+        count=1,
+        data={
+            "task_id": task_id,
+            "lane": result.contract.lane,
+            "pickup_ready": result.pickup_ready,
+            "assignee_valid": result.assignee_valid,
+            "missing_fields": result.missing_fields,
+            "errors": result.errors,
+            "warnings": result.warnings,
+            "recommended_next_action": result.recommended_next_action,
+        },
+    )]
+
+
 def _rule_prose_phantom_refs(task, events, runs, now, cfg) -> list[Diagnostic]:
     """Advisory prose-scan: the completion summary mentions ``t_<hex>``
     ids that don't resolve. Non-blocking; surfaced as a warning only.
@@ -979,6 +1058,7 @@ def _rule_stranded_in_ready(task, events, runs, now, cfg) -> list[Diagnostic]:
 _RULES: list[RuleFn] = [
     _rule_hallucinated_cards,
     _rule_triage_aux_unavailable,
+    _rule_lane_role_contract,
     _rule_prose_phantom_refs,
     _rule_repeated_failures,
     _rule_repeated_crashes,
@@ -993,6 +1073,7 @@ _RULES: list[RuleFn] = [
 DIAGNOSTIC_KINDS = (
     "hallucinated_cards",
     "triage_aux_unavailable",
+    "lane_role_contract",
     "prose_phantom_refs",
     "repeated_failures",
     "repeated_crashes",

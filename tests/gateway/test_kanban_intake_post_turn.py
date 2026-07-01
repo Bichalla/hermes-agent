@@ -128,6 +128,39 @@ async def test_post_turn_suppresses_current_turn_subagent_review_command_even_if
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("text", [
+    "t_5b858cd6 카드 업데이트 승인",
+    "진행상태 업데이트",
+    "기존 카드에 진행상태 업데이트해",
+    "이 카드에 Task 4 완료 기록 남겨",
+    "tracking card t_5b858cd6에 코멘트 추가",
+])
+async def test_post_turn_suppresses_existing_card_update_even_if_detector_says_true(tmp_path, text):
+    cfg = KanbanIntakeConfig(enabled=True, default_board="lifelog-control", store_path=tmp_path / "pending.db")
+    runner = object.__new__(GatewayRunner)
+    runner._kanban_intake_config = lambda: cfg
+    runner._kanban_intake_store = lambda _cfg=None: __import__("gateway.kanban_intake", fromlist=["PendingKanbanStore"]).PendingKanbanStore(cfg.store_path)
+    runner._kanban_intake_detector = Detector(DetectorDecision(
+        True,
+        title="[상현] Update existing tracking card",
+        body={"source_ref": "kp_safe"},
+    ))
+    event = MessageEvent(
+        text=text,
+        message_type=MessageType.TEXT,
+        source=source(),
+        message_id="1521543610456084605",
+    )
+    msg = await runner._maybe_build_kanban_intake_proposal_message(
+        event,
+        "s1",
+        event.text,
+        "Hermes Agent repo에서 Kanban conversational intake 중복 노이즈를 고치는 프롬프트를 작성했다. 구현/테스트/커밋 후 검증하면 된다.",
+    )
+    assert msg is None
+
+
+@pytest.mark.asyncio
 async def test_post_turn_renders_semantic_title_for_explicit_candidate_audit_card_request(tmp_path):
     cfg = KanbanIntakeConfig(enabled=True, default_board="lifelog-control", store_path=tmp_path / "pending.db")
     runner = object.__new__(GatewayRunner)

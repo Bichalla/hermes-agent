@@ -32,5 +32,6 @@ def test_no_live_smoke_script_outputs_safe_booleans(tmp_path, monkeypatch):
     assert data["one_off_card_proposal_suppressed"] is True
     assert data["meta_kanban_card_proposal_suppressed"] is True
     assert data["read_only_candidate_audit_suppressed"] is True
+    assert data["existing_card_update_suppressed"] is True
     assert data["raw_source_ids_in_card_body"] is False
     assert data["sensitive_payload_in_card_body"] is False

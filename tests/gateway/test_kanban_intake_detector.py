@@ -87,6 +87,51 @@ def test_review_subagent_current_turn_command_is_not_durable_kanban_followup():
     assert KeywordHeuristicDetector().detect(request).card_worthy is False
 
 
+@pytest.mark.parametrize("user_summary", [
+    "t_5b858cd6 카드 업데이트 승인",
+    "진행상태 업데이트",
+    "기존 카드에 진행상태 업데이트해",
+    "이 카드에 Task 4 완료 기록 남겨",
+    "tracking card t_5b858cd6에 코멘트 추가",
+])
+def test_existing_card_update_intent_is_not_new_card_candidate(user_summary):
+    request = IntakeDetectionRequest(
+        platform="discord",
+        session_key="s1",
+        source_ref="kp_safe",
+        user_summary=user_summary,
+        assistant_summary=(
+            "Hermes Agent repo `/Users/honbul/.hermes/hermes-agent`에서 "
+            "Kanban conversational intake 중복 노이즈를 고치는 새 세션 프롬프트를 작성했다. "
+            "구현/테스트/커밋 후 검증하면 된다."
+        ),
+        default_board="lifelog-control",
+        default_tenant="lifelog",
+    )
+
+    eligibility = card_proposal_eligibility(request)
+    assert eligibility.eligible is False
+    assert eligibility.matched_rule == "existing_card_update_intent"
+    assert KeywordHeuristicDetector().detect(request).card_worthy is False
+
+
+def test_assistant_summary_card_words_do_not_override_existing_card_update_suppression():
+    request = IntakeDetectionRequest(
+        platform="discord",
+        session_key="s1",
+        source_ref="kp_safe",
+        user_summary="t_5b858cd6 진행상태 업데이트",
+        assistant_summary="이 내용을 새 카드로 만들어도 좋은 후보라고 답했다.",
+        default_board="lifelog-control",
+        default_tenant="lifelog",
+    )
+
+    eligibility = card_proposal_eligibility(request)
+    assert eligibility.eligible is False
+    assert eligibility.matched_rule == "existing_card_update_intent"
+    assert KeywordHeuristicDetector().detect(request).card_worthy is False
+
+
 def test_title_generator_strips_discord_sender_prefix_even_for_unmapped_titles():
     request = IntakeDetectionRequest(
         platform="discord",
@@ -113,6 +158,9 @@ def test_title_generator_strips_discord_sender_prefix_even_for_unmapped_titles()
     "lifelog medication reminder cron 누락 원인 분석하고 재발 방지 테스트까지 해줘",
     "게이트웨이재시작했고 칸반보드 title generator를 더 명시적으로 다듬자. 구현/테스트까지 하자",
     "승인: Discord live smoke 테스트 blocked card 1개 생성/검증해",
+    "이 내용을 새 카드로 만들어",
+    "별도 카드 생성",
+    "새 tracking card 후보로 올려: Kanban intake 중복 노이즈 회귀 테스트 추가",
 ])
 def test_heuristic_proposes_for_explicit_card_durable_followup_or_approved_smoke(user_summary):
     request = IntakeDetectionRequest(

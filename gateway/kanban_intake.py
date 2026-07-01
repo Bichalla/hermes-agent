@@ -51,7 +51,20 @@ _CASUAL_TITLE_NOISE_RE = re.compile(
     re.I,
 )
 _EXPLICIT_CARD_REQUEST_RE = re.compile(
-    r"(?:카드로\s*남겨|카드\s*(?:만들|생성)(?:해|해줘|해주세요|하자|요청)|칸반에\s*추가|add\s+(?:a\s+)?kanban\s+card|create\s+(?:a\s+)?card)",
+    r"(?:카드로\s*남겨|(?:새\s*)?카드(?:로)?\s*(?:만들|생성)(?:어|해|해줘|해주세요|하자|요청)?|새\s*(?:tracking\s*)?카드\s*후보|새\s*tracking\s*card\s*후보|별도\s*카드\s*생성|칸반에\s*추가|add\s+(?:a\s+)?kanban\s+card|create\s+(?:a\s+)?card)",
+    re.I,
+)
+_KANBAN_CARD_ID_RE = r"\bt_[a-f0-9]{6,}\b"
+_EXISTING_CARD_REF_RE = re.compile(
+    rf"(?:{_KANBAN_CARD_ID_RE}|기존\s*카드|tracking\s*card|이\s*카드)",
+    re.I,
+)
+_EXISTING_CARD_UPDATE_VERB_RE = re.compile(
+    r"(?:업데이트|update|코멘트\s*추가|댓글\s*추가|comment|진행\s*상태|진행상태|status|progress|상태\s*기록|기록\s*남겨|남겨|완료\s*기록|승인)",
+    re.I,
+)
+_STANDALONE_PROGRESS_UPDATE_RE = re.compile(
+    r"(?:진행\s*상태|진행상태|status|progress)\s*(?:업데이트|update|기록|남겨)",
     re.I,
 )
 _APPROVED_LIVE_SMOKE_RE = re.compile(
@@ -709,6 +722,21 @@ def _has_explicit_user_card_request(request: IntakeDetectionRequest) -> bool:
     return _has_explicit_card_request(request.user_summary or "")
 
 
+def suppress_existing_card_update_intent(text: str) -> bool:
+    """Return True for current-turn operations on an existing Kanban card.
+
+    These messages may mention cards and progress, but they are commands to
+    update/comment/record status on an existing tracking card, not requests to
+    open a new card proposal banner.
+    """
+    collapsed = " ".join(str(text or "").split())
+    if not collapsed:
+        return False
+    if _STANDALONE_PROGRESS_UPDATE_RE.search(collapsed):
+        return True
+    return bool(_EXISTING_CARD_REF_RE.search(collapsed) and _EXISTING_CARD_UPDATE_VERB_RE.search(collapsed))
+
+
 def _is_approved_live_smoke_request(text: str) -> bool:
     return bool(_APPROVED_LIVE_SMOKE_RE.search(text))
 
@@ -740,6 +768,8 @@ def card_proposal_eligibility(request: IntakeDetectionRequest, decision: Optiona
         return ProposalEligibility(False, "meta discussion or one-off question", "negative_meta_one_off")
     if _is_approved_live_smoke_request(user_text):
         return ProposalEligibility(True, "approved live smoke request", "approved_live_smoke_request")
+    if suppress_existing_card_update_intent(user_text) and not _has_explicit_user_card_request(request):
+        return ProposalEligibility(False, "existing card update intent", "existing_card_update_intent")
     if _is_read_only_candidate_audit(user_text) and not _has_explicit_user_card_request(request):
         return ProposalEligibility(False, "read-only candidate audit", "read_only_candidate_audit")
     if _has_explicit_user_card_request(request):

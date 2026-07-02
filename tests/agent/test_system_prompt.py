@@ -114,6 +114,24 @@ class TestRuntimeLiveEnforcement:
         assert "# Runtime-live action guard" in stable
         assert "current-turn explicit approval" in stable
         assert "Delegate/subagent boundary" in stable
+        expected_allowed_fragments = [
+            "Existing Kanban card status-memory",
+            "comments, progress notes, repo/PR/artifact links",
+            "verification summaries",
+            "handoff notes",
+            "does not require separate approval",
+        ]
+        expected_forbidden_fragments = [
+            "create new work",
+            "dispatch/unblock/complete/archive/delete",
+            "change status/assignee/priority",
+            "publish externally",
+            "read credentials",
+            "run migrations",
+            "destructive actions",
+        ]
+        for fragment in expected_allowed_fragments + expected_forbidden_fragments:
+            assert fragment in stable
 
     def test_runtime_live_guard_can_be_disabled(self):
         stable = _stable_prompt(

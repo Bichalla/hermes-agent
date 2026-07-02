@@ -1279,10 +1279,15 @@ KANBAN_HEARTBEAT_SCHEMA = {
 KANBAN_COMMENT_SCHEMA = {
     "name": "kanban_comment",
     "description": (
-        "Append a comment to a task's thread. Use for durable notes "
-        "that should outlive this run (questions for the next worker, "
-        "partial findings, rationale). Ephemeral reasoning doesn't "
-        "belong here — use your normal response instead."
+        "Append a comment to an existing task's thread. Use this directly — "
+        "do not ask for separate approval — for status-memory metadata that "
+        "should outlive this run: progress notes, repo/PR/artifact links, "
+        "verification summaries, handoff notes, and rationale attached to an "
+        "existing or already-approved task. This tool is not for creating new "
+        "work, dispatching, unblocking, completing, archiving, or deleting tasks; "
+        "changing status/assignee/priority; public delivery/deploy; credential "
+        "reads; DB migrations; or destructive actions. Those actions follow the "
+        "runtime-live approval boundary."
     ),
     "parameters": {
         "type": "object",

@@ -61,6 +61,27 @@ def test_kanban_tools_visible_with_env_var(monkeypatch, tmp_path):
     assert kanban == expected, f"expected {expected}, got {kanban}"
 
 
+def test_kanban_comment_schema_marks_existing_card_metadata_approval_free():
+    from tools.kanban_tools import KANBAN_COMMENT_SCHEMA
+
+    desc = KANBAN_COMMENT_SCHEMA["description"]
+    required_fragments = [
+        "existing task",
+        "status-memory",
+        "repo/PR/artifact",
+        "do not ask for separate approval",
+        "creating new work",
+        "dispatching, unblocking, completing, archiving, or deleting",
+        "changing status/assignee/priority",
+        "public delivery/deploy",
+        "credential reads",
+        "DB migrations",
+        "destructive actions",
+    ]
+    for fragment in required_fragments:
+        assert fragment in desc
+
+
 def test_kanban_worker_env_overrides_profile_toolset_filter(monkeypatch, tmp_path):
     """Dispatcher-spawned workers must get lifecycle tools even when the
     assignee profile restricts enabled toolsets and does not list kanban.

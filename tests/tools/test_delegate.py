@@ -2738,6 +2738,24 @@ class TestChildSystemPromptRuntimeLiveEnforcement(unittest.TestCase):
         self.assertIn("Runtime-live action guard", prompt)
         self.assertIn("current-turn explicit approval", prompt)
         self.assertIn("Return an approval-needed summary", prompt)
+        expected_allowed_fragments = [
+            "Existing Kanban card status-memory",
+            "comments, progress notes, repo/PR/artifact links",
+            "verification summaries",
+            "handoff notes",
+            "does not require separate approval",
+        ]
+        expected_forbidden_fragments = [
+            "create new work",
+            "dispatch/unblock/complete/archive/delete",
+            "change status/assignee/priority",
+            "publish externally",
+            "read credentials",
+            "run migrations",
+            "destructive actions",
+        ]
+        for fragment in expected_allowed_fragments + expected_forbidden_fragments:
+            self.assertIn(fragment, prompt)
 
 
 class TestSubagentApprovalCallback(unittest.TestCase):

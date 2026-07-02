@@ -60,7 +60,11 @@ _EXISTING_CARD_REF_RE = re.compile(
     re.I,
 )
 _EXISTING_CARD_UPDATE_VERB_RE = re.compile(
-    r"(?:업데이트|update|코멘트\s*추가|댓글\s*추가|comment|진행\s*상태|진행상태|status|progress|상태\s*기록|기록\s*남겨|남겨|완료\s*기록|승인)",
+    r"(?:업데이트|update|코멘트\s*추가|댓글\s*추가|comment|"
+    r"진행\s*상태|진행상태|status|progress|상태\s*기록|기록\s*남겨|"
+    r"기록(?:해줘|해|해주세요)?|남겨|완료\s*기록|승인|repo\s*URL|"
+    r"PR\s*URL|artifact\s*link|verification\s*summary|handoff\s*note|"
+    r"링크\s*기록|URL\s*기록|검증\s*요약|인계\s*노트)",
     re.I,
 )
 _STANDALONE_PROGRESS_UPDATE_RE = re.compile(

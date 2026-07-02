@@ -161,6 +161,39 @@ async def test_post_turn_suppresses_existing_card_update_even_if_detector_says_t
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("text", [
+    "t_deadbeef 카드에 repo URL https://github.com/NousResearch/hermes-agent 기록해줘",
+    "t_deadbeef 카드에 PR URL https://github.com/NousResearch/hermes-agent/pull/123 남겨",
+    "t_deadbeef 카드에 artifact link /tmp/report.pdf 기록 남겨",
+    "t_deadbeef 카드에 verification summary: focused tests 5 passed 기록",
+    "t_deadbeef 카드에 handoff note: 다음 worker는 prompt_builder.py부터 보면 됨 남겨",
+])
+async def test_post_turn_suppresses_existing_card_metadata_update_even_if_detector_says_true(tmp_path, text):
+    cfg = KanbanIntakeConfig(enabled=True, default_board="lifelog-control", store_path=tmp_path / "pending.db")
+    runner = object.__new__(GatewayRunner)
+    runner._kanban_intake_config = lambda: cfg
+    runner._kanban_intake_store = lambda _cfg=None: __import__("gateway.kanban_intake", fromlist=["PendingKanbanStore"]).PendingKanbanStore(cfg.store_path)
+    runner._kanban_intake_detector = Detector(DetectorDecision(
+        True,
+        title="Existing card metadata update",
+        body={"source_ref": "kp_safe"},
+    ))
+    event = MessageEvent(
+        text=text,
+        message_type=MessageType.TEXT,
+        source=source(),
+        message_id="1521543610456084606",
+    )
+    msg = await runner._maybe_build_kanban_intake_proposal_message(
+        event,
+        "s1",
+        event.text,
+        "Detector says this might be a card-worthy Kanban follow-up.",
+    )
+    assert msg is None
+
+
+@pytest.mark.asyncio
 async def test_post_turn_renders_semantic_title_for_explicit_candidate_audit_card_request(tmp_path):
     cfg = KanbanIntakeConfig(enabled=True, default_board="lifelog-control", store_path=tmp_path / "pending.db")
     runner = object.__new__(GatewayRunner)

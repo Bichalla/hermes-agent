@@ -115,6 +115,30 @@ def test_existing_card_update_intent_is_not_new_card_candidate(user_summary):
     assert KeywordHeuristicDetector().detect(request).card_worthy is False
 
 
+@pytest.mark.parametrize("user_summary", [
+    "t_deadbeef 카드에 repo URL https://github.com/NousResearch/hermes-agent 기록해줘",
+    "t_deadbeef 카드에 PR URL https://github.com/NousResearch/hermes-agent/pull/123 남겨",
+    "t_deadbeef 카드에 artifact link /tmp/report.pdf 기록 남겨",
+    "t_deadbeef 카드에 verification summary: focused tests 5 passed 기록",
+    "t_deadbeef 카드에 handoff note: 다음 worker는 prompt_builder.py부터 보면 됨 남겨",
+])
+def test_existing_card_metadata_updates_are_not_new_card_candidates(user_summary):
+    request = IntakeDetectionRequest(
+        platform="discord",
+        session_key="s1",
+        source_ref="kp_test",
+        user_summary=user_summary,
+        assistant_summary="Hermes Agent repo follow-up implementation work exists.",
+        default_board="default",
+        default_tenant="hermes-agent",
+    )
+
+    eligibility = card_proposal_eligibility(request)
+    assert eligibility.eligible is False
+    assert eligibility.matched_rule == "existing_card_update_intent"
+    assert KeywordHeuristicDetector().detect(request).card_worthy is False
+
+
 def test_assistant_summary_card_words_do_not_override_existing_card_update_suppression():
     request = IntakeDetectionRequest(
         platform="discord",

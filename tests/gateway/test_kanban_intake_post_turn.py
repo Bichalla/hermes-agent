@@ -210,6 +210,31 @@ async def test_post_turn_rewrites_raw_clunky_korean_detector_title(tmp_path):
 
 
 @pytest.mark.asyncio
+async def test_post_turn_rewrites_verbatim_detector_title_before_rendering(tmp_path):
+    cfg = KanbanIntakeConfig(enabled=True, default_board="lifelog-control", store_path=tmp_path / "pending.db")
+    runner = object.__new__(GatewayRunner)
+    runner._kanban_intake_config = lambda: cfg
+    runner._kanban_intake_store = lambda _cfg=None: __import__("gateway.kanban_intake", fromlist=["PendingKanbanStore"]).PendingKanbanStore(cfg.store_path)
+    raw_title = "카드로 남겨줘: 카드 후보 타이틀 생성시 원문 복사 금지 구현/테스트"
+    runner._kanban_intake_detector = Detector(DetectorDecision(
+        True,
+        title=raw_title,
+        body={"source_ref": "kp_safe"},
+    ))
+    event = MessageEvent(
+        text=raw_title,
+        message_type=MessageType.TEXT,
+        source=source(),
+        message_id="1521543610456084606",
+    )
+    msg = await runner._maybe_build_kanban_intake_proposal_message(event, "s1", event.text, "구현하자")
+    assert msg is not None
+    assert "Improve Kanban intake title generator" in msg
+    assert raw_title not in msg
+    assert "원문 복사 금지 구현/테스트" not in msg
+
+
+@pytest.mark.asyncio
 async def test_post_turn_noop_for_false_unsafe_empty_or_command(tmp_path):
     cfg = KanbanIntakeConfig(enabled=True, default_board="lifelog-control", store_path=tmp_path / "pending.db")
     runner = object.__new__(GatewayRunner)

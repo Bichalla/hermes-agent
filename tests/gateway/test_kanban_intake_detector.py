@@ -132,7 +132,28 @@ def test_assistant_summary_card_words_do_not_override_existing_card_update_suppr
     assert KeywordHeuristicDetector().detect(request).card_worthy is False
 
 
-def test_title_generator_strips_discord_sender_prefix_even_for_unmapped_titles():
+@pytest.mark.parametrize("user_summary", [
+    "gateway status update feature 구현/테스트까지 해줘",
+    "lifelog 진행상태 업데이트 자동화 구현/테스트까지 해줘",
+])
+def test_durable_status_update_work_is_not_suppressed_as_existing_card_update(user_summary):
+    request = IntakeDetectionRequest(
+        platform="discord",
+        session_key="s1",
+        source_ref="kp_safe",
+        user_summary=user_summary,
+        assistant_summary="후속 작업이 필요하다.",
+        default_board="lifelog-control",
+        default_tenant="lifelog",
+    )
+
+    eligibility = card_proposal_eligibility(request)
+    assert eligibility.eligible is True
+    assert eligibility.matched_rule == "durable_followup"
+    assert KeywordHeuristicDetector().detect(request).card_worthy is True
+
+
+def test_title_generator_rejects_discord_sender_prefixed_raw_title():
     request = IntakeDetectionRequest(
         platform="discord",
         session_key="s1",
@@ -148,8 +169,9 @@ def test_title_generator_strips_discord_sender_prefix_even_for_unmapped_titles()
         "[상현] 리뷰까지 서브에이전트 시켜서 진행해봐",
     )
 
-    assert title == "리뷰까지 서브에이전트 시켜서 진행해봐"
+    assert title == "Follow up on requested work"
     assert "[상현]" not in title
+    assert "리뷰까지 서브에이전트" not in title
 
 
 @pytest.mark.parametrize("user_summary", [
@@ -278,6 +300,40 @@ def test_title_generator_rewrites_raw_clunky_proposed_title():
     )
     raw_title = "[상현] 이거 해커톤 관련해서 칸반보드 만들고 카드 만드는게 낫지 않나??"
     assert explicit_title_from_request(request, raw_title) == "Create hackathon Kanban board backlog"
+
+
+def test_title_generator_rejects_verbatim_user_wording_even_when_not_clunky():
+    request = IntakeDetectionRequest(
+        platform="discord",
+        session_key="s1",
+        source_ref="kp_safe",
+        user_summary="새 tracking card 후보로 올려: Kanban intake 중복 노이즈 회귀 테스트 추가",
+        assistant_summary="테스트 추가가 필요하다.",
+        default_board="lifelog-control",
+        default_tenant="lifelog",
+    )
+    raw_title = "Kanban intake 중복 노이즈 회귀 테스트 추가"
+    title = explicit_title_from_request(request, raw_title)
+    assert title == "Plan Kanban follow-up work"
+    assert title != raw_title
+    assert "중복 노이즈 회귀 테스트 추가" not in title
+
+
+def test_title_generator_rejects_lightly_reformatted_user_wording():
+    request = IntakeDetectionRequest(
+        platform="discord",
+        session_key="s1",
+        source_ref="kp_safe",
+        user_summary="카드로 남겨줘: lifelog medication reminder cron 누락 원인 분석하고 재발 방지 테스트까지 해줘",
+        assistant_summary="후속 작업이다.",
+        default_board="lifelog-control",
+        default_tenant="lifelog",
+    )
+    raw_title = "lifelog medication reminder cron 누락 원인 분석 / 재발 방지 테스트"
+    title = explicit_title_from_request(request, raw_title)
+    assert title == "Review lifelog follow-up work"
+    assert title != raw_title
+    assert "누락 원인 분석" not in title
 
 
 def test_title_generator_names_existing_card_review_request():

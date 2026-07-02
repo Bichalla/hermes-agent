@@ -694,6 +694,53 @@ def _is_clunky_title(value: str) -> bool:
     )
 
 
+def _title_compare_key(value: str) -> str:
+    """Return a compact key for raw-title copy detection.
+
+    This ignores whitespace/punctuation/case so a generator cannot evade the
+    guard by trimming or lightly reformatting a user utterance.
+    """
+    text = _strip_chat_speaker_prefixes(str(value or "")).lower()
+    return re.sub(r"[^0-9a-z가-힣]+", "", text)
+
+
+def _longest_common_substring_len(left: str, right: str) -> int:
+    if not left or not right:
+        return 0
+    if len(left) > len(right):
+        left, right = right, left
+    previous = [0] * (len(right) + 1)
+    best = 0
+    for left_ch in left:
+        current = [0]
+        for idx, right_ch in enumerate(right, start=1):
+            if left_ch == right_ch:
+                value = previous[idx - 1] + 1
+                best = max(best, value)
+                current.append(value)
+            else:
+                current.append(0)
+        previous = current
+    return best
+
+
+def _looks_like_raw_user_title(title: str, request: IntakeDetectionRequest) -> bool:
+    """Return True when a title is copied from the current user message.
+
+    Generated card titles may share a short domain phrase with the user's text
+    (for example "title generator"), but they must not be the user utterance,
+    a trimmed speaker-prefixed line, or a long substring of it.
+    """
+    title_key = _title_compare_key(title)
+    user_key = _title_compare_key(request.user_summary)
+    if len(title_key) < 8 or len(user_key) < 8:
+        return False
+    if title_key in user_key or user_key in title_key:
+        return True
+    overlap = _longest_common_substring_len(title_key, user_key)
+    return overlap >= max(18, int(len(title_key) * 0.65))
+
+
 def _normalize_korean_title_intent(text: str) -> str:
     if _has_any(text, "타이틀", "title") and _has_any(text, "왜이래", "왜 이래", "변한게 없어", "카드후보"):
         return "Improve Kanban intake title normalization"
@@ -704,6 +751,31 @@ def _normalize_korean_title_intent(text: str) -> str:
     if _has_any(text, "기존 카드", "기존 카드들") and _has_any(text, "기준", "지우", "어떻게"):
         return "Review existing lifelog-control Kanban cards"
     return ""
+
+
+def _raw_title_fallback(request: IntakeDetectionRequest) -> str:
+    text = _clean_gate_text(request)
+    lowered = text.lower()
+    if _has_any(text, "타이틀", "title", "제목") and _has_any(text, "칸반", "kanban", "카드후보", "카드 후보"):
+        return "Improve Kanban intake title generator"
+    if "live smoke" in lowered and ("lifelog-control" in lowered or "discord" in lowered):
+        return "Verify Discord live smoke for lifelog-control"
+    if _has_any(text, "gateway", "게이트웨이") and _has_any(text, "구현", "implement"):
+        return "Implement gateway follow-up work"
+    if _has_any(text, "gateway", "게이트웨이"):
+        return "Verify gateway follow-up"
+    if _has_any(text, "lifelog"):
+        return "Review lifelog follow-up work"
+    if _has_any(text, "칸반", "kanban", "카드"):
+        return "Plan Kanban follow-up work"
+    return "Follow up on requested work"
+
+
+def _enforce_non_raw_user_title(request: IntakeDetectionRequest, title: str) -> str:
+    compact = _compact_title(title)
+    if not compact or _looks_like_raw_user_title(compact, request):
+        return _raw_title_fallback(request)
+    return compact
 
 
 def _clean_gate_text(request: IntakeDetectionRequest) -> str:
@@ -733,7 +805,7 @@ def suppress_existing_card_update_intent(text: str) -> bool:
     if not collapsed:
         return False
     if _STANDALONE_PROGRESS_UPDATE_RE.search(collapsed):
-        return True
+        return not (_has_durable_project_anchor(collapsed) and _has_concrete_followup_signal(collapsed))
     return bool(_EXISTING_CARD_REF_RE.search(collapsed) and _EXISTING_CARD_UPDATE_VERB_RE.search(collapsed))
 
 
@@ -809,7 +881,7 @@ def explicit_title_from_request(request: IntakeDetectionRequest, proposed_title:
     if proposed_normalized:
         return proposed_normalized
     if proposed_compact and not _is_generic_title(proposed_compact) and not _is_clunky_title(proposed_compact):
-        return proposed_compact
+        return _enforce_non_raw_user_title(request, proposed_compact)
 
     text = _candidate_title_text(request)
     lowered = text.lower()
@@ -828,12 +900,12 @@ def explicit_title_from_request(request: IntakeDetectionRequest, proposed_title:
     if normalized:
         return normalized
     if "칸반" in text or "kanban" in lowered:
-        return _compact_title(text or "Kanban follow-up")
+        return _enforce_non_raw_user_title(request, text or "Kanban follow-up")
     if "구현" in text:
-        return _compact_title(f"Implement {text.replace('구현', '').strip() or 'follow-up work'}")
+        return _enforce_non_raw_user_title(request, f"Implement {text.replace('구현', '').strip() or 'follow-up work'}")
     if "검증" in text:
-        return _compact_title(f"Verify {text.replace('검증', '').strip() or 'follow-up work'}")
-    return _compact_title(text or "Follow up on conversation")
+        return _enforce_non_raw_user_title(request, f"Verify {text.replace('검증', '').strip() or 'follow-up work'}")
+    return _enforce_non_raw_user_title(request, text or "Follow up on conversation")
 
 
 class KeywordHeuristicDetector:

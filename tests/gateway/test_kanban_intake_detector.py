@@ -402,9 +402,43 @@ def test_title_generator_rejects_lightly_reformatted_user_wording():
     )
     raw_title = "lifelog medication reminder cron 누락 원인 분석 / 재발 방지 테스트"
     title = explicit_title_from_request(request, raw_title)
-    assert title == "Review lifelog follow-up work"
+    assert title == "Fix Lifelog medication reminder cron regression"
     assert title != raw_title
+    assert "Review lifelog follow-up work" not in title
     assert "누락 원인 분석" not in title
+
+
+@pytest.mark.parametrize(
+    ("user_summary", "proposed_title", "expected"),
+    [
+        ("방금 복약 기록 후속 작업 정리하고 카드로 남겨줘", "Review lifelog follow-up work", "Review medication intake Lifelog capture"),
+        ("수면 기록 follow-up 확인하고 카드로 남겨줘", "Review lifelog follow-up work", "Review sleep log Lifelog capture"),
+        ("컨디션 기록 후속 검토 카드로 남겨줘", "Review lifelog follow-up work", "Review condition Lifelog capture"),
+        ("식단 기록 follow-up 카드로 남겨줘", "Review lifelog follow-up work", "Review diet intake Lifelog capture"),
+        ("육아 기록 follow-up 카드로 남겨줘", "Review lifelog follow-up work", "Review childcare Lifelog capture"),
+        ("운동 기록 후속 카드로 남겨줘", "Review lifelog follow-up work", "Review training Lifelog capture"),
+        ("여행 기록 follow-up 카드로 남겨줘", "Review lifelog follow-up work", "Review travel Lifelog capture"),
+        (
+            "Review lifelog follow-up work 같은 generic title 문제를 카드로 남겨줘",
+            "Review lifelog follow-up work",
+            "Fix Kanban candidate title generation for Lifelog records",
+        ),
+    ],
+)
+def test_title_generator_rewrites_generic_lifelog_followup_by_record_object(user_summary, proposed_title, expected):
+    request = IntakeDetectionRequest(
+        platform="discord",
+        session_key="s1",
+        source_ref="kp_safe",
+        user_summary=user_summary,
+        assistant_summary="후속 작업이 필요하다.",
+        default_board="lifelog-control",
+        default_tenant="lifelog",
+    )
+    title = explicit_title_from_request(request, proposed_title)
+    assert title == expected
+    assert title not in {"Review lifelog follow-up work", "Plan Kanban follow-up work"}
+    assert "[상현]" not in title
 
 
 def test_title_generator_names_existing_card_review_request():

@@ -43,7 +43,7 @@ _SENSITIVE_PATTERNS = (
 _ID_LIKE_RE = re.compile(r"\b\d{8,}\b")
 _TITLE_MAX_CHARS = 72
 _GENERIC_TITLE_RE = re.compile(
-    r"(?:review\s+.*follow[-\s]?up|define\s+next\s+action|safe\s+ops\s+follow[-\s]?up|conversational\s+kanban\s+follow[-\s]?up)",
+    r"(?:review\s+.*follow[-\s]?up|plan\s+kanban\s+follow[-\s]?up|define\s+next\s+action|safe\s+ops\s+follow[-\s]?up|conversational\s+kanban\s+follow[-\s]?up)",
     re.I,
 )
 _CASUAL_TITLE_NOISE_RE = re.compile(
@@ -773,9 +773,49 @@ def _normalize_korean_title_intent(text: str) -> str:
     return ""
 
 
+def _normalize_lifelog_title_intent(text: str) -> str:
+    if not _has_any(text, "lifelog", "라이프로그", "기록", "record", "follow-up", "후속"):
+        return ""
+    if _has_any(text, "generic title", "제목", "타이틀", "review lifelog follow-up work 같은") and _has_any(
+        text,
+        "lifelog",
+        "라이프로그",
+        "카드후보",
+        "카드 후보",
+        "candidate",
+    ):
+        return "Fix Kanban candidate title generation for Lifelog records"
+    if _has_any(text, "medication reminder", "복약 리마인더", "약 리마인더", "cron") and _has_any(
+        text,
+        "누락",
+        "missing",
+        "regression",
+        "재발",
+    ):
+        return "Fix Lifelog medication reminder cron regression"
+    if _has_any(text, "medication", "복약", "약 먹", "약먹", "intake", "skipped dose", "복용"):
+        return "Review medication intake Lifelog capture"
+    if _has_any(text, "sleep", "수면", "취침", "기상"):
+        return "Review sleep log Lifelog capture"
+    if _has_any(text, "condition", "컨디션", "pain", "통증", "피로", "soreness", "fever", "illness", "증상"):
+        return "Review condition Lifelog capture"
+    if _has_any(text, "diet", "meal", "식단", "식사", "간식", "먹었"):
+        return "Review diet intake Lifelog capture"
+    if _has_any(text, "childcare", "육아", "아이", "자녀", "child health"):
+        return "Review childcare Lifelog capture"
+    if _has_any(text, "training", "exercise", "운동", "주짓수", "레슬링", "mma"):
+        return "Review training Lifelog capture"
+    if _has_any(text, "travel", "여행", "출장"):
+        return "Review travel Lifelog capture"
+    return ""
+
+
 def _raw_title_fallback(request: IntakeDetectionRequest) -> str:
     text = _clean_gate_text(request)
     lowered = text.lower()
+    lifelog_normalized = _normalize_lifelog_title_intent(text)
+    if lifelog_normalized:
+        return lifelog_normalized
     if _has_any(text, "타이틀", "title", "제목") and _has_any(text, "칸반", "kanban", "카드후보", "카드 후보"):
         return "Improve Kanban intake title generator"
     if "live smoke" in lowered and ("lifelog-control" in lowered or "discord" in lowered):
@@ -784,8 +824,8 @@ def _raw_title_fallback(request: IntakeDetectionRequest) -> str:
         return "Implement gateway follow-up work"
     if _has_any(text, "gateway", "게이트웨이"):
         return "Verify gateway follow-up"
-    if _has_any(text, "lifelog"):
-        return "Review lifelog follow-up work"
+    if _has_any(text, "lifelog", "라이프로그"):
+        return "Review Lifelog record capture workflow"
     if _has_any(text, "칸반", "kanban", "카드"):
         return "Plan Kanban follow-up work"
     return "Follow up on requested work"
@@ -909,7 +949,30 @@ def _candidate_title_text(request: IntakeDetectionRequest) -> str:
     # of carrying preceding conversational acknowledgements/restart chatter into
     # the card title.
     segments = [s.strip(" -:;,.，。") for s in re.split(r"(?:그리고|근데|,|，|\.|。|;|；)", text) if s.strip()]
-    title_words = ("title generator", "타이틀", "제목", "kanban", "칸반", "gateway", "lifelog", "smoke")
+    title_words = (
+        "title generator",
+        "타이틀",
+        "제목",
+        "kanban",
+        "칸반",
+        "gateway",
+        "lifelog",
+        "smoke",
+        "복약",
+        "medication",
+        "수면",
+        "sleep",
+        "컨디션",
+        "condition",
+        "식단",
+        "diet",
+        "육아",
+        "childcare",
+        "운동",
+        "training",
+        "여행",
+        "travel",
+    )
     for segment in segments:
         if any(word.lower() in segment.lower() for word in title_words):
             return segment
@@ -925,6 +988,18 @@ def explicit_title_from_request(request: IntakeDetectionRequest, proposed_title:
     unless they are empty or generic boilerplate.
     """
     proposed_compact = _compact_title(proposed_title)
+    combined_for_title = "\n".join(
+        part for part in (request.user_summary or "", proposed_compact, request.assistant_summary or "") if part
+    )
+    if (
+        not proposed_compact
+        or _is_generic_title(proposed_compact)
+        or _is_clunky_title(proposed_compact)
+        or _looks_like_raw_user_title(proposed_compact, request)
+    ):
+        proposed_lifelog_normalized = _normalize_lifelog_title_intent(combined_for_title)
+        if proposed_lifelog_normalized:
+            return proposed_lifelog_normalized
     proposed_normalized = _normalize_korean_title_intent(
         "\n".join(part for part in (request.user_summary or "", proposed_compact) if part)
     )
@@ -936,6 +1011,9 @@ def explicit_title_from_request(request: IntakeDetectionRequest, proposed_title:
     text = _candidate_title_text(request)
     lowered = text.lower()
 
+    lifelog_normalized = _normalize_lifelog_title_intent(text)
+    if lifelog_normalized:
+        return lifelog_normalized
     if "title generator" in lowered and ("kanban" in lowered or "칸반" in text):
         return "Improve Kanban intake title generator"
     if "live smoke" in lowered and ("lifelog-control" in lowered or "discord" in lowered):

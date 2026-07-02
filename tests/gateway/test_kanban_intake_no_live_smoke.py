@@ -36,5 +36,6 @@ def test_no_live_smoke_script_outputs_safe_booleans(tmp_path, monkeypatch):
     assert data["direct_card_operation_suppressed"] is True
     assert data["direct_card_operation_failure_suppressed"] is True
     assert data["durable_status_update_remains_eligible"] is True
+    assert data["lifelog_generic_title_rewritten"] is True
     assert data["raw_source_ids_in_card_body"] is False
     assert data["sensitive_payload_in_card_body"] is False

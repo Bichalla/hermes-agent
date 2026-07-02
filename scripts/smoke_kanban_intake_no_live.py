@@ -90,6 +90,9 @@ def main() -> int:
         durable_status_update_remains_eligible = detector.detect(detector_request(
             "gateway status update feature 구현/테스트까지 해줘"
         )).card_worthy
+        lifelog_generic_title_rewritten = detector.detect(detector_request(
+            "방금 복약 기록 후속 작업 정리하고 카드로 남겨줘"
+        )).title == "Review medication intake Lifelog capture"
         store = PendingKanbanStore(cfg.store_path)
         binding = SourceBinding("discord", "raw_chat_123456789", "raw_thread_123456789", "u1", "s1")
         proposal = KanbanCardProposal(
@@ -153,6 +156,7 @@ def main() -> int:
             "direct_card_operation_suppressed": direct_card_operation_suppressed,
             "direct_card_operation_failure_suppressed": direct_card_operation_failure_suppressed,
             "durable_status_update_remains_eligible": durable_status_update_remains_eligible,
+            "lifelog_generic_title_rewritten": lifelog_generic_title_rewritten,
             "raw_source_ids_in_card_body": any(raw in (body or "") for raw in ("raw_chat_123456789", "raw_thread_123456789", "u1")),
             "sensitive_payload_in_card_body": bool(sensitive_payload_in_card_body),
         }
@@ -183,6 +187,7 @@ def main() -> int:
             result["direct_card_operation_suppressed"],
             result["direct_card_operation_failure_suppressed"],
             result["durable_status_update_remains_eligible"],
+            result["lifelog_generic_title_rewritten"],
             not result["raw_source_ids_in_card_body"],
             not result["sensitive_payload_in_card_body"],
         ]) else "FAIL")

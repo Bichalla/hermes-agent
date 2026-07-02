@@ -60,6 +60,52 @@ async def test_post_turn_rewrites_generic_detector_title(tmp_path):
 
 
 @pytest.mark.asyncio
+async def test_post_turn_rewrites_generic_lifelog_detector_title_by_record_object(tmp_path):
+    cfg = KanbanIntakeConfig(enabled=True, default_board="lifelog-control", store_path=tmp_path / "pending.db")
+    runner = object.__new__(GatewayRunner)
+    runner._kanban_intake_config = lambda: cfg
+    runner._kanban_intake_store = lambda _cfg=None: __import__("gateway.kanban_intake", fromlist=["PendingKanbanStore"]).PendingKanbanStore(cfg.store_path)
+    runner._kanban_intake_detector = Detector(DetectorDecision(
+        True,
+        title="Review lifelog follow-up work",
+        body={"source_ref": "kp_safe"},
+    ))
+    event = MessageEvent(
+        text="방금 복약 기록 후속 작업 정리하고 카드로 남겨줘",
+        message_type=MessageType.TEXT,
+        source=source(),
+        message_id="1522060000000000001",
+    )
+    msg = await runner._maybe_build_kanban_intake_proposal_message(event, "s1", event.text, "후속 작업이 필요하다.")
+    assert msg is not None
+    assert "Review medication intake Lifelog capture" in msg
+    assert "Review lifelog follow-up work" not in msg
+
+
+@pytest.mark.asyncio
+async def test_post_turn_rewrites_generic_lifelog_title_generator_bug(tmp_path):
+    cfg = KanbanIntakeConfig(enabled=True, default_board="lifelog-control", store_path=tmp_path / "pending.db")
+    runner = object.__new__(GatewayRunner)
+    runner._kanban_intake_config = lambda: cfg
+    runner._kanban_intake_store = lambda _cfg=None: __import__("gateway.kanban_intake", fromlist=["PendingKanbanStore"]).PendingKanbanStore(cfg.store_path)
+    runner._kanban_intake_detector = Detector(DetectorDecision(
+        True,
+        title="Review lifelog follow-up work",
+        body={"source_ref": "kp_safe"},
+    ))
+    event = MessageEvent(
+        text="Review lifelog follow-up work 같은 generic title 문제를 카드로 남겨줘",
+        message_type=MessageType.TEXT,
+        source=source(),
+        message_id="1522060000000000002",
+    )
+    msg = await runner._maybe_build_kanban_intake_proposal_message(event, "s1", event.text, "후속 작업이 필요하다.")
+    assert msg is not None
+    assert "Fix Kanban candidate title generation for Lifelog records" in msg
+    assert "Review lifelog follow-up work" not in msg
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize("text", [
     "카드 생성 조건이 너무 후한거 아닌가?",
     "칸반보드가 필요한거는 장기로 이어지는 프로젝트에 한정해야되는 거 아니야??",

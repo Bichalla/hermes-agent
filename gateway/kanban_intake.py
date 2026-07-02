@@ -54,6 +54,22 @@ _EXPLICIT_CARD_REQUEST_RE = re.compile(
     r"(?:카드로\s*남겨|(?:새\s*)?카드(?:로)?\s*(?:만들|생성)(?:어|해|해줘|해주세요|하자|요청)?|새\s*(?:tracking\s*)?카드\s*후보|새\s*tracking\s*card\s*후보|별도\s*카드\s*생성|칸반에\s*추가|add\s+(?:a\s+)?kanban\s+card|create\s+(?:a\s+)?card)",
     re.I,
 )
+_PROPOSAL_RECORD_REQUEST_RE = re.compile(
+    r"(?:카드로\s*남겨|카드\s*후보(?:로)?\s*(?:올려|남겨)|"
+    r"새\s*(?:tracking\s*)?카드\s*후보|새\s*tracking\s*card\s*후보|"
+    r"별도\s*카드\s*(?:생성|후보|로\s*남겨)|"
+    r"(?:이\s*)?내용.*새\s*카드(?:로)?\s*(?:만들|생성)|"
+    r"proposal\s+card|tracking\s+card\s+candidate)",
+    re.I,
+)
+_DIRECT_CARD_OPERATION_RE = re.compile(
+    r"(?:"
+    r"(?:[\w가-힣_.-]+\s*)?보드(?:에|로)?\s*.*카드\s*(?:만들|생성|추가)"
+    r"|create\s+(?:a\s+)?card\s+(?:on|in)\s+[\w_.-]+"
+    r"|add\s+(?:a\s+)?card\s+(?:to|on|in)\s+[\w_.-]+"
+    r")",
+    re.I,
+)
 _KANBAN_CARD_ID_RE = r"\bt_[a-f0-9]{6,}\b"
 _EXISTING_CARD_REF_RE = re.compile(
     rf"(?:{_KANBAN_CARD_ID_RE}|기존\s*카드|tracking\s*card|이\s*카드)",
@@ -790,12 +806,24 @@ def _has_explicit_card_request(text: str) -> bool:
     return bool(_EXPLICIT_CARD_REQUEST_RE.search(text))
 
 
+def _has_proposal_record_request(text: str) -> bool:
+    return bool(_PROPOSAL_RECORD_REQUEST_RE.search(text or ""))
+
+
+def _has_direct_card_operation_request(text: str) -> bool:
+    return bool(_DIRECT_CARD_OPERATION_RE.search(text or ""))
+
+
 def _is_read_only_candidate_audit(text: str) -> bool:
     return bool(_CANDIDATE_AUDIT_RE.search(text) and _READ_ONLY_ACTION_RE.search(text))
 
 
 def _has_explicit_user_card_request(request: IntakeDetectionRequest) -> bool:
     return _has_explicit_card_request(request.user_summary or "")
+
+
+def _has_explicit_user_proposal_record_request(request: IntakeDetectionRequest) -> bool:
+    return _has_proposal_record_request(request.user_summary or "")
 
 
 def suppress_existing_card_update_intent(text: str) -> bool:
@@ -811,6 +839,20 @@ def suppress_existing_card_update_intent(text: str) -> bool:
     if _STANDALONE_PROGRESS_UPDATE_RE.search(collapsed):
         return not (_has_durable_project_anchor(collapsed) and _has_concrete_followup_signal(collapsed))
     return bool(_EXISTING_CARD_REF_RE.search(collapsed) and _EXISTING_CARD_UPDATE_VERB_RE.search(collapsed))
+
+
+def suppress_direct_card_operation_intent(request: IntakeDetectionRequest) -> bool:
+    """Return True for current-turn direct Kanban card operations.
+
+    Direct operations are handled by the main agent/tool path. Post-turn intake
+    must not reinterpret them as default-board blocked proposal candidates. This
+    check uses user text only so assistant wording cannot forge approval or
+    durable follow-up intent.
+    """
+    user_text = " ".join(str(request.user_summary or "").split())
+    if not user_text or _has_proposal_record_request(user_text):
+        return False
+    return _has_direct_card_operation_request(user_text)
 
 
 def _is_approved_live_smoke_request(text: str) -> bool:
@@ -844,12 +886,16 @@ def card_proposal_eligibility(request: IntakeDetectionRequest, decision: Optiona
         return ProposalEligibility(False, "meta discussion or one-off question", "negative_meta_one_off")
     if _is_approved_live_smoke_request(user_text):
         return ProposalEligibility(True, "approved live smoke request", "approved_live_smoke_request")
-    if suppress_existing_card_update_intent(user_text) and not _has_explicit_user_card_request(request):
+    if suppress_existing_card_update_intent(user_text) and not _has_explicit_user_proposal_record_request(request):
         return ProposalEligibility(False, "existing card update intent", "existing_card_update_intent")
-    if _is_read_only_candidate_audit(user_text) and not _has_explicit_user_card_request(request):
+    if _is_read_only_candidate_audit(user_text) and not _has_explicit_user_proposal_record_request(request):
         return ProposalEligibility(False, "read-only candidate audit", "read_only_candidate_audit")
-    if _has_explicit_user_card_request(request):
+    if suppress_direct_card_operation_intent(request):
+        return ProposalEligibility(False, "direct card operation intent", "direct_card_operation_intent")
+    if _has_explicit_user_proposal_record_request(request):
         return ProposalEligibility(True, "explicit card request", "explicit_card_request")
+    if _has_explicit_user_card_request(request):
+        return ProposalEligibility(False, "direct card request requires main-turn handling", "direct_card_operation_intent")
     if _is_vague_board_creation_discussion(text):
         return ProposalEligibility(False, "board discussion requires explicit long-lived project request", "board_requires_explicit_request")
     if _has_durable_project_anchor(text) and _has_concrete_followup_signal(text):

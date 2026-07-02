@@ -194,6 +194,37 @@ async def test_post_turn_suppresses_existing_card_metadata_update_even_if_detect
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(("text", "assistant_response"), [
+    (
+        "suttanipata-ko 보드에 숫타니파타 번역 검수 카드 만들어줘",
+        "실제로 필요한 카드는 이미 `suttanipata-ko` 보드에 만들었어: `t_e9f4c088`.",
+    ),
+    (
+        "suttanipata-ko 보드에 숫타니파타 번역 검수 카드 만들어줘",
+        "카드 생성 실패했어. 권한 문제를 먼저 해결해야 해.",
+    ),
+])
+async def test_post_turn_suppresses_direct_card_operation_even_if_detector_says_true(tmp_path, text, assistant_response):
+    cfg = KanbanIntakeConfig(enabled=True, default_board="lifelog-control", store_path=tmp_path / "pending.db")
+    runner = object.__new__(GatewayRunner)
+    runner._kanban_intake_config = lambda: cfg
+    runner._kanban_intake_store = lambda _cfg=None: __import__("gateway.kanban_intake", fromlist=["PendingKanbanStore"]).PendingKanbanStore(cfg.store_path)
+    runner._kanban_intake_detector = Detector(DetectorDecision(
+        True,
+        title="Improve Kanban intake title generator",
+        body={"source_ref": "kp_safe"},
+    ))
+    event = MessageEvent(
+        text=text,
+        message_type=MessageType.TEXT,
+        source=source(),
+        message_id="1521543610456084607",
+    )
+    msg = await runner._maybe_build_kanban_intake_proposal_message(event, "s1", event.text, assistant_response)
+    assert msg is None
+
+
+@pytest.mark.asyncio
 async def test_post_turn_renders_semantic_title_for_explicit_candidate_audit_card_request(tmp_path):
     cfg = KanbanIntakeConfig(enabled=True, default_board="lifelog-control", store_path=tmp_path / "pending.db")
     runner = object.__new__(GatewayRunner)

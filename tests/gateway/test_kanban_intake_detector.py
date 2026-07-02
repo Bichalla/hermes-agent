@@ -156,6 +156,53 @@ def test_assistant_summary_card_words_do_not_override_existing_card_update_suppr
     assert KeywordHeuristicDetector().detect(request).card_worthy is False
 
 
+@pytest.mark.parametrize(("user_summary", "assistant_summary"), [
+    (
+        "suttanipata-ko 보드에 숫타니파타 번역 검수 카드 만들어줘",
+        "실제로 필요한 카드는 이미 `suttanipata-ko` 보드에 만들었어: `t_e9f4c088`.",
+    ),
+    (
+        "suttanipata-ko 보드에 숫타니파타 번역 검수 카드 만들어줘",
+        "카드 생성 실패했어. 권한 문제를 먼저 해결해야 해.",
+    ),
+    (
+        "create a card on suttanipata-ko for translation review",
+        "I could not create the card because the board was not found.",
+    ),
+])
+def test_direct_card_operation_request_is_not_post_turn_proposal(user_summary, assistant_summary):
+    request = IntakeDetectionRequest(
+        platform="discord",
+        session_key="s1",
+        source_ref="kp_safe",
+        user_summary=user_summary,
+        assistant_summary=assistant_summary,
+        default_board="lifelog-control",
+        default_tenant="lifelog",
+    )
+
+    eligibility = card_proposal_eligibility(request)
+    assert eligibility.eligible is False
+    assert eligibility.matched_rule == "direct_card_operation_intent"
+    assert KeywordHeuristicDetector().detect(request).card_worthy is False
+
+
+def test_failed_card_creation_with_task_id_is_not_labeled_fulfilled():
+    request = IntakeDetectionRequest(
+        platform="discord",
+        session_key="s1",
+        source_ref="kp_safe",
+        user_summary="suttanipata-ko 보드에 카드 만들어줘",
+        assistant_summary="카드 생성 실패했어. 이전 후보 `t_e9f4c088`가 남아있어.",
+        default_board="lifelog-control",
+        default_tenant="lifelog",
+    )
+
+    eligibility = card_proposal_eligibility(request)
+    assert eligibility.eligible is False
+    assert eligibility.matched_rule == "direct_card_operation_intent"
+
+
 @pytest.mark.parametrize("user_summary", [
     "gateway status update feature 구현/테스트까지 해줘",
     "lifelog 진행상태 업데이트 자동화 구현/테스트까지 해줘",

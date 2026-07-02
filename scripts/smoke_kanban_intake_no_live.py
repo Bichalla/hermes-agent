@@ -69,6 +69,24 @@ def main() -> int:
         existing_card_update_suppressed = not detector.detect(detector_request(
             "t_5b858cd6 카드 업데이트 승인"
         )).card_worthy
+        direct_card_operation_suppressed = not detector.detect(IntakeDetectionRequest(
+            platform="discord",
+            session_key="s1",
+            source_ref="kp_safe",
+            user_summary="suttanipata-ko 보드에 숫타니파타 번역 검수 카드 만들어줘",
+            assistant_summary="실제로 필요한 카드는 이미 `suttanipata-ko` 보드에 만들었어: `t_e9f4c088`.",
+            default_board=board,
+            default_tenant="lifelog",
+        )).card_worthy
+        direct_card_operation_failure_suppressed = not detector.detect(IntakeDetectionRequest(
+            platform="discord",
+            session_key="s1",
+            source_ref="kp_safe",
+            user_summary="suttanipata-ko 보드에 숫타니파타 번역 검수 카드 만들어줘",
+            assistant_summary="카드 생성 실패했어. 권한 문제를 먼저 해결해야 해.",
+            default_board=board,
+            default_tenant="lifelog",
+        )).card_worthy
         durable_status_update_remains_eligible = detector.detect(detector_request(
             "gateway status update feature 구현/테스트까지 해줘"
         )).card_worthy
@@ -132,6 +150,8 @@ def main() -> int:
             "meta_kanban_card_proposal_suppressed": meta_kanban_card_proposal_suppressed,
             "read_only_candidate_audit_suppressed": read_only_candidate_audit_suppressed,
             "existing_card_update_suppressed": existing_card_update_suppressed,
+            "direct_card_operation_suppressed": direct_card_operation_suppressed,
+            "direct_card_operation_failure_suppressed": direct_card_operation_failure_suppressed,
             "durable_status_update_remains_eligible": durable_status_update_remains_eligible,
             "raw_source_ids_in_card_body": any(raw in (body or "") for raw in ("raw_chat_123456789", "raw_thread_123456789", "u1")),
             "sensitive_payload_in_card_body": bool(sensitive_payload_in_card_body),
@@ -160,6 +180,8 @@ def main() -> int:
             result["meta_kanban_card_proposal_suppressed"],
             result["read_only_candidate_audit_suppressed"],
             result["existing_card_update_suppressed"],
+            result["direct_card_operation_suppressed"],
+            result["direct_card_operation_failure_suppressed"],
             result["durable_status_update_remains_eligible"],
             not result["raw_source_ids_in_card_body"],
             not result["sensitive_payload_in_card_body"],

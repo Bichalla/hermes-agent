@@ -7978,7 +7978,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         if not eligibility.eligible:
             logger.debug("kanban intake proposal skipped: %s", eligibility.reason)
             return None
-        proposal = proposal_from_decision(decision, request, binding, cfg)
+        title_generator = getattr(self, "_kanban_title_generator", None)
+        proposal = proposal_from_decision(decision, request, binding, cfg, title_generator=title_generator)
         ok, reason = validate_proposal(proposal, cfg)
         if not ok:
             logger.info("kanban intake proposal rejected: %s", reason)

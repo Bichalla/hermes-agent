@@ -83,6 +83,55 @@ async def test_post_turn_rewrites_generic_lifelog_detector_title_by_record_objec
 
 
 @pytest.mark.asyncio
+async def test_post_turn_uses_safe_injected_title_generator(tmp_path):
+    cfg = KanbanIntakeConfig(enabled=True, default_board="lifelog-control", store_path=tmp_path / "pending.db")
+    runner = object.__new__(GatewayRunner)
+    runner._kanban_intake_config = lambda: cfg
+    runner._kanban_intake_store = lambda _cfg=None: __import__("gateway.kanban_intake", fromlist=["PendingKanbanStore"]).PendingKanbanStore(cfg.store_path)
+    runner._kanban_intake_detector = Detector(DetectorDecision(
+        True,
+        title="Review lifelog follow-up work",
+        body={"source_ref": "kp_safe"},
+    ))
+    runner._kanban_title_generator = lambda _request, _rule: '{"title":"Investigate missed medication reminder regression","action":"Investigate","object":"medication reminder"}'
+    event = MessageEvent(
+        text="lifelog medication reminder cron 누락 재발 방지 테스트 카드로 남겨줘",
+        message_type=MessageType.TEXT,
+        source=source(),
+        message_id="1522060000000000003",
+    )
+    msg = await runner._maybe_build_kanban_intake_proposal_message(event, "s1", event.text, "후속 작업이 필요하다.")
+    assert msg is not None
+    assert "Investigate missed medication reminder regression" in msg
+    assert "Review lifelog follow-up work" not in msg
+
+
+@pytest.mark.asyncio
+async def test_post_turn_falls_back_when_injected_title_generator_is_unsafe(tmp_path):
+    cfg = KanbanIntakeConfig(enabled=True, default_board="lifelog-control", store_path=tmp_path / "pending.db")
+    runner = object.__new__(GatewayRunner)
+    runner._kanban_intake_config = lambda: cfg
+    runner._kanban_intake_store = lambda _cfg=None: __import__("gateway.kanban_intake", fromlist=["PendingKanbanStore"]).PendingKanbanStore(cfg.store_path)
+    runner._kanban_intake_detector = Detector(DetectorDecision(
+        True,
+        title="Review lifelog follow-up work",
+        body={"source_ref": "kp_safe"},
+    ))
+    runner._kanban_title_generator = lambda _request, _rule: '{"title":"[상현] lifelog medication reminder cron 누락 원인 분석","action":"Review","object":"medication reminder"}'
+    event = MessageEvent(
+        text="lifelog medication reminder cron 누락 재발 방지 테스트 카드로 남겨줘",
+        message_type=MessageType.TEXT,
+        source=source(),
+        message_id="1522060000000000004",
+    )
+    msg = await runner._maybe_build_kanban_intake_proposal_message(event, "s1", event.text, "후속 작업이 필요하다.")
+    assert msg is not None
+    assert "Fix Lifelog medication reminder cron regression" in msg
+    assert "[상현]" not in msg
+    assert "누락 원인 분석" not in msg
+
+
+@pytest.mark.asyncio
 async def test_post_turn_rewrites_generic_lifelog_title_generator_bug(tmp_path):
     cfg = KanbanIntakeConfig(enabled=True, default_board="lifelog-control", store_path=tmp_path / "pending.db")
     runner = object.__new__(GatewayRunner)

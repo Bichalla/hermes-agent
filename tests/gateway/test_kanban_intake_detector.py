@@ -7,6 +7,7 @@ from gateway.kanban_intake import (
     IntakeDetectionRequest,
     card_proposal_eligibility,
     explicit_title_from_request,
+    generated_title_from_json,
     minimize_for_detector,
     parse_detector_json,
 )
@@ -506,6 +507,77 @@ def test_title_generator_removes_clunky_chat_fragments(user_summary, expected, f
 def test_title_generator_preserves_specific_human_or_auxiliary_title():
     request = req()
     assert explicit_title_from_request(request, "Verify blocked intake cards stay unclaimed") == "Verify blocked intake cards stay unclaimed"
+
+
+def test_title_validator_accepts_safe_generated_lifelog_title():
+    request = IntakeDetectionRequest(
+        platform="discord",
+        session_key="s1",
+        source_ref="kp_safe",
+        user_summary="카드로 남겨줘: lifelog medication reminder cron 누락 재발 방지 테스트 1521423652547989615 fever token",
+        assistant_summary="후속 작업이다.",
+        default_board="lifelog-control",
+        default_tenant="lifelog",
+    )
+    raw = '{"title":"Investigate missed medication reminder regression","action":"Investigate","object":"medication reminder"}'
+    assert generated_title_from_json(request, raw) == "Investigate missed medication reminder regression"
+
+
+@pytest.mark.parametrize("raw", [
+    "not json",
+    '{"title":"Review lifelog follow-up work","action":"Review","object":"lifelog"}',
+    '{"title":"[상현] lifelog medication reminder cron 누락 원인 분석","action":"Review","object":"medication reminder"}',
+    '{"title":"Review child fever 39.2 follow-up","action":"Review","object":"condition"}',
+    '{"title":"Ship beautiful amazing emotional story","action":"Ship","object":"story"}',
+])
+def test_title_validator_rejects_unsafe_or_invalid_generated_titles(raw):
+    request = IntakeDetectionRequest(
+        platform="discord",
+        session_key="s1",
+        source_ref="kp_safe",
+        user_summary="카드로 남겨줘: lifelog medication reminder cron 누락 재발 방지 테스트 1521423652547989615 fever token",
+        assistant_summary="후속 작업이다.",
+        default_board="lifelog-control",
+        default_tenant="lifelog",
+    )
+    assert generated_title_from_json(request, raw) == ""
+
+
+def test_explicit_title_uses_safe_constrained_generator_before_hard_fallback():
+    request = IntakeDetectionRequest(
+        platform="discord",
+        session_key="s1",
+        source_ref="kp_safe",
+        user_summary="카드로 남겨줘: lifelog medication reminder cron 누락 재발 방지 테스트 1521423652547989615 fever token",
+        assistant_summary="후속 작업이다.",
+        default_board="lifelog-control",
+        default_tenant="lifelog",
+    )
+
+    def generator(generated_request, _rule):
+        assert "1521423652547989615" not in generated_request.user_summary
+        assert "fever" not in generated_request.user_summary.lower()
+        assert "token" not in generated_request.user_summary.lower()
+        return '{"title":"Investigate missed medication reminder regression","action":"Investigate","object":"medication reminder"}'
+
+    assert explicit_title_from_request(request, "Review lifelog follow-up work", title_generator=generator) == "Investigate missed medication reminder regression"
+
+
+def test_explicit_title_falls_back_when_constrained_generator_is_unsafe():
+    request = IntakeDetectionRequest(
+        platform="discord",
+        session_key="s1",
+        source_ref="kp_safe",
+        user_summary="카드로 남겨줘: lifelog medication reminder cron 누락 재발 방지 테스트 1521423652547989615 fever token",
+        assistant_summary="후속 작업이다.",
+        default_board="lifelog-control",
+        default_tenant="lifelog",
+    )
+
+    def generator(_request, _rule):
+        return '{"title":"[상현] lifelog medication reminder cron 누락 원인 분석","action":"Review","object":"medication reminder"}'
+
+    assert explicit_title_from_request(request, "Review lifelog follow-up work", title_generator=generator) == "Fix Lifelog medication reminder cron regression"
 
 
 def test_strict_json_parser_fail_closed():

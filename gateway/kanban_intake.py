@@ -134,6 +134,9 @@ class KanbanIntakeConfig:
     detector: str = "heuristic"
     auxiliary_detector_enabled: bool = False
     redact_before_auxiliary: bool = True
+    title_generator_enabled: bool = False
+    title_generator_mode: str = "fallback_only"
+    title_generator_timeout_seconds: int = 3
     pending_retention_seconds: int = 86400
     card_body_include_raw_source_ids: bool = False
     max_body_chars: int = 4000
@@ -196,6 +199,13 @@ def parse_config(config: Optional[dict[str, Any]]) -> KanbanIntakeConfig:
 
     store_path = block.get("store_path")
     path_obj = Path(store_path).expanduser() if store_path else None
+    title_generator_mode = str(block.get("title_generator_mode") or "fallback_only").strip().lower() or "fallback_only"
+    title_generator_enabled = _as_bool(block.get("title_generator_enabled"), False)
+    if title_generator_mode not in {"fallback_only", "constrained_llm"}:
+        title_generator_mode = "fallback_only"
+        title_generator_enabled = False
+    if title_generator_mode == "fallback_only":
+        title_generator_enabled = False
     return KanbanIntakeConfig(
         enabled=_as_bool(block.get("enabled"), False),
         platforms=platforms or ("discord",),
@@ -210,6 +220,11 @@ def parse_config(config: Optional[dict[str, Any]]) -> KanbanIntakeConfig:
         detector=str(block.get("detector") or "heuristic").strip().lower() or "heuristic",
         auxiliary_detector_enabled=_as_bool(block.get("auxiliary_detector_enabled"), False),
         redact_before_auxiliary=_as_bool(block.get("redact_before_auxiliary"), True),
+        title_generator_enabled=title_generator_enabled,
+        title_generator_mode=title_generator_mode,
+        title_generator_timeout_seconds=_bounded_int(
+            block.get("title_generator_timeout_seconds"), 3, minimum=1, maximum=5
+        ),
         pending_retention_seconds=_bounded_int(block.get("pending_retention_seconds"), 86400, minimum=3600, maximum=30 * 86400),
         card_body_include_raw_source_ids=_as_bool(block.get("card_body_include_raw_source_ids"), False),
         max_body_chars=_bounded_int(block.get("max_body_chars"), 4000, minimum=500, maximum=16000),
@@ -316,6 +331,35 @@ class DetectorDecision:
     proposed_status: str = "blocked"
     why: str = ""
     body: dict[str, Any] = field(default_factory=dict)
+
+
+@dataclass(frozen=True)
+class TitleGenerationRule:
+    allowed_verbs: tuple[str, ...] = ("Review", "Fix", "Verify", "Investigate", "Record", "Implement")
+    allowed_objects: tuple[str, ...] = (
+        "medication intake",
+        "medication reminder",
+        "sleep log",
+        "condition",
+        "diet intake",
+        "childcare",
+        "training",
+        "travel",
+        "title generation",
+        "gateway",
+        "kanban intake",
+    )
+    max_chars: int = _TITLE_MAX_CHARS
+    min_words: int = 3
+    max_words: int = 10
+
+
+@dataclass(frozen=True)
+class CandidateTitleDraft:
+    title: str
+    action: str
+    object: str
+    rationale: str = ""
 
 
 @dataclass(frozen=True)
@@ -831,6 +875,123 @@ def _raw_title_fallback(request: IntakeDetectionRequest) -> str:
     return "Follow up on requested work"
 
 
+_SAFE_TITLE_OBJECT_ALIASES = {
+    "medication": "medication intake",
+    "medication log": "medication intake",
+    "medication capture": "medication intake",
+    "dose": "medication intake",
+    "reminder": "medication reminder",
+    "medication cron": "medication reminder",
+    "sleep": "sleep log",
+    "sleep capture": "sleep log",
+    "diet": "diet intake",
+    "meal": "diet intake",
+    "meal intake": "diet intake",
+    "child health": "childcare",
+    "childcare record": "childcare",
+    "exercise": "training",
+    "training log": "training",
+    "trip": "travel",
+    "travel log": "travel",
+    "title generator": "title generation",
+    "kanban title generation": "title generation",
+    "kanban title generator": "title generation",
+    "conversational intake": "kanban intake",
+}
+
+
+def _title_generator_request(request: IntakeDetectionRequest) -> IntakeDetectionRequest:
+    """Return the minimized request shape passed to optional title generators."""
+    return IntakeDetectionRequest(
+        platform=request.platform,
+        session_key=request.session_key,
+        source_ref=request.source_ref,
+        user_summary=minimize_for_detector(request.user_summary, max_chars=280),
+        assistant_summary=minimize_for_detector(request.assistant_summary, max_chars=280),
+        default_board=request.default_board,
+        default_tenant=request.default_tenant,
+    )
+
+
+def _safe_title_object(value: str, rule: TitleGenerationRule) -> str:
+    normalized = " ".join(str(value or "").strip().lower().split())
+    if not normalized:
+        return ""
+    alias = _SAFE_TITLE_OBJECT_ALIASES.get(normalized)
+    if alias:
+        normalized = alias
+    for allowed in rule.allowed_objects:
+        if normalized == allowed.lower():
+            return allowed
+    return ""
+
+
+def _hangul_fragment_present(value: str) -> bool:
+    return bool(re.search(r"[가-힣]", value or ""))
+
+
+def generated_title_from_json(
+    request: IntakeDetectionRequest,
+    raw: str,
+    *,
+    rule: Optional[TitleGenerationRule] = None,
+) -> str:
+    """Validate a constrained JSON title draft and return a safe title or ''."""
+    rule = rule or TitleGenerationRule()
+    try:
+        data = json.loads(raw or "")
+    except (TypeError, json.JSONDecodeError):
+        return ""
+    if not isinstance(data, dict):
+        return ""
+    values = {key: data.get(key) for key in ("title", "action", "object")}
+    if not all(isinstance(value, str) and value.strip() for value in values.values()):
+        return ""
+
+    title_value = str(values["title"])
+    action_value = str(values["action"])
+    object_value = str(values["object"])
+    raw_title = " ".join(title_value.replace("\n", " ").split())
+    stripped_title = _strip_chat_speaker_prefixes(raw_title)
+    if raw_title != stripped_title:
+        return ""
+    if len(stripped_title) > rule.max_chars:
+        return ""
+    if _ID_LIKE_RE.search(stripped_title) or re.search(r"\d", stripped_title):
+        return ""
+    if _contains_sensitive_payload(stripped_title) or _hangul_fragment_present(stripped_title):
+        return ""
+
+    title = _compact_title(stripped_title, max_chars=rule.max_chars)
+    words = title.split()
+    if not (rule.min_words <= len(words) <= rule.max_words):
+        return ""
+    if _is_generic_title(title) or _is_clunky_title(title) or _looks_like_raw_user_title(title, request):
+        return ""
+
+    allowed_action = next((verb for verb in rule.allowed_verbs if action_value.strip().lower() == verb.lower()), "")
+    if not allowed_action:
+        return ""
+    if not (title == allowed_action or title.lower().startswith(f"{allowed_action.lower()} ")):
+        return ""
+
+    safe_object = _safe_title_object(object_value, rule)
+    if not safe_object:
+        return ""
+    if safe_object.lower() not in title.lower():
+        return ""
+    return title
+
+
+def _should_attempt_title_generation(request: IntakeDetectionRequest, proposed_compact: str) -> bool:
+    return (
+        not proposed_compact
+        or _is_generic_title(proposed_compact)
+        or _is_clunky_title(proposed_compact)
+        or _looks_like_raw_user_title(proposed_compact, request)
+    )
+
+
 def _enforce_non_raw_user_title(request: IntakeDetectionRequest, title: str) -> str:
     compact = _compact_title(title)
     if not compact or _looks_like_raw_user_title(compact, request):
@@ -979,7 +1140,12 @@ def _candidate_title_text(request: IntakeDetectionRequest) -> str:
     return text
 
 
-def explicit_title_from_request(request: IntakeDetectionRequest, proposed_title: str = "") -> str:
+def explicit_title_from_request(
+    request: IntakeDetectionRequest,
+    proposed_title: str = "",
+    *,
+    title_generator: Optional[Callable[[IntakeDetectionRequest, TitleGenerationRule], str]] = None,
+) -> str:
     """Return a compact, action/object title for a Kanban intake card.
 
     Heuristic intake must not create vague cards like "Review ... follow-up and
@@ -988,6 +1154,20 @@ def explicit_title_from_request(request: IntakeDetectionRequest, proposed_title:
     unless they are empty or generic boilerplate.
     """
     proposed_compact = _compact_title(proposed_title)
+    should_generate = _should_attempt_title_generation(request, proposed_compact)
+    if should_generate and title_generator is not None:
+        rule = TitleGenerationRule()
+        try:
+            generated = generated_title_from_json(
+                request,
+                title_generator(_title_generator_request(request), rule),
+                rule=rule,
+            )
+        except Exception:
+            generated = ""
+        if generated:
+            return generated
+
     combined_for_title = "\n".join(
         part for part in (request.user_summary or "", proposed_compact, request.assistant_summary or "") if part
     )
@@ -1141,10 +1321,17 @@ def build_detection_request(
     )
 
 
-def proposal_from_decision(decision: DetectorDecision, request: IntakeDetectionRequest, binding: SourceBinding, cfg: KanbanIntakeConfig) -> KanbanCardProposal:
+def proposal_from_decision(
+    decision: DetectorDecision,
+    request: IntakeDetectionRequest,
+    binding: SourceBinding,
+    cfg: KanbanIntakeConfig,
+    *,
+    title_generator: Optional[Callable[[IntakeDetectionRequest, TitleGenerationRule], str]] = None,
+) -> KanbanCardProposal:
     return KanbanCardProposal(
         board=request.default_board,
-        title=explicit_title_from_request(request, decision.title),
+        title=explicit_title_from_request(request, decision.title, title_generator=title_generator),
         body=decision.body or {
             "source_ref": request.source_ref,
             "acceptance_criteria": ["review and define follow-up"],

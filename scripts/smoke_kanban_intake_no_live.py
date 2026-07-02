@@ -40,6 +40,7 @@ def main() -> int:
             KeywordHeuristicDetector,
             PendingKanbanStore,
             SourceBinding,
+            explicit_title_from_request,
             handle_reply,
             validate_proposal,
         )
@@ -93,6 +94,17 @@ def main() -> int:
         lifelog_generic_title_rewritten = detector.detect(detector_request(
             "방금 복약 기록 후속 작업 정리하고 카드로 남겨줘"
         )).title == "Review medication intake Lifelog capture"
+        hybrid_request = detector_request("lifelog medication reminder cron 누락 재발 방지 테스트 카드로 남겨줘")
+        hybrid_title_generator_accepts_safe_draft = explicit_title_from_request(
+            hybrid_request,
+            "Review lifelog follow-up work",
+            title_generator=lambda *_: '{"title":"Investigate missed medication reminder regression","action":"Investigate","object":"medication reminder"}',
+        ) == "Investigate missed medication reminder regression"
+        hybrid_title_generator_rejects_unsafe_draft = explicit_title_from_request(
+            hybrid_request,
+            "Review lifelog follow-up work",
+            title_generator=lambda *_: '{"title":"[상현] lifelog medication reminder cron 누락 원인 분석","action":"Review","object":"medication reminder"}',
+        ) == "Fix Lifelog medication reminder cron regression"
         store = PendingKanbanStore(cfg.store_path)
         binding = SourceBinding("discord", "raw_chat_123456789", "raw_thread_123456789", "u1", "s1")
         proposal = KanbanCardProposal(
@@ -157,6 +169,8 @@ def main() -> int:
             "direct_card_operation_failure_suppressed": direct_card_operation_failure_suppressed,
             "durable_status_update_remains_eligible": durable_status_update_remains_eligible,
             "lifelog_generic_title_rewritten": lifelog_generic_title_rewritten,
+            "hybrid_title_generator_accepts_safe_draft": hybrid_title_generator_accepts_safe_draft,
+            "hybrid_title_generator_rejects_unsafe_draft": hybrid_title_generator_rejects_unsafe_draft,
             "raw_source_ids_in_card_body": any(raw in (body or "") for raw in ("raw_chat_123456789", "raw_thread_123456789", "u1")),
             "sensitive_payload_in_card_body": bool(sensitive_payload_in_card_body),
         }
@@ -188,6 +202,8 @@ def main() -> int:
             result["direct_card_operation_failure_suppressed"],
             result["durable_status_update_remains_eligible"],
             result["lifelog_generic_title_rewritten"],
+            result["hybrid_title_generator_accepts_safe_draft"],
+            result["hybrid_title_generator_rejects_unsafe_draft"],
             not result["raw_source_ids_in_card_body"],
             not result["sensitive_payload_in_card_body"],
         ]) else "FAIL")

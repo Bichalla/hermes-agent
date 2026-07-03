@@ -6,6 +6,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import sys
 import tempfile
 from pathlib import Path
 
@@ -32,6 +33,9 @@ def main() -> int:
     ])
 
     with tempfile.TemporaryDirectory(prefix="hermes-kanban-intake-") as td:
+        project_root = Path(__file__).resolve().parents[1]
+        if str(project_root) not in sys.path:
+            sys.path.insert(0, str(project_root))
         os.environ["HERMES_HOME"] = str(Path(td) / ".hermes")
         from gateway.kanban_intake import (
             IntakeDetectionRequest,
@@ -45,6 +49,7 @@ def main() -> int:
             validate_proposal,
         )
         from hermes_cli import kanban_db as kb
+        from scripts.eval_kanban_intake_quality import evaluate, load_cases
 
         board = "lifelog-control"
         kb.create_board(board, name="Lifelog Control")
@@ -109,7 +114,7 @@ def main() -> int:
         binding = SourceBinding("discord", "raw_chat_123456789", "raw_thread_123456789", "u1", "s1")
         proposal = KanbanCardProposal(
             board=board,
-            title="No-live guardrail smoke",
+            title="Verify no-live guardrail smoke",
             body={"source_ref": "kp_safe", "acceptance_criteria": ["pass"]},
             source_ref="kp_safe",
             user_id="u1",
@@ -143,6 +148,7 @@ def main() -> int:
             user_id="u1",
         )
         sensitive_payload_in_card_body = validate_proposal(sensitive, cfg)[0]
+        quality = evaluate(load_cases(Path(__file__).resolve().parents[1] / "tests/fixtures/kanban_intake_golden_cases.jsonl"))
 
         result = {
             "gateway_restarted": False,
@@ -171,6 +177,13 @@ def main() -> int:
             "lifelog_generic_title_rewritten": lifelog_generic_title_rewritten,
             "hybrid_title_generator_accepts_safe_draft": hybrid_title_generator_accepts_safe_draft,
             "hybrid_title_generator_rejects_unsafe_draft": hybrid_title_generator_rejects_unsafe_draft,
+            "quality_metrics_present": True,
+            "candidate_precision_threshold_met": quality["candidate_precision"] >= 0.90,
+            "candidate_recall_threshold_met": quality["candidate_recall"] >= 0.70,
+            "generic_title_rate_threshold_met": quality["generic_title_rate"] <= 0.05,
+            "raw_copy_rate_zero": quality["raw_copy_rate"] == 0,
+            "sensitive_title_leak_zero": quality["sensitive_title_leak"] == 0,
+            "quality_thresholds_passed": bool(quality["thresholds_passed"]),
             "raw_source_ids_in_card_body": any(raw in (body or "") for raw in ("raw_chat_123456789", "raw_thread_123456789", "u1")),
             "sensitive_payload_in_card_body": bool(sensitive_payload_in_card_body),
         }
@@ -204,6 +217,13 @@ def main() -> int:
             result["lifelog_generic_title_rewritten"],
             result["hybrid_title_generator_accepts_safe_draft"],
             result["hybrid_title_generator_rejects_unsafe_draft"],
+            result["quality_metrics_present"],
+            result["candidate_precision_threshold_met"],
+            result["candidate_recall_threshold_met"],
+            result["generic_title_rate_threshold_met"],
+            result["raw_copy_rate_zero"],
+            result["sensitive_title_leak_zero"],
+            result["quality_thresholds_passed"],
             not result["raw_source_ids_in_card_body"],
             not result["sensitive_payload_in_card_body"],
         ]) else "FAIL")

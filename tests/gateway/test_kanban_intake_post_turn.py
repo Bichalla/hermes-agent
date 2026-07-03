@@ -155,6 +155,49 @@ async def test_post_turn_rewrites_generic_lifelog_title_generator_bug(tmp_path):
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("text", "expected", "forbidden"),
+    [
+        (
+            "카드로 남겨줘: add regression tests for Kanban intake false positives",
+            "Add Kanban intake false-positive regression tests",
+            "medication",
+        ),
+        (
+            "카드로 남겨줘: JÖKL 마케팅 패킷 생성기 다음 스프린트 작업을 정리하고 테스트/커밋까지 해야 해",
+            "Plan JÖKL marketing packet generator sprint work",
+            "Plan Kanban follow-up work",
+        ),
+        (
+            "해수 열 기록 후속 작업 카드로 남겨줘",
+            "Review child health Lifelog capture",
+            "해수",
+        ),
+        (
+            "token rotation follow-up 카드로 남겨줘",
+            "Review security rotation scope",
+            "child health",
+        ),
+    ],
+)
+async def test_post_turn_renders_quality_hardened_semantic_titles(tmp_path, text, expected, forbidden):
+    cfg = KanbanIntakeConfig(enabled=True, default_board="lifelog-control", store_path=tmp_path / "pending.db")
+    runner = object.__new__(GatewayRunner)
+    runner._kanban_intake_config = lambda: cfg
+    runner._kanban_intake_store = lambda _cfg=None: __import__("gateway.kanban_intake", fromlist=["PendingKanbanStore"]).PendingKanbanStore(cfg.store_path)
+    runner._kanban_intake_detector = Detector(DetectorDecision(
+        True,
+        title="Review lifelog follow-up work",
+        body={"source_ref": "kp_safe"},
+    ))
+    event = MessageEvent(text=text, message_type=MessageType.TEXT, source=source(), message_id="1522060000000000010")
+    msg = await runner._maybe_build_kanban_intake_proposal_message(event, "s1", event.text, "후속 작업이 필요하다.")
+    assert msg is not None
+    assert expected in msg
+    assert forbidden not in msg
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize("text", [
     "카드 생성 조건이 너무 후한거 아닌가?",
     "칸반보드가 필요한거는 장기로 이어지는 프로젝트에 한정해야되는 거 아니야??",
@@ -388,7 +431,7 @@ async def test_post_turn_rewrites_verbatim_detector_title_before_rendering(tmp_p
     )
     msg = await runner._maybe_build_kanban_intake_proposal_message(event, "s1", event.text, "구현하자")
     assert msg is not None
-    assert "Improve Kanban intake title generator" in msg
+    assert "Fix Kanban title raw-copy guardrail scope" in msg
     assert raw_title not in msg
     assert "원문 복사 금지 구현/테스트" not in msg
 

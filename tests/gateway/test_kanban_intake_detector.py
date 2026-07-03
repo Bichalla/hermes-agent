@@ -1,15 +1,23 @@
+import json
+import subprocess
+import sys
+from pathlib import Path
+
 import pytest
 
 from gateway.kanban_intake import (
     AuxiliaryLLMDetector,
+    KanbanCardProposal,
     KanbanIntakeConfig,
     KeywordHeuristicDetector,
     IntakeDetectionRequest,
     card_proposal_eligibility,
+    evaluate_title_quality,
     explicit_title_from_request,
     generated_title_from_json,
     minimize_for_detector,
     parse_detector_json,
+    validate_proposal,
 )
 
 
@@ -386,7 +394,7 @@ def test_title_generator_rejects_verbatim_user_wording_even_when_not_clunky():
     )
     raw_title = "Kanban intake 중복 노이즈 회귀 테스트 추가"
     title = explicit_title_from_request(request, raw_title)
-    assert title == "Plan Kanban follow-up work"
+    assert title == "Add Kanban intake regression tests"
     assert title != raw_title
     assert "중복 노이즈 회귀 테스트 추가" not in title
 
@@ -583,12 +591,12 @@ def test_explicit_title_falls_back_when_constrained_generator_is_unsafe():
 def test_strict_json_parser_fail_closed():
     assert parse_detector_json('{"card_worthy": true, "status": "ready", "title": "x"}').card_worthy is False
     assert parse_detector_json('{"card_worthy": true}').card_worthy is False
-    good = parse_detector_json('{"card_worthy": true, "title": "Safe follow-up", "status": "blocked", "body": {"source_ref": "kp"}}')
+    good = parse_detector_json('{"card_worthy": true, "title": "Verify safe diagnostic scope", "status": "blocked", "body": {"source_ref": "kp"}}')
     assert good.card_worthy is True
 
 
 def test_strict_json_parser_defaults_to_blocked_when_status_omitted():
-    decision = parse_detector_json('{"card_worthy": true, "title": "Safe follow-up", "body": {"source_ref": "kp"}}')
+    decision = parse_detector_json('{"card_worthy": true, "title": "Verify safe diagnostic scope", "body": {"source_ref": "kp"}}')
     assert decision.card_worthy is True
     assert decision.proposed_status == "blocked"
 
@@ -608,3 +616,213 @@ def test_auxiliary_not_called_when_disabled_or_redaction_off():
     assert AuxiliaryLLMDetector(KanbanIntakeConfig(auxiliary_detector_enabled=False), call).detect(req()).card_worthy is False
     assert AuxiliaryLLMDetector(KanbanIntakeConfig(auxiliary_detector_enabled=True, redact_before_auxiliary=False), call).detect(req()).card_worthy is False
     assert called["n"] == 0
+
+
+def test_golden_corpus_schema_is_valid():
+    path = Path("tests/fixtures/kanban_intake_golden_cases.jsonl")
+    cases = [json.loads(line) for line in path.read_text(encoding="utf-8").splitlines() if line.strip()]
+    assert cases
+    required_ids = {
+        "p0_kanban_intake_not_medication",
+        "p0_kanban_false_positive_tests_not_medication",
+        "p1_child_health_privacy_safe_title",
+        "p1_jokl_marketing_packet_non_generic_title",
+        "p1_security_sensitive_not_child_health",
+        "negative_read_only_candidate_audit",
+        "negative_existing_card_update",
+        "negative_direct_card_operation",
+        "negative_ephemeral_subagent_review_command",
+    }
+    assert {case["id"] for case in cases} >= required_ids
+    for case in cases:
+        assert isinstance(case["input"]["user_summary"], str)
+        assert isinstance(case["input"].get("assistant_summary", ""), str)
+        expected = case["expected"]
+        assert expected["candidate_class"] in {
+            "direct_operation",
+            "existing_card_update",
+            "proposal_record_request",
+            "read_only_audit",
+            "ephemeral_workflow_command",
+            "durable_followup",
+            "unsafe_live_side_effect",
+            "insufficient_signal",
+        }
+        assert isinstance(expected["card_worthy"], bool)
+        assert "title_policy" in expected
+
+
+@pytest.mark.parametrize(
+    ("user_summary", "expected_class", "expected_worthy"),
+    [
+        ("suttanipata-ko 보드에 카드 만들어줘", "direct_operation", False),
+        ("t_5b858cd6 카드에 진행상태 업데이트해", "existing_card_update", False),
+        ("카드로 남겨줘: Kanban intake false positive regression tests", "proposal_record_request", True),
+        ("보드/카드 후보만 추천해줘. 실행하지 말고 목록만.", "read_only_audit", False),
+        ("리뷰까지 서브에이전트 시켜서 진행해봐", "insufficient_signal", False),
+        ("gateway status update feature 구현/테스트까지 해줘", "durable_followup", True),
+        ("승인: Discord live smoke 테스트 blocked card 1개 생성/검증해", "unsafe_live_side_effect", True),
+        ("오늘 뭐하지", "insufficient_signal", False),
+    ],
+)
+def test_candidate_classifier_taxonomy(user_summary, expected_class, expected_worthy):
+    request = IntakeDetectionRequest(
+        platform="discord",
+        session_key="s1",
+        source_ref="kp_safe",
+        user_summary=user_summary,
+        assistant_summary="답변했다.",
+        default_board="lifelog-control",
+        default_tenant="lifelog",
+    )
+    decision = KeywordHeuristicDetector().detect(request)
+    assert decision.card_worthy is expected_worthy
+    assert decision.candidate_class == expected_class
+    assert card_proposal_eligibility(request).candidate_class == expected_class
+
+
+def test_kanban_intake_titles_do_not_collapse_to_medication():
+    request = IntakeDetectionRequest(
+        platform="discord",
+        session_key="s1",
+        source_ref="kp_safe",
+        user_summary="Hermes gateway kanban intake title generator 품질 평가 리포트 작성하고 개선안 정리해줘",
+        assistant_summary="후속 구현/테스트 작업이 필요하다.",
+        default_board="lifelog-control",
+        default_tenant="lifelog",
+    )
+    title = explicit_title_from_request(request, "Review lifelog follow-up work")
+    assert title == "Review Kanban candidate/title quality"
+    assert "medication" not in title.lower()
+
+
+def test_kanban_false_positive_regression_title_not_medication():
+    request = IntakeDetectionRequest(
+        platform="discord",
+        session_key="s1",
+        source_ref="kp_safe",
+        user_summary="카드로 남겨줘: add regression tests for Kanban intake false positives",
+        assistant_summary="테스트 추가가 필요하다.",
+        default_board="lifelog-control",
+        default_tenant="lifelog",
+    )
+    title = explicit_title_from_request(request, "Review lifelog follow-up work")
+    assert title == "Add Kanban intake false-positive regression tests"
+    assert "medication" not in title.lower()
+
+
+def test_project_title_preserves_jokl_marketing_object_without_raw_copy():
+    request = IntakeDetectionRequest(
+        platform="discord",
+        session_key="s1",
+        source_ref="kp_safe",
+        user_summary="카드로 남겨줘: JÖKL 마케팅 패킷 생성기 다음 스프린트 작업을 정리하고 테스트/커밋까지 해야 해",
+        assistant_summary="후속 작업이 필요하다.",
+        default_board="lifelog-control",
+        default_tenant="lifelog",
+    )
+    title = explicit_title_from_request(request, "Plan Kanban follow-up work")
+    assert title == "Plan JÖKL marketing packet generator sprint work"
+    assert "Plan Kanban follow-up work" not in title
+    assert "마케팅 패킷 생성기 다음 스프린트 작업" not in title
+
+
+def test_child_health_title_is_privacy_safe_semantic_title():
+    request = IntakeDetectionRequest(
+        platform="discord",
+        session_key="s1",
+        source_ref="kp_safe",
+        user_summary="해수 열 기록 후속 작업 카드로 남겨줘",
+        assistant_summary="후속 작업이 필요하다.",
+        default_board="lifelog-control",
+        default_tenant="lifelog",
+    )
+    title = explicit_title_from_request(request, "Plan Kanban follow-up work")
+    assert title == "Review child health Lifelog capture"
+    assert "해수" not in title
+    assert "Plan Kanban follow-up work" not in title
+
+
+def test_typed_sensitive_marker_does_not_collapse_security_to_child_health():
+    request = IntakeDetectionRequest(
+        platform="discord",
+        session_key="s1",
+        source_ref="kp_safe",
+        user_summary=minimize_for_detector("token rotation follow-up 카드로 남겨줘"),
+        assistant_summary="후속 작업이 필요하다.",
+        default_board="lifelog-control",
+        default_tenant="lifelog",
+    )
+    assert "[security-sensitive]" in request.user_summary
+    title = explicit_title_from_request(request, "Plan Kanban follow-up work")
+    assert title == "Review security rotation scope"
+    assert "child health" not in title.lower()
+    assert "token" not in title.lower()
+
+
+@pytest.mark.parametrize("bad", [
+    "Follow up on requested work",
+    "Plan Kanban follow-up work",
+    "[상현] 카드로 남겨줘: Kanban intake 중복 노이즈 회귀 테스트 추가",
+    "Review child fever 39.2 follow-up",
+])
+def test_title_quality_rubric_rejects_generic_raw_or_sensitive_titles(bad):
+    request = IntakeDetectionRequest(
+        platform="discord",
+        session_key="s1",
+        source_ref="kp_safe",
+        user_summary="카드로 남겨줘: Kanban intake 중복 노이즈 회귀 테스트 추가",
+        assistant_summary="후속 작업이다.",
+        default_board="lifelog-control",
+        default_tenant="lifelog",
+    )
+    assert evaluate_title_quality(bad, request).passed is False
+
+
+def test_validate_proposal_enforces_title_quality_before_storage():
+    cfg = KanbanIntakeConfig(enabled=True, default_board="lifelog-control")
+    proposal = KanbanCardProposal(
+        board="lifelog-control",
+        title="Bad title",
+        body={"source_ref": "kp_safe", "acceptance_criteria": ["check"]},
+        source_ref="kp_safe",
+        user_id="u1",
+    )
+    assert validate_proposal(proposal, cfg) == (
+        False,
+        "title quality failed: missing_action_verb,missing_object_or_scope",
+    )
+
+
+@pytest.mark.parametrize("good", [
+    "Fix Kanban intake false-positive suppression",
+    "Add Kanban intake regression tests",
+    "Review JÖKL marketing packet generator sprint scope",
+    "Review child health Lifelog capture",
+])
+def test_title_quality_rubric_accepts_action_object_scope_titles(good):
+    assert evaluate_title_quality(good).passed is True
+
+
+def test_eval_script_reports_quality_metrics():
+    proc = subprocess.run(
+        [
+            sys.executable,
+            "scripts/eval_kanban_intake_quality.py",
+            "--corpus",
+            "tests/fixtures/kanban_intake_golden_cases.jsonl",
+            "--json",
+        ],
+        text=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        check=True,
+    )
+    data = json.loads(proc.stdout)
+    assert data["candidate_precision"] >= 0.90
+    assert data["candidate_recall"] >= 0.70
+    assert data["unsafe_false_positive"] == 0
+    assert data["generic_title_rate"] <= 0.05
+    assert data["raw_copy_rate"] == 0
+    assert data["sensitive_title_leak"] == 0
+    assert data["thresholds_passed"] is True

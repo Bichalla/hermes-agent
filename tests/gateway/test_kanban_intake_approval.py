@@ -22,7 +22,7 @@ def binding():
 def valid_proposal():
     return KanbanCardProposal(
         board="lifelog-control",
-        title="Implement local guardrail",
+        title="Implement local guardrail scope",
         body={"source_ref": "kp_safe", "acceptance_criteria": ["focused tests pass"]},
         source_ref="kp_safe",
         user_id="u1",

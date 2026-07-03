@@ -28,7 +28,7 @@ def test_execute_creates_verified_blocked_card_in_temp_home(tmp_path, monkeypatc
     cfg = KanbanIntakeConfig(enabled=True, default_board=board)
     proposal = KanbanCardProposal(
         board=board,
-        title="Local guardrail task",
+        title="Implement local guardrail scope",
         body={"source_ref": "kp_safe", "acceptance_criteria": ["pass"]},
         source_ref="kp_safe",
         user_id="u1",
@@ -71,7 +71,7 @@ def test_blocked_intake_card_is_not_spawned_by_dispatch_tick(tmp_path, monkeypat
     cfg = KanbanIntakeConfig(enabled=True, default_board=board)
     proposal = KanbanCardProposal(
         board=board,
-        title="Non-dispatch intake card",
+        title="Verify non-dispatch intake card scope",
         body={"source_ref": "kp_safe", "acceptance_criteria": ["pass"]},
         source_ref="kp_safe",
         user_id="u1",

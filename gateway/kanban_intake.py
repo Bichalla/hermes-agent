@@ -42,6 +42,15 @@ _SENSITIVE_PATTERNS = (
 )
 _ID_LIKE_RE = re.compile(r"\b\d{8,}\b")
 _TITLE_MAX_CHARS = 72
+CURRENT_POLICY_VERSION = "kanban-intake-policy/v2"
+_SAFE_SENSITIVE_TITLE_PHRASES = (
+    "child health",
+    "childcare condition",
+    "family health",
+    "condition lifelog capture",
+    "child health lifelog capture",
+    "childcare lifelog capture",
+)
 _GENERIC_TITLE_RE = re.compile(
     r"(?:review\s+.*follow[-\s]?up|plan\s+kanban\s+follow[-\s]?up|define\s+next\s+action|safe\s+ops\s+follow[-\s]?up|conversational\s+kanban\s+follow[-\s]?up)",
     re.I,
@@ -293,6 +302,7 @@ class PendingKanbanApproval:
     status: str = "pending"
     source_ids: dict[str, Any] = field(default_factory=dict)
     purge_after: float = 0.0
+    policy_version: str = CURRENT_POLICY_VERSION
 
 
 @dataclass(frozen=True)
@@ -331,6 +341,7 @@ class DetectorDecision:
     proposed_status: str = "blocked"
     why: str = ""
     body: dict[str, Any] = field(default_factory=dict)
+    candidate_class: str = "insufficient_signal"
 
 
 @dataclass(frozen=True)
@@ -367,6 +378,13 @@ class ProposalEligibility:
     eligible: bool
     reason: str
     matched_rule: str = ""
+    candidate_class: str = "insufficient_signal"
+
+
+@dataclass(frozen=True)
+class TitleQualityResult:
+    passed: bool
+    reason_codes: tuple[str, ...] = ()
 
 
 class KanbanIntakeDetector(Protocol):
@@ -390,7 +408,14 @@ def _contains_sensitive_payload(text: str) -> bool:
     value = str(text or "")
     if not value:
         return False
-    return any(p.search(value) for p in _SENSITIVE_PATTERNS)
+    # Safe semantic titles may name the domain class (for example "child
+    # health") without leaking raw person names, symptoms, measurements, or
+    # transcript details. Remove those allowlisted phrases before applying the
+    # broad privacy guard used for raw payloads.
+    screened = value.lower()
+    for phrase in _SAFE_SENSITIVE_TITLE_PHRASES:
+        screened = screened.replace(phrase.lower(), "")
+    return any(p.search(screened) for p in _SENSITIVE_PATTERNS)
 
 
 def _iter_body_strings(value: Any) -> Iterable[str]:
@@ -412,6 +437,9 @@ def validate_proposal(proposal: KanbanCardProposal, cfg: KanbanIntakeConfig) -> 
         return False, f"unsupported status {proposal.proposed_status!r}"
     if not proposal.title.strip():
         return False, "missing title"
+    title_quality = evaluate_title_quality(proposal.title)
+    if not title_quality.passed:
+        return False, "title quality failed: " + ",".join(title_quality.reason_codes)
     if not proposal.user_id:
         return False, "missing user binding"
     if _contains_sensitive_payload(proposal.title) or _contains_sensitive_payload(proposal.why):
@@ -478,7 +506,27 @@ class PendingKanbanStore:
         conn.execute("PRAGMA journal_mode=WAL")
         conn.execute("PRAGMA foreign_keys=ON")
         conn.executescript(_SCHEMA)
+        self._migrate(conn)
         return conn
+
+    def connect_readonly(self) -> Optional[sqlite3.Connection]:
+        if not self.path.exists():
+            return None
+        conn = sqlite3.connect(f"file:{self.path}?mode=ro", uri=True)
+        conn.row_factory = sqlite3.Row
+        return conn
+
+    @staticmethod
+    def _migrate(conn: sqlite3.Connection) -> None:
+        columns = {row["name"] for row in conn.execute("PRAGMA table_info(kanban_intake_pending)").fetchall()}
+        if "policy_version" not in columns:
+            conn.execute(
+                "ALTER TABLE kanban_intake_pending ADD COLUMN policy_version TEXT NOT NULL DEFAULT ''"
+            )
+            conn.execute(
+                "UPDATE kanban_intake_pending SET policy_version = '' WHERE policy_version IS NULL"
+            )
+        conn.commit()
 
     def put_pending(
         self,
@@ -526,8 +574,8 @@ class PendingKanbanStore:
                   platform, chat_id, thread_id, user_id, session_key,
                   source_ref, source_ids_json, board, title, body_json,
                   domain, tenant, assignee, priority, proposed_status,
-                  why, idempotency_key, redaction_version, purge_after, updated_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                  why, idempotency_key, redaction_version, policy_version, purge_after, updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     pending.pending_id, pending.created_at, pending.expires_at, pending.status,
@@ -535,7 +583,7 @@ class PendingKanbanStore:
                     proposal.source_ref, json.dumps(pending.source_ids, ensure_ascii=False, sort_keys=True),
                     proposal.board, proposal.title, json.dumps(proposal.body, ensure_ascii=False, sort_keys=True),
                     proposal.domain, proposal.tenant, proposal.assignee, int(proposal.priority), proposal.proposed_status,
-                    proposal.why, proposal.idempotency_key, "kanban-intake-redaction/v1", pending.purge_after, now,
+                    proposal.why, proposal.idempotency_key, "kanban-intake-redaction/v1", CURRENT_POLICY_VERSION, pending.purge_after, now,
                 ),
             )
             conn.commit()
@@ -579,6 +627,89 @@ class PendingKanbanStore:
             conn.commit()
             return int(cur.rowcount or 0)
 
+    def review_pending(self, *, now: Optional[float] = None, include_all: bool = False, limit: int = 100) -> dict[str, Any]:
+        now = time.time() if now is None else float(now)
+        status_clause = "" if include_all else "WHERE status = 'pending'"
+        conn = self.connect_readonly()
+        if conn is None:
+            return {"current_policy_version": CURRENT_POLICY_VERSION, "counts": {}, "items": []}
+        with conn:
+            table = conn.execute(
+                "SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'kanban_intake_pending'"
+            ).fetchone()
+            if table is None:
+                return {"current_policy_version": CURRENT_POLICY_VERSION, "counts": {}, "items": []}
+            columns = {row["name"] for row in conn.execute("PRAGMA table_info(kanban_intake_pending)").fetchall()}
+            policy_expr = "policy_version" if "policy_version" in columns else "'' AS policy_version"
+            rows = conn.execute(
+                f"""
+                SELECT pending_id, status, title, created_at, expires_at,
+                       {policy_expr}, board, tenant
+                FROM kanban_intake_pending
+                {status_clause}
+                ORDER BY created_at DESC
+                LIMIT ?
+                """,
+                (int(limit),),
+            ).fetchall()
+        items: list[dict[str, Any]] = []
+        counts: dict[str, int] = {}
+        for row in rows:
+            policy_version = row["policy_version"] or ""
+            raw_title = row["title"] or ""
+            title_quality = evaluate_title_quality(raw_title)
+            title = minimize_for_detector(raw_title, max_chars=120)
+            flags = []
+            if policy_version != CURRENT_POLICY_VERSION:
+                flags.append("stale_policy")
+            if row["status"] == "pending" and float(row["expires_at"] or 0) <= now:
+                flags.append("expired")
+            flags.extend(title_quality.reason_codes)
+            counts[row["status"]] = counts.get(row["status"], 0) + 1
+            items.append({
+                "pending_id": row["pending_id"],
+                "status": row["status"],
+                "title": title,
+                "created_at": row["created_at"],
+                "expires_at": row["expires_at"],
+                "policy_version": policy_version,
+                "current_policy_version": CURRENT_POLICY_VERSION,
+                "board": row["board"],
+                "tenant": row["tenant"],
+                "flags": tuple(dict.fromkeys(flags)),
+            })
+        return {"current_policy_version": CURRENT_POLICY_VERSION, "counts": counts, "items": items}
+
+    def revalidate_pending(self, *, now: Optional[float] = None, include_all: bool = False, limit: int = 100) -> dict[str, Any]:
+        review = self.review_pending(now=now, include_all=include_all, limit=limit)
+        for item in review["items"]:
+            flags = set(item["flags"])
+            item["would_pass"] = not (flags & {"stale_policy", "expired", "generic_title", "raw_user_copy", "sensitive_leak", "empty"})
+            item["would_invalidate"] = not item["would_pass"]
+        return review
+
+    def bulk_invalidate(self, *, where: str = "stale-or-generic", dry_run: bool = True, now: Optional[float] = None) -> dict[str, Any]:
+        review = self.revalidate_pending(now=now, include_all=False, limit=10000)
+        if where != "stale-or-generic":
+            raise ValueError("unsupported where filter")
+        targets = [item["pending_id"] for item in review["items"] if item.get("would_invalidate")]
+        updated = 0
+        if not dry_run and targets:
+            timestamp = time.time() if now is None else float(now)
+            with self.connect() as conn:
+                for pending_id in targets:
+                    cur = conn.execute(
+                        """
+                        UPDATE kanban_intake_pending
+                        SET status = 'invalid', updated_at = ?
+                        WHERE pending_id = ? AND status = 'pending'
+                        """,
+                        (timestamp, pending_id),
+                    )
+                    updated += int(cur.rowcount or 0)
+                conn.commit()
+        return {"dry_run": dry_run, "where": where, "matched": len(targets), "updated": updated, "pending_ids": targets[:25]}
+
     def _from_row(self, row: sqlite3.Row) -> PendingKanbanApproval:
         binding = SourceBinding(
             platform=row["platform"], chat_id=row["chat_id"], thread_id=row["thread_id"],
@@ -600,6 +731,7 @@ class PendingKanbanStore:
             pending_id=row["pending_id"], binding=binding, proposal=proposal,
             created_at=float(row["created_at"]), expires_at=float(row["expires_at"]),
             status=row["status"], source_ids=source_ids, purge_after=float(row["purge_after"]),
+            policy_version=(row["policy_version"] or ""),
         )
 
 
@@ -627,6 +759,7 @@ CREATE TABLE IF NOT EXISTS kanban_intake_pending (
   why TEXT,
   idempotency_key TEXT,
   redaction_version TEXT NOT NULL,
+  policy_version TEXT NOT NULL DEFAULT '',
   purge_after REAL NOT NULL,
   updated_at REAL NOT NULL
 );
@@ -687,6 +820,13 @@ def handle_reply(
     if action == DENY:
         store.mark_status(lookup.pending.pending_id, "denied")
         return ApprovalResult(True, "Kanban 카드 후보 취소 완료.", action=DENY)
+    if lookup.pending.policy_version != CURRENT_POLICY_VERSION:
+        store.mark_status(lookup.pending.pending_id, "needs_revalidation")
+        return ApprovalResult(
+            True,
+            "Kanban 카드 후보 정책 버전이 오래되어 실행하지 않았다. revalidate 또는 새 후보 생성이 필요하다.",
+            action=APPROVAL,
+        )
     result = execute_pending_approval(lookup.pending, cfg)
     store.mark_status(lookup.pending.pending_id, "executed" if result.verified else "invalid")
     return result
@@ -695,8 +835,15 @@ def handle_reply(
 def minimize_for_detector(text: str, *, max_chars: int = 500) -> str:
     value = str(text or "")
     value = _ID_LIKE_RE.sub("[id]", value)
-    for pat in _SENSITIVE_PATTERNS:
-        value = pat.sub("[sensitive]", value)
+    typed_redactions = (
+        (re.compile(r"(?:해수|아이|자녀|\bchild\b|\bchildcare\b)", re.I), "[child-sensitive]"),
+        (re.compile(r"(?:가족|아내|수지|\bfamily\b|\bwife\b|\bspouse\b)", re.I), "[family-sensitive]"),
+        (re.compile(r"(?:의료|진단|처방|복용|열|\bmedical\b|\bdiagnosis\b|\bprescription\b|\billness\b|\bfever\b)", re.I), "[health-sensitive]"),
+        (re.compile(r"(?:비밀번호|토큰|시크릿|\bcredential\b|\bsecret\b|\btoken\b|\bpassword\b)", re.I), "[security-sensitive]"),
+        (re.compile(r"(?:가치관|정체성|\bvalue\s*grill\b|\bstance\b|\bidentity\b)", re.I), "[private-sensitive]"),
+    )
+    for pat, marker in typed_redactions:
+        value = pat.sub(marker, value)
     value = " ".join(value.split())
     if len(value) > max_chars:
         value = value[: max_chars - 1] + "…"
@@ -802,10 +949,104 @@ def _looks_like_raw_user_title(title: str, request: IntakeDetectionRequest) -> b
     if title_key in user_key or user_key in title_key:
         return True
     overlap = _longest_common_substring_len(title_key, user_key)
-    return overlap >= max(18, int(len(title_key) * 0.65))
+    return overlap >= max(18, int(len(title_key) * 0.85))
+
+
+def evaluate_title_quality(title: str, request: Optional[IntakeDetectionRequest] = None) -> TitleQualityResult:
+    """Score the deterministic card-title rubric: Verb + Object + Outcome/scope.
+
+    The helper is intentionally small and stdlib-only so tests, no-live smoke,
+    and operator diagnostics can share one definition of generic/raw/sensitive
+    title failures.
+    """
+    compact = _compact_title(title)
+    reasons: list[str] = []
+    if not compact:
+        reasons.append("empty")
+    if _is_generic_title(compact):
+        reasons.append("generic_title")
+    if _is_clunky_title(compact):
+        reasons.append("clunky_title")
+    if _contains_sensitive_payload(compact):
+        reasons.append("sensitive_leak")
+    if request is not None and _looks_like_raw_user_title(compact, request):
+        reasons.append("raw_user_copy")
+    words = compact.split()
+    allowed_verbs = ("Review", "Fix", "Verify", "Investigate", "Record", "Implement", "Improve", "Add", "Plan", "Create")
+    if not any(compact == verb or compact.startswith(f"{verb} ") for verb in allowed_verbs):
+        reasons.append("missing_action_verb")
+    if len(words) < 3:
+        reasons.append("missing_object_or_scope")
+    # Require something after the object: scope/outcome nouns, domain anchors,
+    # or an accepted three-word domain title such as "Improve conversational
+    # Kanban intake". This blocks "Review follow-up" while keeping current
+    # concise project titles valid.
+    if len(words) >= 3 and not any(
+        anchor.lower() in compact.lower()
+        for anchor in (
+            "regression", "tests", "capture", "scope", "suppression", "generator",
+            "quality", "normalization", "workflow", "backlog", "cards", "intake",
+            "follow-up", "lifelog-control", "kanban", "gateway", "smoke",
+        )
+    ):
+        reasons.append("missing_outcome_scope")
+    return TitleQualityResult(not reasons, tuple(dict.fromkeys(reasons)))
+
+
+def _normalize_kanban_intake_title_intent(text: str) -> str:
+    lowered = str(text or "").lower()
+    if "kanban" not in lowered and "칸반" not in str(text or ""):
+        return ""
+    if any(term in lowered for term in ("false positive", "false-positive", "오탐")):
+        if any(term in lowered for term in ("test", "regression", "회귀", "테스트")):
+            return "Add Kanban intake false-positive regression tests"
+        return "Fix Kanban intake false-positive suppression"
+    if ("quality" in lowered or "품질" in str(text or "")) and ("title" in lowered or "타이틀" in str(text or "")):
+        return "Review Kanban candidate/title quality"
+    if "candidate" in lowered and ("title" in lowered or "quality" in lowered):
+        return "Review Kanban candidate/title quality"
+    if "title generator" in lowered or "타이틀" in str(text or "") or "제목" in str(text or ""):
+        return "Improve Kanban intake title generator"
+    if any(term in lowered for term in ("test", "regression", "회귀", "테스트")):
+        return "Add Kanban intake regression tests"
+    if "conversational intake" in lowered:
+        return "Improve conversational Kanban intake"
+    if "intake" in lowered:
+        return "Fix Kanban intake classification quality"
+    return ""
+
+
+def _normalize_project_title_intent(text: str) -> str:
+    value = str(text or "")
+    lowered = value.lower()
+    if "jÖkl" in value or "JÖKL" in value or "jokl" in lowered:
+        if "marketing" in lowered or "마케팅" in value:
+            if "packet" in lowered or "패킷" in value:
+                return "Plan JÖKL marketing packet generator sprint work"
+            return "Plan JÖKL marketing sprint work"
+        return "Plan JÖKL project follow-up work"
+    return ""
+
+
+def _normalize_child_family_health_title_intent(text: str) -> str:
+    value = str(text or "")
+    lowered = value.lower()
+    child_health = any(token in value for token in ("해수", "아이", "자녀", "[child-sensitive]")) or any(
+        token in lowered for token in ("child", "childcare")
+    )
+    health_signal = any(token in value for token in ("열", "증상", "컨디션", "기록", "후속", "[health-sensitive]")) or any(
+        token in lowered for token in ("health", "condition", "illness", "record", "follow-up")
+    )
+    if child_health and health_signal:
+        return "Review child health Lifelog capture"
+    if ("family" in lowered or "가족" in value) and health_signal:
+        return "Review family health Lifelog capture"
+    return ""
 
 
 def _normalize_korean_title_intent(text: str) -> str:
+    if _has_any(text, "원문 복사", "raw copy", "raw-copy") and _has_any(text, "타이틀", "title", "제목"):
+        return "Fix Kanban title raw-copy guardrail scope"
     if _has_any(text, "타이틀", "title") and _has_any(text, "왜이래", "왜 이래", "변한게 없어", "카드후보"):
         return "Improve Kanban intake title normalization"
     if _has_any(text, "후보", "candidate") and _has_any(text, "보드", "카드", "kanban") and _has_any(text, "Hermes", "헤르메스"):
@@ -817,9 +1058,27 @@ def _normalize_korean_title_intent(text: str) -> str:
     return ""
 
 
+def _normalize_sensitive_ops_title_intent(text: str) -> str:
+    value = str(text or "")
+    lowered = value.lower()
+    if any(token in value for token in ("[security-sensitive]", "비밀번호", "토큰", "시크릿")) or any(
+        token in lowered for token in ("credential", "secret", "token", "password")
+    ):
+        return "Review security rotation scope"
+    if any(token in value for token in ("[private-sensitive]", "가치관", "정체성")) or any(
+        token in lowered for token in ("value grill", "stance", "identity")
+    ):
+        return "Review private context follow-up scope"
+    return ""
+
+
+
 def _normalize_lifelog_title_intent(text: str) -> str:
-    if not _has_any(text, "lifelog", "라이프로그", "기록", "record", "follow-up", "후속"):
+    if not _has_any(text, "lifelog", "라이프로그", "기록", "record", "follow-up", "후속", "[child-sensitive]", "[health-sensitive]", "[family-sensitive]"):
         return ""
+    child_health = _normalize_child_family_health_title_intent(text)
+    if child_health:
+        return child_health
     if _has_any(text, "generic title", "제목", "타이틀", "review lifelog follow-up work 같은") and _has_any(
         text,
         "lifelog",
@@ -837,7 +1096,7 @@ def _normalize_lifelog_title_intent(text: str) -> str:
         "재발",
     ):
         return "Fix Lifelog medication reminder cron regression"
-    if _has_any(text, "medication", "복약", "약 먹", "약먹", "intake", "skipped dose", "복용"):
+    if _has_any(text, "medication", "복약", "약 먹", "약먹", "skipped dose", "복용"):
         return "Review medication intake Lifelog capture"
     if _has_any(text, "sleep", "수면", "취침", "기상"):
         return "Review sleep log Lifelog capture"
@@ -857,9 +1116,21 @@ def _normalize_lifelog_title_intent(text: str) -> str:
 def _raw_title_fallback(request: IntakeDetectionRequest) -> str:
     text = _clean_gate_text(request)
     lowered = text.lower()
+    project_normalized = _normalize_project_title_intent(text)
+    if project_normalized:
+        return project_normalized
+    kanban_normalized = _normalize_kanban_intake_title_intent(text)
+    if kanban_normalized:
+        return kanban_normalized
+    child_health = _normalize_child_family_health_title_intent(text)
+    if child_health:
+        return child_health
     lifelog_normalized = _normalize_lifelog_title_intent(text)
     if lifelog_normalized:
         return lifelog_normalized
+    sensitive_ops = _normalize_sensitive_ops_title_intent(text)
+    if sensitive_ops:
+        return sensitive_ops
     if _has_any(text, "타이틀", "title", "제목") and _has_any(text, "칸반", "kanban", "카드후보", "카드 후보"):
         return "Improve Kanban intake title generator"
     if "live smoke" in lowered and ("lifelog-control" in lowered or "discord" in lowered):
@@ -1084,24 +1355,24 @@ def card_proposal_eligibility(request: IntakeDetectionRequest, decision: Optiona
     text = _clean_gate_text(request)
     user_text = " ".join(str(request.user_summary or "").split())
     if _is_meta_or_one_off(text):
-        return ProposalEligibility(False, "meta discussion or one-off question", "negative_meta_one_off")
+        return ProposalEligibility(False, "meta discussion or one-off question", "negative_meta_one_off", "ephemeral_workflow_command")
     if _is_approved_live_smoke_request(user_text):
-        return ProposalEligibility(True, "approved live smoke request", "approved_live_smoke_request")
+        return ProposalEligibility(True, "approved live smoke request", "approved_live_smoke_request", "unsafe_live_side_effect")
     if suppress_existing_card_update_intent(user_text) and not _has_explicit_user_proposal_record_request(request):
-        return ProposalEligibility(False, "existing card update intent", "existing_card_update_intent")
+        return ProposalEligibility(False, "existing card update intent", "existing_card_update_intent", "existing_card_update")
     if _is_read_only_candidate_audit(user_text) and not _has_explicit_user_proposal_record_request(request):
-        return ProposalEligibility(False, "read-only candidate audit", "read_only_candidate_audit")
+        return ProposalEligibility(False, "read-only candidate audit", "read_only_candidate_audit", "read_only_audit")
     if suppress_direct_card_operation_intent(request):
-        return ProposalEligibility(False, "direct card operation intent", "direct_card_operation_intent")
+        return ProposalEligibility(False, "direct card operation intent", "direct_card_operation_intent", "direct_operation")
     if _has_explicit_user_proposal_record_request(request):
-        return ProposalEligibility(True, "explicit card request", "explicit_card_request")
+        return ProposalEligibility(True, "explicit card request", "explicit_card_request", "proposal_record_request")
     if _has_explicit_user_card_request(request):
-        return ProposalEligibility(False, "direct card request requires main-turn handling", "direct_card_operation_intent")
+        return ProposalEligibility(False, "direct card request requires main-turn handling", "direct_card_operation_intent", "direct_operation")
     if _is_vague_board_creation_discussion(text):
-        return ProposalEligibility(False, "board discussion requires explicit long-lived project request", "board_requires_explicit_request")
+        return ProposalEligibility(False, "board discussion requires explicit long-lived project request", "board_requires_explicit_request", "insufficient_signal")
     if _has_durable_project_anchor(text) and _has_concrete_followup_signal(text):
-        return ProposalEligibility(True, "durable project follow-up", "durable_followup")
-    return ProposalEligibility(False, "insufficient durable follow-up signal", "insufficient_scope")
+        return ProposalEligibility(True, "durable project follow-up", "durable_followup", "durable_followup")
+    return ProposalEligibility(False, "insufficient durable follow-up signal", "insufficient_scope", "insufficient_signal")
 
 
 def _candidate_title_text(request: IntakeDetectionRequest) -> str:
@@ -1133,6 +1404,15 @@ def _candidate_title_text(request: IntakeDetectionRequest) -> str:
         "training",
         "여행",
         "travel",
+        "JÖKL",
+        "jokl",
+        "마케팅",
+        "marketing",
+        "packet",
+        "패킷",
+        "false positive",
+        "false-positive",
+        "오탐",
     )
     for segment in segments:
         if any(word.lower() in segment.lower() for word in title_words):
@@ -1176,24 +1456,54 @@ def explicit_title_from_request(
         or _is_generic_title(proposed_compact)
         or _is_clunky_title(proposed_compact)
         or _looks_like_raw_user_title(proposed_compact, request)
+        or not evaluate_title_quality(proposed_compact, request).passed
     ):
+        project_normalized = _normalize_project_title_intent(combined_for_title)
+        if project_normalized:
+            return project_normalized
+        proposal_specific = _normalize_kanban_intake_title_intent(combined_for_title)
+        if proposal_specific:
+            return proposal_specific
+        child_health = _normalize_child_family_health_title_intent(combined_for_title)
+        if child_health:
+            return child_health
         proposed_lifelog_normalized = _normalize_lifelog_title_intent(combined_for_title)
         if proposed_lifelog_normalized:
             return proposed_lifelog_normalized
+        sensitive_ops = _normalize_sensitive_ops_title_intent(combined_for_title)
+        if sensitive_ops:
+            return sensitive_ops
     proposed_normalized = _normalize_korean_title_intent(
         "\n".join(part for part in (request.user_summary or "", proposed_compact) if part)
     )
     if proposed_normalized:
         return proposed_normalized
-    if proposed_compact and not _is_generic_title(proposed_compact) and not _is_clunky_title(proposed_compact):
+    if (
+        proposed_compact
+        and not _is_generic_title(proposed_compact)
+        and not _is_clunky_title(proposed_compact)
+        and evaluate_title_quality(proposed_compact, request).passed
+    ):
         return _enforce_non_raw_user_title(request, proposed_compact)
 
     text = _candidate_title_text(request)
     lowered = text.lower()
 
+    project_normalized = _normalize_project_title_intent(text)
+    if project_normalized:
+        return project_normalized
+    kanban_normalized = _normalize_kanban_intake_title_intent(text)
+    if kanban_normalized:
+        return kanban_normalized
+    child_health = _normalize_child_family_health_title_intent(text)
+    if child_health:
+        return child_health
     lifelog_normalized = _normalize_lifelog_title_intent(text)
     if lifelog_normalized:
         return lifelog_normalized
+    sensitive_ops = _normalize_sensitive_ops_title_intent(text)
+    if sensitive_ops:
+        return sensitive_ops
     if "title generator" in lowered and ("kanban" in lowered or "칸반" in text):
         return "Improve Kanban intake title generator"
     if "live smoke" in lowered and ("lifelog-control" in lowered or "discord" in lowered):
@@ -1219,7 +1529,7 @@ def explicit_title_from_request(
 class KeywordHeuristicDetector:
     """Small deterministic detector for tests/local smoke; fails closed by default."""
 
-    _CARD_WORDS = ("구현", "계획", "후속", "작업", "TODO", "카드", "kanban", "lifelog", "gateway")
+    _CARD_WORDS = ("구현", "계획", "후속", "작업", "TODO", "카드", "card", "kanban", "lifelog", "gateway", "smoke")
 
     def detect(self, request: IntakeDetectionRequest) -> DetectorDecision:
         haystack = f"{request.user_summary}\n{request.assistant_summary}".lower()
@@ -1227,7 +1537,7 @@ class KeywordHeuristicDetector:
             return DetectorDecision(False)
         eligibility = card_proposal_eligibility(request)
         if not eligibility.eligible:
-            return DetectorDecision(False, why=eligibility.reason)
+            return DetectorDecision(False, why=eligibility.reason, candidate_class=eligibility.candidate_class)
         title = explicit_title_from_request(request)
         return DetectorDecision(
             True,
@@ -1236,6 +1546,7 @@ class KeywordHeuristicDetector:
             tenant=request.default_tenant or "lifelog",
             proposed_status="blocked",
             why=eligibility.reason,
+            candidate_class=eligibility.candidate_class,
             body={
                 "source_ref": request.source_ref,
                 "acceptance_criteria": ["review proposed scope", "define next action"],

@@ -850,6 +850,29 @@ def build_parser(parent_subparsers: argparse._SubParsersAction) -> argparse.Argu
         help="Emit one JSON object per task on stdout",
     )
 
+    # --- intake-pending ---
+    p_intake = sub.add_parser(
+        "intake-pending",
+        help="Inspect conversational Kanban intake pending proposals safely",
+    )
+    intake_sub = p_intake.add_subparsers(dest="intake_pending_action")
+    for name in ("list", "review"):
+        p = intake_sub.add_parser(name, help=f"{name} pending intake proposals")
+        p.add_argument("--json", action="store_true")
+        p.add_argument("--all", action="store_true", help="Include non-pending rows")
+        p.add_argument("--limit", type=int, default=100)
+    p_revalidate = intake_sub.add_parser("revalidate", help="Dry-run policy/title revalidation")
+    p_revalidate.add_argument("--json", action="store_true")
+    p_revalidate.add_argument("--all", action="store_true", help="Include non-pending rows")
+    p_revalidate.add_argument("--limit", type=int, default=100)
+    p_revalidate.add_argument("--dry-run", action="store_true", default=True)
+    p_bulk = intake_sub.add_parser("bulk-invalidate", help="Invalidate stale/generic pending proposals; dry-run by default")
+    p_bulk.add_argument("--where", default="stale-or-generic", choices=["stale-or-generic"])
+    p_bulk.add_argument("--dry-run", action="store_true", default=True)
+    p_bulk.add_argument("--execute", action="store_true", help="Actually mark matched pending proposals invalid")
+    p_bulk.add_argument("--confirm", default="", help="Required with --execute: type INVALIDATE_PENDING")
+    p_bulk.add_argument("--json", action="store_true")
+
     # --- gc ---
     p_gc = sub.add_parser(
         "gc", help="Garbage-collect archived-task workspaces, old events, and old logs",
@@ -893,6 +916,17 @@ def kanban_command(args: argparse.Namespace) -> int:
     # alpha.
     if action == "boards":
         return _dispatch_boards(args)
+
+    # `intake-pending` is a no-board diagnostic surface for conversational
+    # intake hygiene. Dispatch it before the global board DB init so list,
+    # review, revalidate, and dry-run invalidation stay truly no-write when
+    # both the board DB and intake DB are absent.
+    if action == "intake-pending":
+        try:
+            return int(_cmd_intake_pending(args) or 0)
+        except (ValueError, RuntimeError) as exc:
+            print(f"kanban: {exc}", file=sys.stderr)
+            return 1
 
     # `--board <slug>` applies to every subcommand below by way of an
     # env-var pin for the duration of this call. Using HERMES_KANBAN_BOARD
@@ -973,6 +1007,7 @@ def kanban_command(args: argparse.Namespace) -> int:
             "context":  _cmd_context,
             "specify":  _cmd_specify,
             "decompose":  _cmd_decompose,
+            "intake-pending": _cmd_intake_pending,
             "gc":       _cmd_gc,
         }
         handler = handlers.get(action)
@@ -2697,6 +2732,52 @@ def _cmd_decompose(args: argparse.Namespace) -> int:
     if not all_flag:
         return 0 if ok_count == 1 else 1
     return 0 if (ok_count > 0 or not ids) else 1
+
+
+def _cmd_intake_pending(args: argparse.Namespace) -> int:
+    """Safe diagnostics for conversational Kanban intake pending proposals."""
+    from gateway.kanban_intake import PendingKanbanStore, parse_config
+    from hermes_cli.config import load_config
+
+    cfg = parse_config(load_config())
+    store = PendingKanbanStore(cfg.store_path)
+    sub = getattr(args, "intake_pending_action", None) or "list"
+    want_json = bool(getattr(args, "json", False))
+    include_all = bool(getattr(args, "all", False))
+    limit = int(getattr(args, "limit", 100) or 100)
+
+    if sub in {"list", "review"}:
+        data = store.review_pending(include_all=include_all, limit=limit)
+    elif sub == "revalidate":
+        data = store.revalidate_pending(include_all=include_all, limit=limit)
+    elif sub == "bulk-invalidate":
+        execute = bool(getattr(args, "execute", False))
+        if execute and getattr(args, "confirm", "") != "INVALIDATE_PENDING":
+            print("kanban intake-pending: --execute requires --confirm INVALIDATE_PENDING", file=sys.stderr)
+            return 2
+        data = store.bulk_invalidate(
+            where=getattr(args, "where", "stale-or-generic"),
+            dry_run=not execute,
+        )
+    else:
+        print(f"kanban intake-pending: unknown action {sub!r}", file=sys.stderr)
+        return 2
+
+    if want_json:
+        print(json.dumps(data, ensure_ascii=False, sort_keys=True, indent=2))
+        return 0
+    if sub == "bulk-invalidate":
+        mode = "would invalidate" if data.get("dry_run") else "invalidated"
+        print(f"{mode} {data.get('matched', 0)} pending proposal(s)")
+        return 0
+    items = data.get("items", [])
+    print(f"Policy: {data.get('current_policy_version', '')}")
+    print(f"Counts: {data.get('counts', {})}")
+    for item in items:
+        flags = ",".join(item.get("flags") or []) or "ok"
+        print(f"{item['pending_id']} {item['status']} {item['policy_version'] or '(missing)'} [{flags}] {item['title']}")
+    return 0
+
 
 
 def _cmd_gc(args: argparse.Namespace) -> int:

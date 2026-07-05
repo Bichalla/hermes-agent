@@ -1,3 +1,5 @@
+from types import SimpleNamespace
+
 import pytest
 
 from gateway.kanban_intake import DetectorDecision, KanbanIntakeConfig
@@ -107,6 +109,52 @@ async def test_post_turn_uses_safe_injected_title_generator(tmp_path):
 
 
 @pytest.mark.asyncio
+async def test_post_turn_uses_configured_constrained_llm_title_generator(tmp_path, monkeypatch):
+    cfg = KanbanIntakeConfig(
+        enabled=True,
+        default_board="lifelog-control",
+        store_path=tmp_path / "pending.db",
+        title_generator_enabled=True,
+        title_generator_mode="constrained_llm",
+    )
+    calls = []
+
+    def fake_call_llm(**kwargs):
+        calls.append(kwargs)
+        return SimpleNamespace(
+            choices=[SimpleNamespace(message=SimpleNamespace(
+                content='{"title":"Investigate missed medication reminder regression","action":"Investigate","object":"medication reminder"}'
+            ))]
+        )
+
+    from agent import auxiliary_client
+
+    monkeypatch.setattr(auxiliary_client, "call_llm", fake_call_llm)
+    runner = object.__new__(GatewayRunner)
+    runner._kanban_intake_config = lambda: cfg
+    configured = cfg
+    runner._kanban_intake_store = lambda cfg=None: __import__("gateway.kanban_intake", fromlist=["PendingKanbanStore"]).PendingKanbanStore(configured.store_path)
+    setattr(runner, "_kanban_intake_detector", Detector(DetectorDecision(
+        True,
+        title="Review lifelog follow-up work",
+        body={"source_ref": "kp_safe"},
+    )))
+    event = MessageEvent(
+        text="lifelog medication reminder cron 누락 재발 방지 테스트 카드로 남겨줘",
+        message_type=MessageType.TEXT,
+        source=source(),
+        message_id="1522060000000000005",
+    )
+
+    msg = await runner._maybe_build_kanban_intake_proposal_message(event, "s1", event.text, "후속 작업이 필요하다.")
+
+    assert msg is not None
+    assert "Investigate missed medication reminder regression" in msg
+    assert calls and calls[0]["task"] == "title_generation"
+    assert "allowed_objects" in calls[0]["messages"][1]["content"]
+
+
+@pytest.mark.asyncio
 async def test_post_turn_falls_back_when_injected_title_generator_is_unsafe(tmp_path):
     cfg = KanbanIntakeConfig(enabled=True, default_board="lifelog-control", store_path=tmp_path / "pending.db")
     runner = object.__new__(GatewayRunner)
@@ -205,6 +253,7 @@ async def test_post_turn_renders_quality_hardened_semantic_titles(tmp_path, text
     "이거 해커톤 관련해서 칸반보드 만들고 카드 만드는게 낫지 않나??",
     "내 헤르메스 프로젝트 전체 좀 보고 보드 또는 카드 후보로 올릴 수 있는 대상 뭔지 확인하고 추천 목록 작성해서 알려줘봐. (실행은 금지)",
     "보드/카드 후보만 추천해줘. 실행하지 말고 목록만.",
+    "흠 근데 title generator 가 LLM의 장점을 활용해서 이름을 잘 생성하게끔 업데이트 한거 아니었나??\n\n---\n카드 후보 감지: 이건 Kanban에 blocked review 카드로 남기는 게 좋다.\nboard: lifelog-control\ntitle: Review family health Lifelog capture\ndomain: lifelog-core\ntenant: lifelog\nstatus: blocked\nwhy: durable project follow-up\nsafety: dispatch 없음, ready/running 아님, live DB/cron/Graphify/JÖKL public mutation 없음\n\n승인하려면 “승인/ㅇㅇ/고고”, 취소하려면 “취소”.\n\n또 이런식으로 나오는데??",
 ])
 async def test_post_turn_does_not_render_for_meta_or_one_off_even_if_detector_says_true(tmp_path, text):
     cfg = KanbanIntakeConfig(enabled=True, default_board="lifelog-control", store_path=tmp_path / "pending.db")

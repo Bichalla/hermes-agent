@@ -160,6 +160,32 @@ def test_pending_review_redacts_diagnostic_titles(tmp_path):
     assert "sensitive_leak" in item["flags"]
 
 
+def test_pending_review_exposes_expired_hygiene_without_mutating_rows(tmp_path):
+    c = KanbanIntakeConfig(
+        enabled=True,
+        default_board="lifelog-control",
+        store_path=tmp_path / "pending.db",
+        max_pending_per_session=2,
+    )
+    store = PendingKanbanStore(c.store_path)
+    review_now = 100 + c.proposal_ttl_seconds + 1
+    expired = store.put_pending(proposal(title="Implement local guardrail scope B"), binding(thread="expired"), c, now=100)
+    active = store.put_pending(proposal(title="Implement local guardrail scope A"), binding(thread="active"), c, now=review_now - 10)
+
+    review = store.review_pending(now=review_now, include_all=False)
+    items = {item["pending_id"]: item for item in review["items"]}
+
+    assert review["counts"]["pending"] == 2
+    assert review["counts"]["pending_active"] == 1
+    assert review["counts"]["pending_expired"] == 1
+    assert items[active.pending_id]["effective_status"] == "pending"
+    assert items[expired.pending_id]["effective_status"] == "expired"
+    assert "expired" in items[expired.pending_id]["flags"]
+    assert items[active.pending_id]["expires_in_seconds"] > 0
+    assert items[expired.pending_id]["expires_in_seconds"] < 0
+    assert store.get_active_for_source(binding(thread="expired"), now=review_now).state == "none"
+
+
 def test_pending_review_absent_db_is_no_write(tmp_path):
     c = cfg(tmp_path)
     assert c.store_path is not None

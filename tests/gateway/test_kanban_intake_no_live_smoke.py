@@ -31,6 +31,7 @@ def test_no_live_smoke_script_outputs_safe_booleans(tmp_path, monkeypatch):
     assert data["missing_user_id_fail_closed"] is True
     assert data["one_off_card_proposal_suppressed"] is True
     assert data["meta_kanban_card_proposal_suppressed"] is True
+    assert data["pasted_bad_proposal_meta_complaint_suppressed"] is True
     assert data["read_only_candidate_audit_suppressed"] is True
     assert data["existing_card_update_suppressed"] is True
     assert data["direct_card_operation_suppressed"] is True
@@ -39,6 +40,8 @@ def test_no_live_smoke_script_outputs_safe_booleans(tmp_path, monkeypatch):
     assert data["lifelog_generic_title_rewritten"] is True
     assert data["hybrid_title_generator_accepts_safe_draft"] is True
     assert data["hybrid_title_generator_rejects_unsafe_draft"] is True
+    assert data["live_adapter_uses_auxiliary_title_generation"] is True
+    assert data["expired_pending_hygiene_flagged"] is True
     assert data["quality_metrics_present"] is True
     assert data["candidate_precision_threshold_met"] is True
     assert data["candidate_recall_threshold_met"] is True

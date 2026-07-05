@@ -365,6 +365,20 @@ class TitleGenerationRule:
     max_words: int = 10
 
 
+_TITLE_GENERATOR_SYSTEM_PROMPT = """You generate one safe Kanban card title.
+
+Return ONLY compact JSON with string fields: title, action, object.
+No markdown, no prose, no code fences.
+
+Rules:
+- The title must be English, concise, and action/object/outcome oriented.
+- Use one allowed action exactly as the title prefix.
+- Use one allowed object exactly in the object field and include it in the title.
+- Do not copy raw user text, Korean fragments, names, IDs, measurements, or sensitive details.
+- Prefer semantic work objects over generic follow-up wording.
+"""
+
+
 @dataclass(frozen=True)
 class CandidateTitleDraft:
     title: str
@@ -659,19 +673,27 @@ class PendingKanbanStore:
             raw_title = row["title"] or ""
             title_quality = evaluate_title_quality(raw_title)
             title = minimize_for_detector(raw_title, max_chars=120)
+            status = row["status"]
+            is_expired_pending = status == "pending" and float(row["expires_at"] or 0) <= now
+            effective_status = "expired" if is_expired_pending else status
             flags = []
             if policy_version != CURRENT_POLICY_VERSION:
                 flags.append("stale_policy")
-            if row["status"] == "pending" and float(row["expires_at"] or 0) <= now:
+            if is_expired_pending:
                 flags.append("expired")
             flags.extend(title_quality.reason_codes)
-            counts[row["status"]] = counts.get(row["status"], 0) + 1
+            counts[status] = counts.get(status, 0) + 1
+            if status == "pending":
+                hygiene_key = "pending_expired" if is_expired_pending else "pending_active"
+                counts[hygiene_key] = counts.get(hygiene_key, 0) + 1
             items.append({
                 "pending_id": row["pending_id"],
-                "status": row["status"],
+                "status": status,
+                "effective_status": effective_status,
                 "title": title,
                 "created_at": row["created_at"],
                 "expires_at": row["expires_at"],
+                "expires_in_seconds": int(float(row["expires_at"] or 0) - now),
                 "policy_version": policy_version,
                 "current_policy_version": CURRENT_POLICY_VERSION,
                 "board": row["board"],
@@ -1182,6 +1204,46 @@ def _title_generator_request(request: IntakeDetectionRequest) -> IntakeDetection
         default_board=request.default_board,
         default_tenant=request.default_tenant,
     )
+
+
+def title_generator_messages(request: IntakeDetectionRequest, rule: TitleGenerationRule) -> list[dict[str, str]]:
+    """Build the minimized constrained prompt for live Kanban title generation."""
+    safe_request = _title_generator_request(request)
+    contract = {
+        "allowed_actions": list(rule.allowed_verbs),
+        "allowed_objects": list(rule.allowed_objects),
+        "max_chars": rule.max_chars,
+        "min_words": rule.min_words,
+        "max_words": rule.max_words,
+        "request": {
+            "user_summary": safe_request.user_summary,
+            "assistant_summary": safe_request.assistant_summary,
+            "default_board": safe_request.default_board,
+            "default_tenant": safe_request.default_tenant,
+        },
+    }
+    return [
+        {"role": "system", "content": _TITLE_GENERATOR_SYSTEM_PROMPT},
+        {"role": "user", "content": json.dumps(contract, ensure_ascii=False, sort_keys=True)},
+    ]
+
+
+def constrained_llm_title_generator(request: IntakeDetectionRequest, rule: TitleGenerationRule) -> str:
+    """Call the configured auxiliary title-generation LLM for a validated JSON draft.
+
+    The caller still validates the returned JSON via ``generated_title_from_json``.
+    This adapter is intentionally narrow and returns raw text only so provider
+    failure/invalid output falls back to deterministic title normalization.
+    """
+    from agent import auxiliary_client
+
+    response = auxiliary_client.call_llm(
+        task="title_generation",
+        messages=title_generator_messages(request, rule),
+        max_tokens=160,
+        temperature=0.2,
+    )
+    return str(getattr(response.choices[0].message, "content", "") or "").strip()
 
 
 def _safe_title_object(value: str, rule: TitleGenerationRule) -> str:

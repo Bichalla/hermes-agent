@@ -44,6 +44,8 @@ def main() -> int:
             KeywordHeuristicDetector,
             PendingKanbanStore,
             SourceBinding,
+            TitleGenerationRule,
+            constrained_llm_title_generator,
             explicit_title_from_request,
             handle_reply,
             validate_proposal,
@@ -69,6 +71,13 @@ def main() -> int:
 
         one_off_card_proposal_suppressed = not detector.detect(detector_request("이거 왜이래??")).card_worthy
         meta_kanban_card_proposal_suppressed = not detector.detect(detector_request("카드 생성 조건이 너무 후한거 아닌가?")).card_worthy
+        pasted_bad_proposal_meta_complaint_suppressed = not detector.detect(detector_request(
+            "흠 근데 title generator 가 LLM의 장점을 활용해서 이름을 잘 생성하게끔 업데이트 한거 아니었나??\n\n---\n"
+            "카드 후보 감지: 이건 Kanban에 blocked review 카드로 남기는 게 좋다.\n"
+            "board: lifelog-control\ntitle: Review family health Lifelog capture\n"
+            "domain: lifelog-core\ntenant: lifelog\nstatus: blocked\nwhy: durable project follow-up\n\n"
+            "승인하려면 “승인/ㅇㅇ/고고”, 취소하려면 “취소”.\n\n또 이런식으로 나오는데??"
+        )).card_worthy
         read_only_candidate_audit_suppressed = not detector.detect(detector_request(
             "내 헤르메스 프로젝트 전체 좀 보고 보드 또는 카드 후보로 올릴 수 있는 대상 뭔지 확인하고 추천 목록 작성해서 알려줘봐. (실행은 금지)"
         )).card_worthy
@@ -110,6 +119,29 @@ def main() -> int:
             "Review lifelog follow-up work",
             title_generator=lambda *_: '{"title":"[상현] lifelog medication reminder cron 누락 원인 분석","action":"Review","object":"medication reminder"}',
         ) == "Fix Lifelog medication reminder cron regression"
+        from agent import auxiliary_client
+
+        original_call_llm = auxiliary_client.call_llm
+        live_adapter_uses_auxiliary_title_generation = False
+        try:
+            class _FakeMessage:
+                content = '{"title":"Investigate missed medication reminder regression","action":"Investigate","object":"medication reminder"}'
+
+            class _FakeChoice:
+                message = _FakeMessage()
+
+            class _FakeResponse:
+                choices = [_FakeChoice()]
+
+            def fake_call_llm(**kwargs):
+                nonlocal live_adapter_uses_auxiliary_title_generation
+                live_adapter_uses_auxiliary_title_generation = kwargs.get("task") == "title_generation"
+                return _FakeResponse()
+
+            auxiliary_client.call_llm = fake_call_llm
+            constrained_llm_title_generator(hybrid_request, TitleGenerationRule())
+        finally:
+            auxiliary_client.call_llm = original_call_llm
         store = PendingKanbanStore(cfg.store_path)
         binding = SourceBinding("discord", "raw_chat_123456789", "raw_thread_123456789", "u1", "s1")
         proposal = KanbanCardProposal(
@@ -140,6 +172,25 @@ def main() -> int:
         except Exception:
             missing_user_ok = True
         cross = handle_reply("승인", SourceBinding("discord", "raw_chat_123456789", "raw_thread_123456789", "u2", "s1"), cfg, store)
+        expired_pending = store.put_pending(
+            KanbanCardProposal(
+                board=board,
+                title="Verify expired pending hygiene workflow",
+                body={"source_ref": "kp_expired", "acceptance_criteria": ["flag expired"]},
+                source_ref="kp_expired",
+                user_id="u3",
+            ),
+            SourceBinding("discord", "expired_chat_123456789", "expired_thread_123456789", "u3", "s1"),
+            cfg,
+            now=1,
+        )
+        expired_review = store.review_pending(now=1 + cfg.proposal_ttl_seconds + 1)
+        expired_items = {item["pending_id"]: item for item in expired_review["items"]}
+        expired_pending_hygiene_flagged = (
+            expired_review["counts"].get("pending_expired", 0) >= 1
+            and expired_items[expired_pending.pending_id]["effective_status"] == "expired"
+            and "expired" in expired_items[expired_pending.pending_id]["flags"]
+        )
         sensitive = KanbanCardProposal(
             board=board,
             title="아이 fever raw",
@@ -169,6 +220,7 @@ def main() -> int:
             "missing_user_id_fail_closed": missing_user_ok,
             "one_off_card_proposal_suppressed": one_off_card_proposal_suppressed,
             "meta_kanban_card_proposal_suppressed": meta_kanban_card_proposal_suppressed,
+            "pasted_bad_proposal_meta_complaint_suppressed": pasted_bad_proposal_meta_complaint_suppressed,
             "read_only_candidate_audit_suppressed": read_only_candidate_audit_suppressed,
             "existing_card_update_suppressed": existing_card_update_suppressed,
             "direct_card_operation_suppressed": direct_card_operation_suppressed,
@@ -177,6 +229,8 @@ def main() -> int:
             "lifelog_generic_title_rewritten": lifelog_generic_title_rewritten,
             "hybrid_title_generator_accepts_safe_draft": hybrid_title_generator_accepts_safe_draft,
             "hybrid_title_generator_rejects_unsafe_draft": hybrid_title_generator_rejects_unsafe_draft,
+            "live_adapter_uses_auxiliary_title_generation": live_adapter_uses_auxiliary_title_generation,
+            "expired_pending_hygiene_flagged": expired_pending_hygiene_flagged,
             "quality_metrics_present": True,
             "candidate_precision_threshold_met": quality["candidate_precision"] >= 0.90,
             "candidate_recall_threshold_met": quality["candidate_recall"] >= 0.70,
@@ -209,6 +263,7 @@ def main() -> int:
             result["missing_user_id_fail_closed"],
             result["one_off_card_proposal_suppressed"],
             result["meta_kanban_card_proposal_suppressed"],
+            result["pasted_bad_proposal_meta_complaint_suppressed"],
             result["read_only_candidate_audit_suppressed"],
             result["existing_card_update_suppressed"],
             result["direct_card_operation_suppressed"],
@@ -217,6 +272,8 @@ def main() -> int:
             result["lifelog_generic_title_rewritten"],
             result["hybrid_title_generator_accepts_safe_draft"],
             result["hybrid_title_generator_rejects_unsafe_draft"],
+            result["live_adapter_uses_auxiliary_title_generation"],
+            result["expired_pending_hygiene_flagged"],
             result["quality_metrics_present"],
             result["candidate_precision_threshold_met"],
             result["candidate_recall_threshold_met"],

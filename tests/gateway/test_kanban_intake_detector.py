@@ -44,6 +44,7 @@ def test_heuristic_detects_card_worthy_work():
     "카드 생성 조건이 너무 후한거 아닌가?",
     "칸반보드가 필요한거는 장기로 이어지는 프로젝트에 한정해야되는 거 아니야??",
     "방금 다른 스레드에서 또 카드후보 타이틀 줬는데 변한게 없어 이거 왜이래??",
+    "흠 근데 title generator 가 LLM의 장점을 활용해서 이름을 잘 생성하게끔 업데이트 한거 아니었나??\n\n---\n카드 후보 감지: 이건 Kanban에 blocked review 카드로 남기는 게 좋다.\nboard: lifelog-control\ntitle: Review family health Lifelog capture\ndomain: lifelog-core\ntenant: lifelog\nstatus: blocked\nwhy: durable project follow-up\nsafety: dispatch 없음, ready/running 아님, live DB/cron/Graphify/JÖKL public mutation 없음\n\n승인하려면 “승인/ㅇㅇ/고고”, 취소하려면 “취소”.\n\n또 이런식으로 나오는데??",
     "이거 왜이래??",
     "오늘 수면 기록 어떻게 하지?",
     "해커톤 관련해서 칸반보드 만드는 게 낫지 않나?",

@@ -7939,6 +7939,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             SourceBinding,
             build_detection_request,
             card_proposal_eligibility,
+            constrained_llm_title_generator,
             proposal_from_decision,
             render_proposal_message,
             validate_proposal,
@@ -7979,6 +7980,12 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             logger.debug("kanban intake proposal skipped: %s", eligibility.reason)
             return None
         title_generator = getattr(self, "_kanban_title_generator", None)
+        if (
+            title_generator is None
+            and cfg.title_generator_enabled
+            and cfg.title_generator_mode == "constrained_llm"
+        ):
+            title_generator = constrained_llm_title_generator
         proposal = proposal_from_decision(decision, request, binding, cfg, title_generator=title_generator)
         ok, reason = validate_proposal(proposal, cfg)
         if not ok:

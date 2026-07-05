@@ -119,6 +119,11 @@ def main() -> int:
             "Review lifelog follow-up work",
             title_generator=lambda *_: '{"title":"[상현] lifelog medication reminder cron 누락 원인 분석","action":"Review","object":"medication reminder"}',
         ) == "Fix Lifelog medication reminder cron regression"
+        hybrid_title_generator_improves_semantic_bucket = explicit_title_from_request(
+            detector_request("가족 갈등 재발 방지 프로토콜 문서 업데이트 후속 작업 정리하고 카드로 남겨줘"),
+            "Review childcare Lifelog capture",
+            title_generator=lambda *_: '{"title":"Review childcare conflict protocol capture","action":"Review","object":"childcare"}',
+        ) == "Review childcare conflict protocol capture"
         from agent import auxiliary_client
 
         original_call_llm = auxiliary_client.call_llm
@@ -229,6 +234,7 @@ def main() -> int:
             "lifelog_generic_title_rewritten": lifelog_generic_title_rewritten,
             "hybrid_title_generator_accepts_safe_draft": hybrid_title_generator_accepts_safe_draft,
             "hybrid_title_generator_rejects_unsafe_draft": hybrid_title_generator_rejects_unsafe_draft,
+            "hybrid_title_generator_improves_semantic_bucket": hybrid_title_generator_improves_semantic_bucket,
             "live_adapter_uses_auxiliary_title_generation": live_adapter_uses_auxiliary_title_generation,
             "expired_pending_hygiene_flagged": expired_pending_hygiene_flagged,
             "quality_metrics_present": True,
@@ -272,6 +278,7 @@ def main() -> int:
             result["lifelog_generic_title_rewritten"],
             result["hybrid_title_generator_accepts_safe_draft"],
             result["hybrid_title_generator_rejects_unsafe_draft"],
+            result["hybrid_title_generator_improves_semantic_bucket"],
             result["live_adapter_uses_auxiliary_title_generation"],
             result["expired_pending_hygiene_flagged"],
             result["quality_metrics_present"],

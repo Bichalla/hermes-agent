@@ -155,6 +155,52 @@ async def test_post_turn_uses_configured_constrained_llm_title_generator(tmp_pat
 
 
 @pytest.mark.asyncio
+async def test_post_turn_uses_configured_constrained_llm_for_semantic_bucket_title(tmp_path, monkeypatch):
+    cfg = KanbanIntakeConfig(
+        enabled=True,
+        default_board="lifelog-control",
+        store_path=tmp_path / "pending.db",
+        title_generator_enabled=True,
+        title_generator_mode="constrained_llm",
+    )
+    calls = []
+
+    def fake_call_llm(**kwargs):
+        calls.append(kwargs)
+        return SimpleNamespace(
+            choices=[SimpleNamespace(message=SimpleNamespace(
+                content='{"title":"Review childcare conflict protocol capture","action":"Review","object":"childcare"}'
+            ))]
+        )
+
+    from agent import auxiliary_client
+
+    monkeypatch.setattr(auxiliary_client, "call_llm", fake_call_llm)
+    runner = object.__new__(GatewayRunner)
+    runner._kanban_intake_config = lambda: cfg
+    configured = cfg
+    runner._kanban_intake_store = lambda cfg=None: __import__("gateway.kanban_intake", fromlist=["PendingKanbanStore"]).PendingKanbanStore(configured.store_path)
+    setattr(runner, "_kanban_intake_detector", Detector(DetectorDecision(
+        True,
+        title="Review childcare Lifelog capture",
+        body={"source_ref": "kp_safe"},
+    )))
+    event = MessageEvent(
+        text="가족 갈등 재발 방지 프로토콜 문서 업데이트 후속 작업 정리하고 카드로 남겨줘",
+        message_type=MessageType.TEXT,
+        source=source(),
+        message_id="1523330176413339720",
+    )
+
+    msg = await runner._maybe_build_kanban_intake_proposal_message(event, "s1", event.text, "문서를 업데이트했다.")
+
+    assert msg is not None
+    assert "Review childcare conflict protocol capture" in msg
+    assert "Review childcare Lifelog capture" not in msg
+    assert calls and calls[0]["task"] == "title_generation"
+
+
+@pytest.mark.asyncio
 async def test_post_turn_falls_back_when_injected_title_generator_is_unsafe(tmp_path):
     cfg = KanbanIntakeConfig(enabled=True, default_board="lifelog-control", store_path=tmp_path / "pending.db")
     runner = object.__new__(GatewayRunner)

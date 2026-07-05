@@ -40,6 +40,7 @@ def test_no_live_smoke_script_outputs_safe_booleans(tmp_path, monkeypatch):
     assert data["lifelog_generic_title_rewritten"] is True
     assert data["hybrid_title_generator_accepts_safe_draft"] is True
     assert data["hybrid_title_generator_rejects_unsafe_draft"] is True
+    assert data["hybrid_title_generator_improves_semantic_bucket"] is True
     assert data["live_adapter_uses_auxiliary_title_generation"] is True
     assert data["expired_pending_hygiene_flagged"] is True
     assert data["quality_metrics_present"] is True

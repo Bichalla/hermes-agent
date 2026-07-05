@@ -1316,12 +1316,33 @@ def generated_title_from_json(
     return title
 
 
+def _is_semantic_bucket_title(title: str) -> bool:
+    """Return True for safe but too-broad deterministic bucket titles.
+
+    These titles pass privacy/shape checks, but they are the exact class of
+    output where a live constrained generator should add useful semantic scope
+    (for example the concrete protocol/regression/workflow) before falling back.
+    """
+    compact = _compact_title(title)
+    if not compact:
+        return False
+    return bool(re.match(
+        r"^Review (?:"
+        r"Lifelog record|medication intake|medication reminder|sleep log|condition|diet intake|"
+        r"childcare|child health|family health|training|travel"
+        r") Lifelog capture$",
+        compact,
+        re.I,
+    ))
+
+
 def _should_attempt_title_generation(request: IntakeDetectionRequest, proposed_compact: str) -> bool:
     return (
         not proposed_compact
         or _is_generic_title(proposed_compact)
         or _is_clunky_title(proposed_compact)
         or _looks_like_raw_user_title(proposed_compact, request)
+        or _is_semantic_bucket_title(proposed_compact)
     )
 
 

@@ -11,6 +11,8 @@ from gateway.kanban_intake import (
     KanbanIntakeConfig,
     KeywordHeuristicDetector,
     IntakeDetectionRequest,
+    _infer_request_title_objects,
+    _infer_title_object,
     card_proposal_eligibility,
     evaluate_title_quality,
     explicit_title_from_request,
@@ -518,6 +520,154 @@ def test_title_generator_preserves_specific_human_or_auxiliary_title():
     assert explicit_title_from_request(request, "Verify blocked intake cards stay unclaimed") == "Verify blocked intake cards stay unclaimed"
 
 
+def test_sleep_noon_reminder_context_does_not_map_to_medication_reminder():
+    request = IntakeDetectionRequest(
+        platform="discord",
+        session_key="s1",
+        source_ref="kp_sleep",
+        user_summary="wearable sleep log noon reminder cron 누락 처리 카드로 남겨줘. wearable pause 상황.",
+        assistant_summary="sleep log noon reminder workflow follow-up",
+        default_board="lifelog-control",
+        default_tenant="lifelog",
+    )
+    title = explicit_title_from_request(request)
+    assert title == "Review sleep reminder wearable pause workflow"
+    assert "medication" not in title.lower()
+    assert "sleep" in title.lower()
+
+
+def test_korean_sleep_cron_missing_context_does_not_map_to_medication():
+    request = IntakeDetectionRequest(
+        platform="discord",
+        session_key="s1",
+        source_ref="kp_sleep",
+        user_summary="수면 로그 noon reminder cron 누락 처리 카드로 남겨줘",
+        assistant_summary="수면 리마인더 후속 작업이다.",
+        default_board="lifelog-control",
+        default_tenant="lifelog",
+    )
+    title = explicit_title_from_request(request)
+    assert title == "Review sleep reminder wearable pause workflow"
+    assert title != "Fix Lifelog medication reminder cron regression"
+    assert "medication" not in title.lower()
+
+
+@pytest.mark.parametrize(("text", "expected_first"), [
+    ("wearable sleep log noon reminder cron 누락 wearable pause", "sleep_reminder"),
+    ("수면 로그 noon reminder cron 누락", "sleep_reminder"),
+    ("복약 리마인더 cron 누락", "medication_reminder"),
+    ("medication reminder cron missing regression", "medication_reminder"),
+    ("Kanban title generator semantic mismatch", "kanban_title_generation"),
+])
+def test_request_semantic_objects_rank_strongest_context(text, expected_first):
+    request = IntakeDetectionRequest(
+        platform="discord",
+        session_key="s1",
+        source_ref="kp_semantic",
+        user_summary=text,
+        assistant_summary="follow-up",
+        default_board="lifelog-control",
+        default_tenant="lifelog",
+    )
+    assert _infer_request_title_objects(request)[0] == expected_first
+
+
+@pytest.mark.parametrize(("title", "expected"), [
+    ("Fix Lifelog medication reminder cron regression", "medication_reminder"),
+    ("Review sleep reminder wearable pause workflow", "sleep_reminder"),
+    ("Review sleep log reminder workflow", "sleep_reminder"),
+])
+def test_title_semantic_object(title, expected):
+    assert _infer_title_object(title) == expected
+
+
+def test_semantic_mismatch_proposed_title_attempts_constrained_generator():
+    request = IntakeDetectionRequest(
+        platform="discord",
+        session_key="s1",
+        source_ref="kp_sleep",
+        user_summary="wearable sleep log noon reminder cron 누락 wearable pause 카드로 남겨줘",
+        assistant_summary="sleep reminder workflow follow-up",
+        default_board="lifelog-control",
+        default_tenant="lifelog",
+    )
+    calls = []
+
+    def generator(generated_request, rule):
+        calls.append((generated_request, rule))
+        return '{"title":"Review sleep reminder wearable pause workflow","action":"Review","object":"sleep reminder"}'
+
+    title = explicit_title_from_request(
+        request,
+        "Fix Lifelog medication reminder cron regression",
+        title_generator=generator,
+    )
+    assert calls
+    assert title == "Review sleep reminder wearable pause workflow"
+
+
+def test_semantic_mismatch_unsafe_generator_falls_back_to_sleep_title():
+    request = IntakeDetectionRequest(
+        platform="discord",
+        session_key="s1",
+        source_ref="kp_sleep",
+        user_summary="wearable sleep log noon reminder cron 누락 wearable pause 카드로 남겨줘",
+        assistant_summary="sleep reminder workflow follow-up",
+        default_board="lifelog-control",
+        default_tenant="lifelog",
+    )
+
+    def generator(_request, _rule):
+        return '{"title":"Fix Lifelog medication reminder cron regression","action":"Fix","object":"medication reminder"}'
+
+    assert explicit_title_from_request(
+        request,
+        "Fix Lifelog medication reminder cron regression",
+        title_generator=generator,
+    ) == "Review sleep reminder wearable pause workflow"
+
+
+def test_medication_reminder_context_still_maps_to_medication_regression():
+    request = IntakeDetectionRequest(
+        platform="discord",
+        session_key="s1",
+        source_ref="kp_medication",
+        user_summary="복약 리마인더 cron 누락 재발 방지 테스트 카드로 남겨줘",
+        assistant_summary="medication reminder regression follow-up",
+        default_board="lifelog-control",
+        default_tenant="lifelog",
+    )
+    assert explicit_title_from_request(request) == "Fix Lifelog medication reminder cron regression"
+
+
+def test_generated_title_accepts_sleep_reminder_safe_object():
+    request = IntakeDetectionRequest(
+        platform="discord",
+        session_key="s1",
+        source_ref="kp_sleep",
+        user_summary="wearable sleep log noon reminder cron 누락 wearable pause 카드로 남겨줘",
+        assistant_summary="sleep reminder workflow follow-up",
+        default_board="lifelog-control",
+        default_tenant="lifelog",
+    )
+    raw = '{"title":"Review sleep reminder wearable pause workflow","action":"Review","object":"sleep reminder"}'
+    assert generated_title_from_json(request, raw) == "Review sleep reminder wearable pause workflow"
+
+
+def test_generated_sleep_title_rejects_private_procedure_detail():
+    request = IntakeDetectionRequest(
+        platform="discord",
+        session_key="s1",
+        source_ref="kp_sleep",
+        user_summary="wearable sleep log noon reminder cron 누락 wearable pause 카드로 남겨줘",
+        assistant_summary="sleep reminder workflow follow-up",
+        default_board="lifelog-control",
+        default_tenant="lifelog",
+    )
+    raw = '{"title":"Review private procedure detail sleep reminder workflow","action":"Review","object":"sleep reminder"}'
+    assert generated_title_from_json(request, raw) == ""
+
+
 def test_title_validator_accepts_safe_generated_lifelog_title():
     request = IntakeDetectionRequest(
         platform="discord",
@@ -626,6 +776,8 @@ def test_golden_corpus_schema_is_valid():
     required_ids = {
         "p0_kanban_intake_not_medication",
         "p0_kanban_false_positive_tests_not_medication",
+        "p0_sleep_noon_reminder_not_medication",
+        "p0_medication_reminder_still_medication",
         "p1_child_health_privacy_safe_title",
         "p1_jokl_marketing_packet_non_generic_title",
         "p1_security_sensitive_not_child_health",

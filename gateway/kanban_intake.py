@@ -351,6 +351,8 @@ class TitleGenerationRule:
         "medication intake",
         "medication reminder",
         "sleep log",
+        "sleep reminder",
+        "wearable pause",
         "condition",
         "diet intake",
         "childcare",
@@ -401,7 +403,16 @@ class TitleQualityResult:
     reason_codes: tuple[str, ...] = ()
 
 
+@dataclass(frozen=True)
+class TitleSemanticCheck:
+    request_objects: tuple[str, ...]
+    title_object: str = ""
+    mismatch: bool = False
+    reason_codes: tuple[str, ...] = ()
+
+
 class KanbanIntakeDetector(Protocol):
+
     def detect(self, request: IntakeDetectionRequest) -> DetectorDecision: ...
 
 
@@ -908,6 +919,162 @@ def _has_any(text: str, *needles: str) -> bool:
     return any(str(needle).lower() in lowered or str(needle) in value for needle in needles)
 
 
+def _has_medication_term(text: str) -> bool:
+    return _has_any(
+        text,
+        "medication",
+        "medicine",
+        "meds",
+        "dose",
+        "skipped dose",
+        "복약",
+        "복용",
+        "약 먹",
+        "약먹",
+        "약 리마인더",
+    )
+
+
+def _has_reminder_problem_term(text: str) -> bool:
+    return _has_any(text, "누락", "missing", "regression", "재발", "missed")
+
+
+def _has_medication_reminder_evidence(text: str) -> bool:
+    return (
+        _has_medication_term(text)
+        and _has_any(text, "reminder", "리마인더", "cron")
+        and _has_reminder_problem_term(text)
+    )
+
+
+def _has_sleep_reminder_evidence(text: str) -> bool:
+    return _has_any(text, "sleep", "sleep log", "수면", "wearable", "noon reminder", "noon-reminder") and _has_any(
+        text,
+        "reminder",
+        "리마인더",
+        "cron",
+        "누락",
+        "missing",
+        "pause",
+        "wearable pause",
+        "착용 못",
+        "착용못",
+    )
+
+
+def _append_unique(items: list[str], value: str) -> None:
+    if value and value not in items:
+        items.append(value)
+
+
+def _infer_request_title_objects(request: IntakeDetectionRequest) -> tuple[str, ...]:
+    """Return ordered privacy-safe semantic title objects inferred from request context."""
+    text = _clean_gate_text(request)
+    lowered = text.lower()
+    objects: list[str] = []
+    if ("kanban" in lowered or "칸반" in text) and _has_any(text, "title generator", "title", "타이틀", "제목"):
+        _append_unique(objects, "kanban_title_generation")
+    if _has_sleep_reminder_evidence(text):
+        _append_unique(objects, "sleep_reminder")
+    elif _has_any(text, "sleep", "sleep log", "수면", "취침", "기상"):
+        _append_unique(objects, "sleep_log")
+    if _has_medication_reminder_evidence(text):
+        _append_unique(objects, "medication_reminder")
+    elif _has_medication_term(text):
+        _append_unique(objects, "medication_intake")
+    if _has_any(text, "condition", "컨디션", "pain", "통증", "피로", "soreness", "fever", "illness", "증상"):
+        _append_unique(objects, "condition")
+    if _has_any(text, "diet", "meal", "식단", "식사", "간식", "먹었"):
+        _append_unique(objects, "diet_intake")
+    if _has_any(text, "childcare", "육아", "child health"):
+        _append_unique(objects, "childcare")
+    if _has_any(text, "training", "exercise", "운동", "주짓수", "레슬링", "mma"):
+        _append_unique(objects, "training")
+    if _has_any(text, "travel", "여행", "출장"):
+        _append_unique(objects, "travel")
+    if _has_any(text, "kanban", "칸반", "intake", "candidate", "카드후보", "카드 후보"):
+        _append_unique(objects, "kanban_intake")
+    if _has_any(text, "lifelog", "라이프로그", "기록", "record", "follow-up", "후속"):
+        _append_unique(objects, "lifelog")
+    return tuple(objects)
+
+
+def _infer_title_object(title: str) -> str:
+    """Return the privacy-safe semantic object implied by a title, or ''."""
+    compact = _compact_title(title).lower()
+    if not compact:
+        return ""
+    if "medication reminder" in compact:
+        return "medication_reminder"
+    if "medication intake" in compact or "medication" in compact or "dose" in compact:
+        return "medication_intake"
+    if "sleep reminder" in compact or ("sleep log" in compact and "reminder" in compact) or "wearable pause" in compact:
+        return "sleep_reminder"
+    if "sleep log" in compact:
+        return "sleep_log"
+    if "condition" in compact:
+        return "condition"
+    if "diet intake" in compact or "meal" in compact:
+        return "diet_intake"
+    if "childcare" in compact or "child health" in compact or "family health" in compact:
+        return "childcare"
+    if "training" in compact:
+        return "training"
+    if "travel" in compact:
+        return "travel"
+    if "title generator" in compact or "title generation" in compact:
+        return "kanban_title_generation"
+    if "kanban intake" in compact or "candidate/title" in compact or "kanban candidate" in compact:
+        return "kanban_intake"
+    return ""
+
+
+def _objects_semantically_compatible(request_object: str, title_object: str) -> bool:
+    if request_object == title_object:
+        return True
+    compatible = {
+        "sleep_reminder": {"sleep_log"},
+        "sleep_log": {"sleep_reminder"},
+        "kanban_title_generation": {"kanban_intake"},
+        "kanban_intake": {"kanban_title_generation"},
+    }
+    return title_object in compatible.get(request_object, set())
+
+
+def evaluate_title_semantic_match(title: str, request: IntakeDetectionRequest) -> TitleSemanticCheck:
+    request_objects = _infer_request_title_objects(request)
+    title_object = _infer_title_object(title)
+    if not request_objects or not title_object:
+        return TitleSemanticCheck(request_objects, title_object, False, ())
+    strongest = request_objects[0]
+    if strongest == "lifelog":
+        return TitleSemanticCheck(request_objects, title_object, False, ())
+    mismatch = not _objects_semantically_compatible(strongest, title_object)
+    return TitleSemanticCheck(
+        request_objects,
+        title_object,
+        mismatch,
+        ("semantic_mismatch",) if mismatch else (),
+    )
+
+
+def _semantic_safe_fallback(request: IntakeDetectionRequest) -> str:
+    for obj in _infer_request_title_objects(request):
+        if obj == "sleep_reminder":
+            return "Review sleep reminder wearable pause workflow"
+        if obj == "sleep_log":
+            return "Review sleep log Lifelog capture"
+        if obj == "medication_reminder":
+            return "Fix Lifelog medication reminder cron regression"
+        if obj == "medication_intake":
+            return "Review medication intake Lifelog capture"
+        if obj == "kanban_title_generation":
+            return "Improve Kanban intake title generator"
+        if obj == "kanban_intake":
+            return "Fix Kanban intake classification quality"
+    return _raw_title_fallback(request)
+
+
 def _is_clunky_title(value: str) -> bool:
     title = _compact_title(value)
     if not title:
@@ -1096,7 +1263,12 @@ def _normalize_sensitive_ops_title_intent(text: str) -> str:
 
 
 def _normalize_lifelog_title_intent(text: str) -> str:
-    if not _has_any(text, "lifelog", "라이프로그", "기록", "record", "follow-up", "후속", "[child-sensitive]", "[health-sensitive]", "[family-sensitive]"):
+    if not (
+        _has_any(text, "lifelog", "라이프로그", "기록", "로그", "record", "follow-up", "후속", "[child-sensitive]", "[health-sensitive]", "[family-sensitive]")
+        or _has_sleep_reminder_evidence(text)
+        or _has_medication_reminder_evidence(text)
+        or _has_medication_term(text)
+    ):
         return ""
     child_health = _normalize_child_family_health_title_intent(text)
     if child_health:
@@ -1110,15 +1282,11 @@ def _normalize_lifelog_title_intent(text: str) -> str:
         "candidate",
     ):
         return "Fix Kanban candidate title generation for Lifelog records"
-    if _has_any(text, "medication reminder", "복약 리마인더", "약 리마인더", "cron") and _has_any(
-        text,
-        "누락",
-        "missing",
-        "regression",
-        "재발",
-    ):
+    if _has_sleep_reminder_evidence(text):
+        return "Review sleep reminder wearable pause workflow"
+    if _has_medication_reminder_evidence(text):
         return "Fix Lifelog medication reminder cron regression"
-    if _has_any(text, "medication", "복약", "약 먹", "약먹", "skipped dose", "복용"):
+    if _has_medication_term(text):
         return "Review medication intake Lifelog capture"
     if _has_any(text, "sleep", "수면", "취침", "기상"):
         return "Review sleep log Lifelog capture"
@@ -1173,10 +1341,15 @@ _SAFE_TITLE_OBJECT_ALIASES = {
     "medication log": "medication intake",
     "medication capture": "medication intake",
     "dose": "medication intake",
-    "reminder": "medication reminder",
     "medication cron": "medication reminder",
+    "medication reminder cron": "medication reminder",
     "sleep": "sleep log",
     "sleep capture": "sleep log",
+    "sleep reminder": "sleep reminder",
+    "sleep cron": "sleep reminder",
+    "noon reminder": "sleep reminder",
+    "wearable": "wearable pause",
+    "wearable pause": "wearable pause",
     "diet": "diet intake",
     "meal": "diet intake",
     "meal intake": "diet intake",
@@ -1292,6 +1465,9 @@ def generated_title_from_json(
         return ""
     if _ID_LIKE_RE.search(stripped_title) or re.search(r"\d", stripped_title):
         return ""
+    lowered_title = stripped_title.lower()
+    if "private procedure" in lowered_title or "private-procedure" in lowered_title:
+        return ""
     if _contains_sensitive_payload(stripped_title) or _hangul_fragment_present(stripped_title):
         return ""
 
@@ -1312,6 +1488,8 @@ def generated_title_from_json(
     if not safe_object:
         return ""
     if safe_object.lower() not in title.lower():
+        return ""
+    if evaluate_title_semantic_match(title, request).mismatch:
         return ""
     return title
 
@@ -1343,6 +1521,7 @@ def _should_attempt_title_generation(request: IntakeDetectionRequest, proposed_c
         or _is_clunky_title(proposed_compact)
         or _looks_like_raw_user_title(proposed_compact, request)
         or _is_semantic_bucket_title(proposed_compact)
+        or evaluate_title_semantic_match(proposed_compact, request).mismatch
     )
 
 
@@ -1517,6 +1696,8 @@ def explicit_title_from_request(
     unless they are empty or generic boilerplate.
     """
     proposed_compact = _compact_title(proposed_title)
+    semantic_check = evaluate_title_semantic_match(proposed_compact, request)
+    semantic_mismatch = semantic_check.mismatch
     should_generate = _should_attempt_title_generation(request, proposed_compact)
     if should_generate and title_generator is not None:
         rule = TitleGenerationRule()
@@ -1536,6 +1717,7 @@ def explicit_title_from_request(
     )
     if (
         not proposed_compact
+        or semantic_mismatch
         or _is_generic_title(proposed_compact)
         or _is_clunky_title(proposed_compact)
         or _looks_like_raw_user_title(proposed_compact, request)
@@ -1556,6 +1738,8 @@ def explicit_title_from_request(
         sensitive_ops = _normalize_sensitive_ops_title_intent(combined_for_title)
         if sensitive_ops:
             return sensitive_ops
+        if semantic_mismatch:
+            return _semantic_safe_fallback(request)
     proposed_normalized = _normalize_korean_title_intent(
         "\n".join(part for part in (request.user_summary or "", proposed_compact) if part)
     )
@@ -1563,6 +1747,7 @@ def explicit_title_from_request(
         return proposed_normalized
     if (
         proposed_compact
+        and not semantic_mismatch
         and not _is_generic_title(proposed_compact)
         and not _is_clunky_title(proposed_compact)
         and evaluate_title_quality(proposed_compact, request).passed

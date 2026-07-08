@@ -124,6 +124,21 @@ def main() -> int:
             "Review childcare Lifelog capture",
             title_generator=lambda *_: '{"title":"Review childcare conflict protocol capture","action":"Review","object":"childcare"}',
         ) == "Review childcare conflict protocol capture"
+        semantic_mismatch_title_generator_called = False
+
+        def sleep_generator(*_):
+            nonlocal semantic_mismatch_title_generator_called
+            semantic_mismatch_title_generator_called = True
+            return '{"title":"Review sleep reminder wearable pause workflow","action":"Review","object":"sleep reminder"}'
+
+        semantic_mismatch_title_generator_corrects_sleep_title = explicit_title_from_request(
+            detector_request("wearable sleep log noon reminder cron 누락 wearable pause 카드로 남겨줘"),
+            "Fix Lifelog medication reminder cron regression",
+            title_generator=sleep_generator,
+        ) == "Review sleep reminder wearable pause workflow"
+        sleep_noon_reminder_not_medication = detector.detect(detector_request(
+            "wearable sleep log noon reminder cron 누락 wearable pause 카드로 남겨줘"
+        )).title == "Review sleep reminder wearable pause workflow"
         from agent import auxiliary_client
 
         original_call_llm = auxiliary_client.call_llm
@@ -235,6 +250,9 @@ def main() -> int:
             "hybrid_title_generator_accepts_safe_draft": hybrid_title_generator_accepts_safe_draft,
             "hybrid_title_generator_rejects_unsafe_draft": hybrid_title_generator_rejects_unsafe_draft,
             "hybrid_title_generator_improves_semantic_bucket": hybrid_title_generator_improves_semantic_bucket,
+            "semantic_mismatch_title_generator_called": semantic_mismatch_title_generator_called,
+            "semantic_mismatch_title_generator_corrects_sleep_title": semantic_mismatch_title_generator_corrects_sleep_title,
+            "sleep_noon_reminder_not_medication": sleep_noon_reminder_not_medication,
             "live_adapter_uses_auxiliary_title_generation": live_adapter_uses_auxiliary_title_generation,
             "expired_pending_hygiene_flagged": expired_pending_hygiene_flagged,
             "quality_metrics_present": True,
@@ -279,6 +297,9 @@ def main() -> int:
             result["hybrid_title_generator_accepts_safe_draft"],
             result["hybrid_title_generator_rejects_unsafe_draft"],
             result["hybrid_title_generator_improves_semantic_bucket"],
+            result["semantic_mismatch_title_generator_called"],
+            result["semantic_mismatch_title_generator_corrects_sleep_title"],
+            result["sleep_noon_reminder_not_medication"],
             result["live_adapter_uses_auxiliary_title_generation"],
             result["expired_pending_hygiene_flagged"],
             result["quality_metrics_present"],

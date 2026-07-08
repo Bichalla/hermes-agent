@@ -201,6 +201,52 @@ async def test_post_turn_uses_configured_constrained_llm_for_semantic_bucket_tit
 
 
 @pytest.mark.asyncio
+async def test_post_turn_uses_configured_constrained_llm_for_semantic_mismatch_title(tmp_path, monkeypatch):
+    cfg = KanbanIntakeConfig(
+        enabled=True,
+        default_board="lifelog-control",
+        store_path=tmp_path / "pending.db",
+        title_generator_enabled=True,
+        title_generator_mode="constrained_llm",
+    )
+    calls = []
+
+    def fake_call_llm(**kwargs):
+        calls.append(kwargs)
+        return SimpleNamespace(
+            choices=[SimpleNamespace(message=SimpleNamespace(
+                content='{"title":"Review sleep reminder wearable pause workflow","action":"Review","object":"sleep reminder"}'
+            ))]
+        )
+
+    from agent import auxiliary_client
+
+    monkeypatch.setattr(auxiliary_client, "call_llm", fake_call_llm)
+    runner = object.__new__(GatewayRunner)
+    runner._kanban_intake_config = lambda: cfg
+    configured = cfg
+    runner._kanban_intake_store = lambda cfg=None: __import__("gateway.kanban_intake", fromlist=["PendingKanbanStore"]).PendingKanbanStore(configured.store_path)
+    setattr(runner, "_kanban_intake_detector", Detector(DetectorDecision(
+        True,
+        title="Fix Lifelog medication reminder cron regression",
+        body={"source_ref": "kp_safe"},
+    )))
+    event = MessageEvent(
+        text="wearable sleep log noon reminder cron 누락 wearable pause 카드로 남겨줘",
+        message_type=MessageType.TEXT,
+        source=source(),
+        message_id="1523330176413339721",
+    )
+
+    msg = await runner._maybe_build_kanban_intake_proposal_message(event, "s1", event.text, "sleep reminder workflow follow-up")
+
+    assert msg is not None
+    assert "Review sleep reminder wearable pause workflow" in msg
+    assert "medication reminder" not in msg
+    assert calls and calls[0]["task"] == "title_generation"
+
+
+@pytest.mark.asyncio
 async def test_post_turn_falls_back_when_injected_title_generator_is_unsafe(tmp_path):
     cfg = KanbanIntakeConfig(enabled=True, default_board="lifelog-control", store_path=tmp_path / "pending.db")
     runner = object.__new__(GatewayRunner)

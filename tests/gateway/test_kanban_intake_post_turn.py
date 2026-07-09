@@ -17,8 +17,74 @@ class Detector:
         return self.decision
 
 
+class RaisingDetector:
+    def detect(self, request):
+        raise AssertionError("detector must not run for suppressed post-turn acts")
+
+
 def source(user="u1"):
     return SessionSource(platform=Platform.DISCORD, chat_id="1521423652547989615", chat_type="thread", thread_id="1521317738210132069", user_id=user)
+
+
+@pytest.mark.asyncio
+async def test_post_turn_suppresses_existing_card_report_completion_summary(tmp_path):
+    cfg = KanbanIntakeConfig(enabled=True, default_board="lifelog-control", store_path=tmp_path / "pending.db")
+    runner = object.__new__(GatewayRunner)
+    runner._kanban_intake_config = lambda: cfg
+    runner._kanban_intake_store = lambda _cfg=None: __import__("gateway.kanban_intake", fromlist=["PendingKanbanStore"]).PendingKanbanStore(cfg.store_path)
+    runner._kanban_intake_detector = Detector(DetectorDecision(True, title="Review child health Lifelog capture", body={"source_ref": "kp_safe"}))
+    event = MessageEvent(
+        text="오케이 그렇게 해보자 그러면 카드 제목 수정하고 리포트도 업데이트해봐.",
+        message_type=MessageType.TEXT,
+        source=source(),
+        message_id="1524584779402448991",
+    )
+    assistant_response = """완료.
+
+- 카드 제목 수정:
+  - `t_14ed556e`
+  - 새 제목: `Add Lifelog-backed self-context middleware for personal conversations`
+- 리포트 업데이트:
+  - `/Users/honbul/.hermes/reports/lifelog-context-middleware-preinvestigation-20260709.md`
+  - health/medication은 실패 사례일 뿐 전체 범위 아님
+  - family/childcare/profile/value/work/travel 등 DB 분포 추가
+- 안 한 것:
+  - gateway restart 없음
+  - `lifelog.db` write/import/migration 없음
+"""
+    msg = await runner._maybe_build_kanban_intake_proposal_message(event, "s1", event.text, assistant_response)
+    assert msg is None
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(("text", "assistant_response"), [
+    (
+        "오케이 그렇게 해보자 그러면 카드 제목 수정하고 리포트도 업데이트해봐.",
+        "완료. 카드 제목 수정: `t_14ed556e`. 리포트 업데이트. health/medication, family/childcare/profile/value/work/travel. 안 한 것: gateway restart 없음.",
+    ),
+    (
+        "suttanipata-ko 보드에 숫타니파타 번역 검수 카드 만들어줘",
+        "실제로 필요한 카드는 이미 `suttanipata-ko` 보드에 만들었어: `t_e9f4c088`.",
+    ),
+    (
+        "t_5b858cd6 카드에 progress update 기록해줘",
+        "기존 카드에 진행 상태를 기록했다.",
+    ),
+])
+async def test_post_turn_suppressed_acts_skip_detector(tmp_path, text, assistant_response):
+    cfg = KanbanIntakeConfig(enabled=True, default_board="lifelog-control", store_path=tmp_path / "pending.db")
+    runner = object.__new__(GatewayRunner)
+    runner._kanban_intake_config = lambda: cfg
+    runner._kanban_intake_store = lambda _cfg=None: __import__("gateway.kanban_intake", fromlist=["PendingKanbanStore"]).PendingKanbanStore(cfg.store_path)
+    runner._kanban_intake_detector = RaisingDetector()
+    event = MessageEvent(
+        text=text,
+        message_type=MessageType.TEXT,
+        source=source(),
+        message_id="1524584779402448992",
+    )
+    msg = await runner._maybe_build_kanban_intake_proposal_message(event, "s1", event.text, assistant_response)
+    assert msg is None
 
 
 @pytest.mark.asyncio

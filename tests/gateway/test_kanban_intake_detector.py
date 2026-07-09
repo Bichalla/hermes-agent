@@ -947,6 +947,55 @@ def test_validate_proposal_enforces_title_quality_before_storage():
     )
 
 
+def test_completion_summary_existing_card_update_is_not_card_worthy():
+    request = IntakeDetectionRequest(
+        platform="discord",
+        session_key="s1",
+        source_ref="kp_safe",
+        user_summary="오케이 그렇게 해보자 그러면 카드 제목 수정하고 리포트도 업데이트해봐.",
+        assistant_summary="완료. 카드 제목 수정: `t_14ed556e`. 리포트 업데이트. health/medication, family/childcare/profile/value/work/travel. 안 한 것: gateway restart 없음.",
+        default_board="lifelog-control",
+        default_tenant="lifelog",
+    )
+    eligibility = card_proposal_eligibility(request)
+    decision = KeywordHeuristicDetector().detect(request)
+    assert eligibility.eligible is False
+    assert eligibility.candidate_class == "existing_card_update"
+    assert decision.card_worthy is False
+    assert decision.candidate_class == "existing_card_update"
+
+
+def test_explicit_new_proposal_for_personal_context_remains_eligible():
+    request = IntakeDetectionRequest(
+        platform="discord",
+        session_key="s1",
+        source_ref="kp_safe",
+        user_summary="personal context broker 후속 개선을 새 카드 후보로 남겨줘",
+        assistant_summary="후속 설계가 필요하다.",
+        default_board="lifelog-control",
+        default_tenant="lifelog",
+    )
+    decision = KeywordHeuristicDetector().detect(request)
+    assert decision.card_worthy is True
+    assert decision.candidate_class == "proposal_record_request"
+    assert "personal context" in decision.title.lower() or "self-context" in decision.title.lower()
+
+
+def test_semantic_mismatch_does_not_recontaminate_with_child_health_title():
+    request = IntakeDetectionRequest(
+        platform="discord",
+        session_key="s1",
+        source_ref="kp_safe",
+        user_summary="personal context broker 후속 개선을 새 카드 후보로 남겨줘",
+        assistant_summary="완료. health/medication은 실패 사례이고 family/childcare/profile/value/work/travel DB 분포를 확인했다.",
+        default_board="lifelog-control",
+        default_tenant="lifelog",
+    )
+    title = explicit_title_from_request(request, "Review child health Lifelog capture")
+    assert "child health" not in title.lower()
+    assert "personal context" in title.lower() or "self-context" in title.lower()
+
+
 @pytest.mark.parametrize("good", [
     "Fix Kanban intake false-positive suppression",
     "Add Kanban intake regression tests",

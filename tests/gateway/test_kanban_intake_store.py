@@ -97,18 +97,22 @@ def test_pending_rows_store_current_policy_version(tmp_path):
     assert found.pending.policy_version == CURRENT_POLICY_VERSION
 
 
-def test_stale_pending_policy_version_fails_short_approval_closed(tmp_path):
+def test_old_policy_pending_requires_revalidation_after_policy_bump(tmp_path):
     c = cfg(tmp_path)
     store = PendingKanbanStore(c.store_path)
     pending = store.put_pending(proposal(title="Implement local guardrail scope"), binding(), c)
     with store.connect() as conn:
-        conn.execute("UPDATE kanban_intake_pending SET policy_version = '' WHERE pending_id = ?", (pending.pending_id,))
+        conn.execute("UPDATE kanban_intake_pending SET policy_version = ? WHERE pending_id = ?", ("kanban-intake-policy/v2", pending.pending_id))
         conn.commit()
     result = handle_reply("승인", binding(), c, store)
     assert result.handled is True
+    assert result.action == "approve"
     assert result.verified is False
-    assert "정책 버전" in result.message
+    assert "정책 버전" in result.message or "revalidate" in result.message.lower()
     assert store.get_active_for_source(binding(), now=101).state == "none"
+    review = store.review_pending(include_all=True, now=101)
+    items = {item["pending_id"]: item for item in review["items"]}
+    assert items[pending.pending_id]["status"] == "needs_revalidation"
 
 
 def test_pending_review_and_revalidate_flag_stale_or_generic_without_raw_ids(tmp_path):

@@ -42,7 +42,9 @@ _SENSITIVE_PATTERNS = (
 )
 _ID_LIKE_RE = re.compile(r"\b\d{8,}\b")
 _TITLE_MAX_CHARS = 72
-CURRENT_POLICY_VERSION = "kanban-intake-policy/v2"
+CURRENT_POLICY_VERSION = "kanban-intake-policy/v3"
+POST_TURN_POLICY_TITLE = "Fix post-turn intake policy for Kanban"
+PERSONAL_CONTEXT_TITLE = "Improve personal context workflow"
 _SAFE_SENSITIVE_TITLE_PHRASES = (
     "child health",
     "childcare condition",
@@ -361,6 +363,10 @@ class TitleGenerationRule:
         "title generation",
         "gateway",
         "kanban intake",
+        "personal context",
+        "self-context middleware",
+        "lifelog context broker",
+        "post-turn intake policy",
     )
     max_chars: int = _TITLE_MAX_CHARS
     min_words: int = 3
@@ -395,6 +401,22 @@ class ProposalEligibility:
     reason: str
     matched_rule: str = ""
     candidate_class: str = "insufficient_signal"
+
+
+@dataclass(frozen=True)
+class ConversationAct:
+    kind: str
+    reason: str
+
+
+CONVERSATION_ACT_NEW_PROPOSAL = "new_work_proposal_request"
+CONVERSATION_ACT_DURABLE_FOLLOWUP = "durable_followup"
+CONVERSATION_ACT_EXISTING_WORK_UPDATE = "existing_work_update"
+CONVERSATION_ACT_COMPLETION_REPORT = "completion_report"
+CONVERSATION_ACT_META = "meta_or_one_off"
+CONVERSATION_ACT_DIRECT_OPERATION = "direct_operation"
+CONVERSATION_ACT_READ_ONLY_AUDIT = "read_only_audit"
+CONVERSATION_ACT_INSUFFICIENT = "insufficient_signal"
 
 
 @dataclass(frozen=True)
@@ -972,6 +994,15 @@ def _infer_request_title_objects(request: IntakeDetectionRequest) -> tuple[str, 
     text = _clean_gate_text(request)
     lowered = text.lower()
     objects: list[str] = []
+    if _has_any(text, "personal context", "self-context", "self context", "context broker", "나 관련", "나와 관련"):
+        _append_unique(objects, "personal_context")
+    if _has_any(text, "post-turn", "post turn", "completion summary", "완료 요약", "운영 정책") and _has_any(
+        text,
+        "kanban",
+        "칸반",
+        "카드 후보",
+    ):
+        _append_unique(objects, "post_turn_intake_policy")
     if ("kanban" in lowered or "칸반" in text) and _has_any(text, "title generator", "title", "타이틀", "제목"):
         _append_unique(objects, "kanban_title_generation")
     if _has_sleep_reminder_evidence(text):
@@ -1004,6 +1035,10 @@ def _infer_title_object(title: str) -> str:
     compact = _compact_title(title).lower()
     if not compact:
         return ""
+    if "personal context" in compact or "self-context" in compact or "lifelog context broker" in compact:
+        return "personal_context"
+    if "post-turn" in compact and "intake" in compact:
+        return "post_turn_intake_policy"
     if "medication reminder" in compact:
         return "medication_reminder"
     if "medication intake" in compact or "medication" in compact or "dose" in compact:
@@ -1060,6 +1095,10 @@ def evaluate_title_semantic_match(title: str, request: IntakeDetectionRequest) -
 
 def _semantic_safe_fallback(request: IntakeDetectionRequest) -> str:
     for obj in _infer_request_title_objects(request):
+        if obj == "personal_context":
+            return PERSONAL_CONTEXT_TITLE
+        if obj == "post_turn_intake_policy":
+            return POST_TURN_POLICY_TITLE
         if obj == "sleep_reminder":
             return "Review sleep reminder wearable pause workflow"
         if obj == "sleep_log":
@@ -1217,6 +1256,19 @@ def _normalize_project_title_intent(text: str) -> str:
     return ""
 
 
+def _normalize_personal_context_title_intent(text: str) -> str:
+    if _has_any(text, "post-turn", "post turn", "완료 요약", "운영 정책") and _has_any(
+        text,
+        "kanban",
+        "칸반",
+        "카드 후보",
+    ):
+        return POST_TURN_POLICY_TITLE
+    if _has_any(text, "personal context", "self-context", "self context", "context broker", "나 관련"):
+        return PERSONAL_CONTEXT_TITLE
+    return ""
+
+
 def _normalize_child_family_health_title_intent(text: str) -> str:
     value = str(text or "")
     lowered = value.lower()
@@ -1312,6 +1364,9 @@ def _raw_title_fallback(request: IntakeDetectionRequest) -> str:
     kanban_normalized = _normalize_kanban_intake_title_intent(text)
     if kanban_normalized:
         return kanban_normalized
+    personal_context = _normalize_personal_context_title_intent(text)
+    if personal_context:
+        return personal_context
     child_health = _normalize_child_family_health_title_intent(text)
     if child_health:
         return child_health
@@ -1363,6 +1418,11 @@ _SAFE_TITLE_OBJECT_ALIASES = {
     "kanban title generation": "title generation",
     "kanban title generator": "title generation",
     "conversational intake": "kanban intake",
+    "personal context broker": "personal context",
+    "self context": "personal context",
+    "self-context": "personal context",
+    "lifelog-backed context": "lifelog context broker",
+    "post-turn kanban intake": "post-turn intake policy",
 }
 
 
@@ -1536,6 +1596,28 @@ def _clean_gate_text(request: IntakeDetectionRequest) -> str:
     return " ".join(f"{request.user_summary}\n{request.assistant_summary}".split())
 
 
+def _assistant_looks_like_completion_summary(text: str) -> bool:
+    collapsed = " ".join(str(text or "").split())
+    if not collapsed:
+        return False
+    has_completion = _has_any(collapsed, "완료", "done", "completed", "updated", "수정", "업데이트", "코멘트", "commented")
+    has_existing_artifact = bool(re.search(_KANBAN_CARD_ID_RE, collapsed)) or "/reports/" in collapsed or "/docs/plans/" in collapsed
+    has_operation_words = _has_any(
+        collapsed,
+        "카드 제목",
+        "리포트",
+        "report",
+        "checkpoint",
+        "체크포인트",
+        "안 한 것",
+        "gateway restart 없음",
+        "cron",
+        "Graphify",
+        "lifelog.db",
+    )
+    return has_completion and has_existing_artifact and has_operation_words
+
+
 def _has_explicit_card_request(text: str) -> bool:
     return bool(_EXPLICIT_CARD_REQUEST_RE.search(text))
 
@@ -1589,6 +1671,20 @@ def suppress_direct_card_operation_intent(request: IntakeDetectionRequest) -> bo
     return _has_direct_card_operation_request(user_text)
 
 
+def _user_looks_like_existing_work_update(text: str) -> bool:
+    collapsed = " ".join(str(text or "").split())
+    if not collapsed:
+        return False
+    if _has_proposal_record_request(collapsed):
+        return False
+    if suppress_existing_card_update_intent(collapsed):
+        return True
+    return bool(
+        _has_any(collapsed, "카드 제목 수정", "카드 제목", "리포트 업데이트", "보고서 업데이트", "report update")
+        and _has_any(collapsed, "수정", "업데이트", "update")
+    )
+
+
 def _is_approved_live_smoke_request(text: str) -> bool:
     return bool(_APPROVED_LIVE_SMOKE_RE.search(text))
 
@@ -1613,28 +1709,55 @@ def _has_concrete_followup_signal(text: str) -> bool:
     return bool(_CONCRETE_FOLLOWUP_RE.search(text))
 
 
-def card_proposal_eligibility(request: IntakeDetectionRequest, decision: Optional[DetectorDecision] = None) -> ProposalEligibility:
-    text = _clean_gate_text(request)
+def classify_conversation_act(request: IntakeDetectionRequest) -> ConversationAct:
     user_text = " ".join(str(request.user_summary or "").split())
-    if _is_meta_or_one_off(text):
-        return ProposalEligibility(False, "meta discussion or one-off question", "negative_meta_one_off", "ephemeral_workflow_command")
+    assistant_text = " ".join(str(request.assistant_summary or "").split())
+    combined_text = _clean_gate_text(request)
+
     if _is_approved_live_smoke_request(user_text):
-        return ProposalEligibility(True, "approved live smoke request", "approved_live_smoke_request", "unsafe_live_side_effect")
-    if suppress_existing_card_update_intent(user_text) and not _has_explicit_user_proposal_record_request(request):
-        return ProposalEligibility(False, "existing card update intent", "existing_card_update_intent", "existing_card_update")
-    if _is_read_only_candidate_audit(user_text) and not _has_explicit_user_proposal_record_request(request):
-        return ProposalEligibility(False, "read-only candidate audit", "read_only_candidate_audit", "read_only_audit")
-    if suppress_direct_card_operation_intent(request):
-        return ProposalEligibility(False, "direct card operation intent", "direct_card_operation_intent", "direct_operation")
+        return ConversationAct("approved_live_smoke_request", "approved live smoke request")
     if _has_explicit_user_proposal_record_request(request):
-        return ProposalEligibility(True, "explicit card request", "explicit_card_request", "proposal_record_request")
-    if _has_explicit_user_card_request(request):
-        return ProposalEligibility(False, "direct card request requires main-turn handling", "direct_card_operation_intent", "direct_operation")
-    if _is_vague_board_creation_discussion(text):
-        return ProposalEligibility(False, "board discussion requires explicit long-lived project request", "board_requires_explicit_request", "insufficient_signal")
-    if _has_durable_project_anchor(text) and _has_concrete_followup_signal(text):
-        return ProposalEligibility(True, "durable project follow-up", "durable_followup", "durable_followup")
-    return ProposalEligibility(False, "insufficient durable follow-up signal", "insufficient_scope", "insufficient_signal")
+        return ConversationAct(CONVERSATION_ACT_NEW_PROPOSAL, "explicit card request")
+
+    if _is_read_only_candidate_audit(user_text):
+        return ConversationAct(CONVERSATION_ACT_READ_ONLY_AUDIT, "read-only candidate audit")
+    if suppress_direct_card_operation_intent(request) or _has_explicit_user_card_request(request):
+        return ConversationAct(CONVERSATION_ACT_DIRECT_OPERATION, "direct card operation intent")
+    if _user_looks_like_existing_work_update(user_text):
+        return ConversationAct(CONVERSATION_ACT_EXISTING_WORK_UPDATE, "existing card update intent")
+
+    if _is_meta_or_one_off(user_text) or _is_meta_or_one_off(combined_text):
+        return ConversationAct(CONVERSATION_ACT_META, "meta discussion or one-off question")
+    if _is_vague_board_creation_discussion(user_text):
+        return ConversationAct(CONVERSATION_ACT_INSUFFICIENT, "board discussion requires explicit long-lived project request")
+
+    if _assistant_looks_like_completion_summary(assistant_text):
+        return ConversationAct(CONVERSATION_ACT_COMPLETION_REPORT, "assistant completion summary")
+
+    if _has_durable_project_anchor(user_text) and _has_concrete_followup_signal(user_text):
+        return ConversationAct(CONVERSATION_ACT_DURABLE_FOLLOWUP, "durable project follow-up")
+    return ConversationAct(CONVERSATION_ACT_INSUFFICIENT, "insufficient durable follow-up signal")
+
+
+def card_proposal_eligibility(request: IntakeDetectionRequest, decision: Optional[DetectorDecision] = None) -> ProposalEligibility:
+    act = classify_conversation_act(request)
+    if act.kind == "approved_live_smoke_request":
+        return ProposalEligibility(True, act.reason, "approved_live_smoke_request", "unsafe_live_side_effect")
+    if act.kind == CONVERSATION_ACT_NEW_PROPOSAL:
+        return ProposalEligibility(True, act.reason, "explicit_card_request", "proposal_record_request")
+    if act.kind == CONVERSATION_ACT_DURABLE_FOLLOWUP:
+        return ProposalEligibility(True, act.reason, "durable_followup", "durable_followup")
+
+    label_map = {
+        CONVERSATION_ACT_EXISTING_WORK_UPDATE: ("existing_card_update_intent", "existing_card_update"),
+        CONVERSATION_ACT_COMPLETION_REPORT: ("existing_card_update_intent", "existing_card_update"),
+        CONVERSATION_ACT_META: ("negative_meta_one_off", "ephemeral_workflow_command"),
+        CONVERSATION_ACT_DIRECT_OPERATION: ("direct_card_operation_intent", "direct_operation"),
+        CONVERSATION_ACT_READ_ONLY_AUDIT: ("read_only_candidate_audit", "read_only_audit"),
+        CONVERSATION_ACT_INSUFFICIENT: ("insufficient_scope", "insufficient_signal"),
+    }
+    matched_rule, candidate_class = label_map.get(act.kind, ("insufficient_scope", "insufficient_signal"))
+    return ProposalEligibility(False, act.reason, matched_rule, candidate_class)
 
 
 def _candidate_title_text(request: IntakeDetectionRequest) -> str:
@@ -1723,12 +1846,18 @@ def explicit_title_from_request(
         or _looks_like_raw_user_title(proposed_compact, request)
         or not evaluate_title_quality(proposed_compact, request).passed
     ):
-        project_normalized = _normalize_project_title_intent(combined_for_title)
+        user_for_title = request.user_summary or ""
+        project_normalized = _normalize_project_title_intent(user_for_title if semantic_mismatch else combined_for_title)
         if project_normalized:
             return project_normalized
-        proposal_specific = _normalize_kanban_intake_title_intent(combined_for_title)
+        proposal_specific = _normalize_kanban_intake_title_intent(user_for_title if semantic_mismatch else combined_for_title)
         if proposal_specific:
             return proposal_specific
+        personal_context = _normalize_personal_context_title_intent(user_for_title if semantic_mismatch else combined_for_title)
+        if personal_context:
+            return personal_context
+        if semantic_mismatch:
+            return _semantic_safe_fallback(request)
         child_health = _normalize_child_family_health_title_intent(combined_for_title)
         if child_health:
             return child_health
@@ -1738,8 +1867,6 @@ def explicit_title_from_request(
         sensitive_ops = _normalize_sensitive_ops_title_intent(combined_for_title)
         if sensitive_ops:
             return sensitive_ops
-        if semantic_mismatch:
-            return _semantic_safe_fallback(request)
     proposed_normalized = _normalize_korean_title_intent(
         "\n".join(part for part in (request.user_summary or "", proposed_compact) if part)
     )
@@ -1763,6 +1890,9 @@ def explicit_title_from_request(
     kanban_normalized = _normalize_kanban_intake_title_intent(text)
     if kanban_normalized:
         return kanban_normalized
+    personal_context = _normalize_personal_context_title_intent(text)
+    if personal_context:
+        return personal_context
     child_health = _normalize_child_family_health_title_intent(text)
     if child_health:
         return child_health

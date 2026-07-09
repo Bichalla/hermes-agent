@@ -36,6 +36,9 @@ def test_no_live_smoke_script_outputs_safe_booleans(tmp_path, monkeypatch):
     assert data["existing_card_update_suppressed"] is True
     assert data["direct_card_operation_suppressed"] is True
     assert data["direct_card_operation_failure_suppressed"] is True
+    assert data["completion_summary_existing_card_update_suppressed"] is True
+    assert data["completion_summary_child_health_title_not_rendered"] is True
+    assert data["old_policy_pending_approval_rejected"] is True
     assert data["durable_status_update_remains_eligible"] is True
     assert data["lifelog_generic_title_rewritten"] is True
     assert data["hybrid_title_generator_accepts_safe_draft"] is True

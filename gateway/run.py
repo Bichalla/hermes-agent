@@ -7967,6 +7967,10 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             assistant_response=assistant_response,
             cfg=cfg,
         )
+        pre_eligibility = card_proposal_eligibility(request)
+        if not pre_eligibility.eligible:
+            logger.debug("kanban intake proposal skipped before detector: %s", pre_eligibility.reason)
+            return None
         detector = getattr(self, "_kanban_intake_detector", None) or KeywordHeuristicDetector()
         try:
             decision = await asyncio.to_thread(detector.detect, request)

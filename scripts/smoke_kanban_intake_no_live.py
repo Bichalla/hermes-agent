@@ -102,6 +102,24 @@ def main() -> int:
             default_board=board,
             default_tenant="lifelog",
         )).card_worthy
+        completion_summary_existing_card_update_suppressed = not detector.detect(IntakeDetectionRequest(
+            platform="discord",
+            session_key="s1",
+            source_ref="kp_safe",
+            user_summary="오케이 그렇게 해보자 그러면 카드 제목 수정하고 리포트도 업데이트해봐.",
+            assistant_summary="완료. 카드 제목 수정: `t_14ed556e`. 리포트 업데이트. health/medication, family/childcare/profile/value/work/travel. 안 한 것: gateway restart 없음, lifelog.db write/import/migration 없음.",
+            default_board=board,
+            default_tenant="lifelog",
+        )).card_worthy
+        completion_summary_child_health_title_not_rendered = "Review child health" not in explicit_title_from_request(IntakeDetectionRequest(
+            platform="discord",
+            session_key="s1",
+            source_ref="kp_safe",
+            user_summary="personal context broker 후속 개선을 새 카드 후보로 남겨줘",
+            assistant_summary="완료. health/medication, family/childcare/profile/value/work/travel DB 분포를 확인했다.",
+            default_board=board,
+            default_tenant="lifelog",
+        ), "Review child health Lifelog capture")
         durable_status_update_remains_eligible = detector.detect(detector_request(
             "gateway status update feature 구현/테스트까지 해줘"
         )).card_worthy
@@ -173,6 +191,32 @@ def main() -> int:
         )
         store.put_pending(proposal, binding, cfg)
         approved = handle_reply("ㅇㅇ", binding, cfg, store)
+        old_policy_binding = SourceBinding("discord", "old_policy_chat_123456789", "old_policy_thread_123456789", "u_old", "s1")
+        old_policy_pending = store.put_pending(
+            KanbanCardProposal(
+                board=board,
+                title="Verify old policy pending revalidation workflow",
+                body={"source_ref": "kp_old", "acceptance_criteria": ["fail closed"]},
+                source_ref="kp_old",
+                user_id="u_old",
+            ),
+            old_policy_binding,
+            cfg,
+        )
+        with store.connect() as old_policy_conn:
+            old_policy_conn.execute(
+                "UPDATE kanban_intake_pending SET policy_version = ? WHERE pending_id = ?",
+                ("kanban-intake-policy/v2", old_policy_pending.pending_id),
+            )
+            old_policy_conn.commit()
+        old_policy_result = handle_reply("승인", old_policy_binding, cfg, store)
+        old_policy_review = store.review_pending(include_all=True)
+        old_policy_items = {item["pending_id"]: item for item in old_policy_review["items"]}
+        old_policy_pending_approval_rejected = (
+            old_policy_result.handled
+            and not old_policy_result.verified
+            and old_policy_items[old_policy_pending.pending_id]["status"] == "needs_revalidation"
+        )
         conn = kb.connect(board=board)
         try:
             tasks = kb.list_tasks(conn, include_archived=True)
@@ -245,6 +289,9 @@ def main() -> int:
             "existing_card_update_suppressed": existing_card_update_suppressed,
             "direct_card_operation_suppressed": direct_card_operation_suppressed,
             "direct_card_operation_failure_suppressed": direct_card_operation_failure_suppressed,
+            "completion_summary_existing_card_update_suppressed": completion_summary_existing_card_update_suppressed,
+            "completion_summary_child_health_title_not_rendered": completion_summary_child_health_title_not_rendered,
+            "old_policy_pending_approval_rejected": old_policy_pending_approval_rejected,
             "durable_status_update_remains_eligible": durable_status_update_remains_eligible,
             "lifelog_generic_title_rewritten": lifelog_generic_title_rewritten,
             "hybrid_title_generator_accepts_safe_draft": hybrid_title_generator_accepts_safe_draft,
@@ -292,6 +339,9 @@ def main() -> int:
             result["existing_card_update_suppressed"],
             result["direct_card_operation_suppressed"],
             result["direct_card_operation_failure_suppressed"],
+            result["completion_summary_existing_card_update_suppressed"],
+            result["completion_summary_child_health_title_not_rendered"],
+            result["old_policy_pending_approval_rejected"],
             result["durable_status_update_remains_eligible"],
             result["lifelog_generic_title_rewritten"],
             result["hybrid_title_generator_accepts_safe_draft"],

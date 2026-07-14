@@ -15,11 +15,141 @@ from tools.approval import (
     _normalize_approval_mode,
     _smart_approve,
     approve_session,
+    build_approval_decision_evidence,
     detect_dangerous_command,
+    emit_approval_decision_evidence,
     is_approved,
     load_permanent,
     prompt_dangerous_approval,
 )
+
+
+class TestApprovalDecisionEvidence:
+    def test_raw_free_contract(self):
+        evidence = build_approval_decision_evidence(
+            action_id="turn-7.call-2",
+            action_class="status_memory",
+            guard_source="tirith",
+            rule_id="pipe-to-interpreter",
+            decision="prompt",
+            prompt_count=1,
+            session_cache_influenced=False,
+            command_shape="interpreter_pipe",
+        )
+        assert evidence == {
+            "schema": "approval-decision-evidence/v1",
+            "action_id": "turn-7.call-2",
+            "action_class": "status_memory",
+            "guard_source": "tirith",
+            "rule_id": "pipe-to-interpreter",
+            "decision": "prompt",
+            "prompt_count": 1,
+            "session_cache_influenced": False,
+            "command_shape": "interpreter_pipe",
+        }
+        rendered = repr(evidence)
+        assert "hermes kanban" not in rendered
+        assert "discord" not in rendered
+        assert "sqlite" not in rendered
+
+    def test_raw_command_cannot_be_used_as_shape_or_rule(self):
+        for field in ("rule_id", "command_shape"):
+            kwargs = {
+                "action_id": "turn-1",
+                "action_class": "status_memory",
+                "guard_source": "none",
+                "rule_id": "none",
+                "decision": "allow",
+                "prompt_count": 0,
+                "session_cache_influenced": False,
+                "command_shape": "kanban_comment_direct",
+            }
+            kwargs[field] = "hermes kanban comment t_secret raw private text"
+            try:
+                build_approval_decision_evidence(**kwargs)
+            except ValueError:
+                pass
+            else:
+                raise AssertionError(f"raw {field} was accepted")
+
+    def test_evidence_sink_failure_does_not_change_evidence(self):
+        evidence = build_approval_decision_evidence(
+            action_id="turn-1",
+            action_class="trusted_local_record",
+            guard_source="none",
+            rule_id="none",
+            decision="allow",
+            prompt_count=0,
+            session_cache_influenced=False,
+            command_shape="registered_recorder_direct",
+        )
+
+        def broken_sink(_evidence):
+            raise OSError("synthetic sink failure")
+
+        assert emit_approval_decision_evidence(evidence, broken_sink) == evidence
+
+    def test_every_preexec_fast_path_returns_decision_evidence(self):
+        allow_scan = {"action": "allow", "findings": [], "summary": ""}
+
+        with mock_patch.object(
+            approval_module, "_should_skip_container_guards", return_value=True
+        ):
+            isolated = approval_module.check_all_command_guards("echo safe", "docker")
+
+        cron_env = {
+            "HERMES_INTERACTIVE": "",
+            "HERMES_GATEWAY_SESSION": "",
+            "HERMES_EXEC_ASK": "",
+            "HERMES_CRON_SESSION": "1",
+        }
+        with (
+            mock_patch.object(approval_module, "_should_skip_container_guards", return_value=False),
+            mock_patch.object(approval_module, "_get_approval_mode", return_value="manual"),
+            mock_patch.object(approval_module, "_get_cron_approval_mode", return_value="deny"),
+            mock_patch.object(approval_module, "_command_matches_permanent_allowlist", return_value=False),
+            mock_patch.object(approval_module, "detect_hardline_command", return_value=(False, "")),
+            mock_patch.object(approval_module, "_check_sudo_stdin_guard", return_value=(False, "")),
+            mock_patch.object(
+                approval_module,
+                "detect_dangerous_command",
+                return_value=(True, "synthetic-risk", "synthetic risk"),
+            ),
+            mock_patch.dict(os.environ, cron_env, clear=False),
+        ):
+            cron_denied = approval_module.check_all_command_guards(
+                "synthetic dangerous command", "local"
+            )
+
+        interactive_env = {
+            "HERMES_INTERACTIVE": "1",
+            "HERMES_GATEWAY_SESSION": "",
+            "HERMES_EXEC_ASK": "",
+            "HERMES_CRON_SESSION": "",
+        }
+        with (
+            mock_patch.object(approval_module, "_should_skip_container_guards", return_value=False),
+            mock_patch.object(approval_module, "_get_approval_mode", return_value="manual"),
+            mock_patch.object(approval_module, "_command_matches_permanent_allowlist", return_value=False),
+            mock_patch.object(approval_module, "detect_hardline_command", return_value=(False, "")),
+            mock_patch.object(approval_module, "_check_sudo_stdin_guard", return_value=(False, "")),
+            mock_patch.object(
+                approval_module, "detect_dangerous_command", return_value=(False, None, None)
+            ),
+            mock_patch("tools.tirith_security.check_command_security", return_value=allow_scan),
+            mock_patch.dict(os.environ, interactive_env, clear=False),
+        ):
+            clean = approval_module.check_all_command_guards("echo safe", "local")
+
+        assert isolated["decision_evidence"]["rule_id"] == "isolated-backend"
+        assert isolated["decision_evidence"]["decision"] == "allow"
+        assert cron_denied["decision_evidence"]["rule_id"] == "cron-dangerous-deny"
+        assert cron_denied["decision_evidence"]["decision"] == "deny"
+        assert clean["decision_evidence"]["rule_id"] == "clean-command"
+        assert clean["decision_evidence"]["decision"] == "allow"
+        for result in (isolated, cron_denied, clean):
+            assert result["decision_evidence"]["prompt_count"] == 0
+            assert "synthetic dangerous command" not in repr(result["decision_evidence"])
 
 
 class TestApprovalModeParsing:
@@ -166,6 +296,38 @@ class TestApproveAndCheckSession:
         assert is_approved(key, "rm") is False
         approve_session(key, "rm")
         assert is_approved(key, "rm") is True
+
+    def test_session_cached_guard_keeps_raw_free_decision_evidence(self):
+        key = "test_session_evidence"
+        pattern = "synthetic-risk-pattern"
+        _clear_session(key)
+        approve_session(key, pattern)
+        token = approval_module.set_current_session_key(key)
+        try:
+            with mock_patch.object(approval_module, "_get_approval_mode", return_value="manual"):
+                with mock_patch.object(
+                    approval_module,
+                    "detect_dangerous_command",
+                    return_value=(True, pattern, "synthetic risk"),
+                ):
+                    with mock_patch(
+                        "tools.tirith_security.check_command_security",
+                        return_value={"action": "allow", "findings": [], "summary": ""},
+                    ):
+                        with mock_patch.dict("os.environ", {"HERMES_INTERACTIVE": "1"}, clear=False):
+                            result = approval_module.check_all_command_guards(
+                                "synthetic private command", "local"
+                            )
+        finally:
+            approval_module.reset_current_session_key(token)
+            _clear_session(key)
+
+        assert result["approved"] is True
+        evidence = result["decision_evidence"]
+        assert evidence["decision"] == "allow"
+        assert evidence["prompt_count"] == 0
+        assert evidence["session_cache_influenced"] is True
+        assert "synthetic private command" not in repr(evidence)
 
 
 class TestSessionKeyContext:
@@ -1763,6 +1925,11 @@ class TestApprovalTimeoutIsNotConsent:
         assert result["approved"] is False
         assert result.get("user_consent") is False
         assert result.get("outcome") == "timeout"
+        evidence = result["decision_evidence"]
+        assert evidence["decision"] == "prompt"
+        assert evidence["prompt_count"] == 1
+        assert evidence["session_cache_influenced"] is False
+        assert "rm -rf" not in repr(evidence)
         # The notify_cb DID fire — we did try to ask the user.
         assert len(notified) == 1
 

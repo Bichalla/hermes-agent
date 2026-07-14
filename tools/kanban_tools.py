@@ -737,11 +737,42 @@ def _handle_comment(args: dict, **kw) -> str:
     # comments are the deliberate handoff channel between tasks.
     author = os.environ.get("HERMES_PROFILE") or "worker"
     board = args.get("board")
+    from tools.workflow_authority import (
+        get_current_turn_user_authority,
+        opaque_workflow_action_id,
+    )
+
+    authority = get_current_turn_user_authority()
+    worker_task_scope = bool(os.environ.get("HERMES_KANBAN_TASK"))
+    if authority is None and not worker_task_scope:
+        return tool_error(
+            "kanban_comment: current-turn user authority or worker-task scope required"
+        )
+    if authority is not None and not authority.allows("status_memory", str(tid)):
+        return tool_error(
+            "kanban_comment: current user turn did not authorize this card target"
+        )
     try:
         kb, conn = _connect(board=board)
         try:
             cid = kb.add_comment(conn, tid, author=author, body=str(body))
-            return _ok(task_id=tid, comment_id=cid)
+            from agent.workflow_action_policy import WorkflowAction, classify_workflow_action
+            from tools.approval import build_approval_decision_evidence
+
+            action_class = classify_workflow_action(
+                WorkflowAction(operation="kanban.comment", target_exists=True)
+            )
+            evidence = build_approval_decision_evidence(
+                action_id=opaque_workflow_action_id(authority),
+                action_class=action_class.value,
+                guard_source="none",
+                rule_id="typed-kanban-comment",
+                decision="allow",
+                prompt_count=0,
+                session_cache_influenced=False,
+                command_shape="kanban_comment_direct",
+            )
+            return _ok(task_id=tid, comment_id=cid, decision_evidence=evidence)
         finally:
             conn.close()
     except ValueError as e:
@@ -793,6 +824,50 @@ def _handle_create(args: dict, **kw) -> str:
     idempotency_key = args.get("idempotency_key")
     max_runtime_seconds = args.get("max_runtime_seconds")
     initial_status = args.get("initial_status") or "running"
+    board = args.get("board")
+    blocked_authority = None
+    if str(initial_status) == "blocked":
+        from agent.workflow_action_policy import (
+            build_blocked_card_idempotency_key_from_fingerprint,
+        )
+        from tools.workflow_authority import (
+            get_current_turn_user_authority,
+            select_blocked_create_target_fingerprint,
+        )
+
+        blocked_authority = get_current_turn_user_authority()
+        if (
+            blocked_authority is None
+            or not blocked_authority.user_action_fingerprint
+            or not blocked_authority.allows("explicit_blocked_card_create")
+        ):
+            return tool_error(
+                "kanban_create: current user turn did not authorize blocked-card creation"
+            )
+        try:
+            requested_target_fingerprint = select_blocked_create_target_fingerprint(
+                blocked_authority, str(title).strip()
+            )
+        except ValueError as exc:
+            return tool_error(f"kanban_create: {exc}")
+        target_scope = "|".join(
+            (
+                f"tenant:{tenant or 'default'}",
+                f"project:{project_id or 'none'}",
+                f"assignee:{assignee}",
+                f"requested-target:{requested_target_fingerprint}",
+            )
+        )
+        expected_key = build_blocked_card_idempotency_key_from_fingerprint(
+            board=str(board or os.environ.get("HERMES_KANBAN_BOARD") or "current"),
+            user_action_fingerprint=blocked_authority.user_action_fingerprint,
+            target_scope=target_scope,
+        )
+        if idempotency_key and idempotency_key != expected_key:
+            return tool_error(
+                "kanban_create: idempotency_key does not match current user action"
+            )
+        idempotency_key = expected_key
     skills = args.get("skills")
     if isinstance(skills, str):
         # Accept a single skill name as a string for convenience.
@@ -811,7 +886,6 @@ def _handle_create(args: dict, **kw) -> str:
         return tool_error(
             f"parents must be a list of task ids, got {type(parents).__name__}"
         )
-    board = args.get("board")
     try:
         kb, conn = _connect(board=board)
         try:
@@ -856,11 +930,34 @@ def _handle_create(args: dict, **kw) -> str:
             )
             new_task = kb.get_task(conn, new_tid)
             subscribed = _maybe_auto_subscribe(conn, new_tid)
-            return _ok(
-                task_id=new_tid,
-                status=new_task.status if new_task else None,
-                subscribed=subscribed,
-            )
+            result_fields = {
+                "task_id": new_tid,
+                "status": new_task.status if new_task else None,
+                "subscribed": subscribed,
+            }
+            if str(initial_status) == "blocked":
+                from agent.workflow_action_policy import WorkflowAction, classify_workflow_action
+                from tools.approval import build_approval_decision_evidence
+                from tools.workflow_authority import opaque_workflow_action_id
+
+                action_class = classify_workflow_action(
+                    WorkflowAction(
+                        operation="kanban.create_blocked",
+                        explicit_blocked_card_create=True,
+                        deterministic_idempotency_key=bool(idempotency_key),
+                    )
+                )
+                result_fields["decision_evidence"] = build_approval_decision_evidence(
+                    action_id=opaque_workflow_action_id(blocked_authority),
+                    action_class=action_class.value,
+                    guard_source="none",
+                    rule_id="typed-kanban-blocked-create",
+                    decision="allow",
+                    prompt_count=0,
+                    session_cache_influenced=False,
+                    command_shape="kanban_blocked_create_with_idempotency_key",
+                )
+            return _ok(**result_fields)
         finally:
             conn.close()
     except ValueError as e:

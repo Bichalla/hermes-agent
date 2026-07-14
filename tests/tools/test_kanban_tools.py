@@ -716,6 +716,13 @@ def test_comment_happy_path(worker_env):
     d = json.loads(out)
     assert d["ok"] is True
     assert d["comment_id"]
+    evidence = d["decision_evidence"]
+    assert evidence["action_class"] == "status_memory"
+    assert evidence["decision"] == "allow"
+    assert evidence["prompt_count"] == 0
+    assert worker_env not in repr(evidence)
+    assert evidence["guard_source"] == "none"
+    assert "hello thread" not in repr(evidence)
     from hermes_cli import kanban_db as kb
     conn = kb.connect()
     try:
@@ -787,6 +794,152 @@ def test_create_happy_path(worker_env):
         assert child.assignee == "peer"
     finally:
         conn.close()
+
+
+def test_create_blocked_auto_idempotency_and_evidence(worker_env):
+    from tools import kanban_tools as kt
+    from hermes_cli import kanban_db as kb
+    from tools.workflow_authority import (
+        CurrentTurnUserAuthority,
+        bind_current_turn_user_authority,
+        fingerprint_user_action,
+        reset_current_turn_user_authority,
+    )
+
+    def authority(message: str, turn_id: str) -> CurrentTurnUserAuthority:
+        return CurrentTurnUserAuthority(
+            turn_id=turn_id,
+            source_role="user",
+            session_scope="test",
+            platform_scope="synthetic",
+            user_message_index=0,
+            user_action_fingerprint=fingerprint_user_action(message),
+            allowed_action_classes=frozenset({"explicit_blocked_card_create"}),
+        )
+
+    args = {
+        "title": "Review blocked approval card",
+        "assignee": "peer",
+        "initial_status": "blocked",
+    }
+    token = bind_current_turn_user_authority(
+        authority("create the approval review card", "opaque-turn-a")
+    )
+    try:
+        first = json.loads(kt._handle_create(dict(args)))
+        retry_with_rephrased_title = json.loads(
+            kt._handle_create({**args, "title": "Rephrased assistant title"})
+        )
+    finally:
+        reset_current_turn_user_authority(token)
+
+    token = bind_current_turn_user_authority(
+        authority("create a different review card", "opaque-turn-b")
+    )
+    try:
+        different_request_same_title = json.loads(kt._handle_create(dict(args)))
+    finally:
+        reset_current_turn_user_authority(token)
+
+    assert first["ok"] is True
+    assert retry_with_rephrased_title["task_id"] == first["task_id"]
+    assert different_request_same_title["task_id"] != first["task_id"]
+    evidence = first["decision_evidence"]
+    assert evidence["action_class"] == "explicit_blocked_card_create"
+    assert evidence["decision"] == "allow"
+    assert evidence["prompt_count"] == 0
+    assert evidence["command_shape"] == "kanban_blocked_create_with_idempotency_key"
+    assert first["task_id"] not in repr(evidence)
+    with kb.connect_closing() as conn:
+        task = kb.get_task(conn, first["task_id"])
+    assert task is not None
+    assert task.status == "blocked"
+    assert task.idempotency_key is not None
+    assert task.idempotency_key.startswith("blocked-card:v1:")
+
+
+def test_same_turn_blocked_creates_use_distinct_authorized_target_discriminators(worker_env):
+    from tools import kanban_tools as kt
+    from tools.workflow_authority import (
+        CurrentTurnUserAuthority,
+        bind_current_turn_user_authority,
+        fingerprint_user_action,
+        fingerprint_workflow_target,
+        reset_current_turn_user_authority,
+    )
+
+    authority = CurrentTurnUserAuthority(
+        turn_id="opaque-same-turn-multi-create",
+        source_role="user",
+        session_scope="test",
+        platform_scope="synthetic",
+        user_message_index=0,
+        user_action_fingerprint=fingerprint_user_action("create cards A and B"),
+        allowed_action_classes=frozenset({"explicit_blocked_card_create"}),
+        blocked_create_target_fingerprints=frozenset(
+            {
+                fingerprint_workflow_target("Card A"),
+                fingerprint_workflow_target("Card B"),
+            }
+        ),
+    )
+    token = bind_current_turn_user_authority(authority)
+    try:
+        first = json.loads(
+            kt._handle_create(
+                {"title": "Card A", "assignee": "peer", "initial_status": "blocked"}
+            )
+        )
+        first_retry = json.loads(
+            kt._handle_create(
+                {"title": "Card A", "assignee": "peer", "initial_status": "blocked"}
+            )
+        )
+        second = json.loads(
+            kt._handle_create(
+                {"title": "Card B", "assignee": "peer", "initial_status": "blocked"}
+            )
+        )
+    finally:
+        reset_current_turn_user_authority(token)
+
+    assert first_retry["task_id"] == first["task_id"]
+    assert second["task_id"] != first["task_id"]
+
+
+def test_blocked_create_without_current_turn_authority_fails_closed(worker_env):
+    from tools import kanban_tools as kt
+    from tools.workflow_authority import clear_current_turn_user_authority
+
+    clear_current_turn_user_authority()
+    result = json.loads(
+        kt._handle_create(
+            {
+                "title": "Blocked without authority",
+                "assignee": "peer",
+                "initial_status": "blocked",
+            }
+        )
+    )
+    assert result.get("ok") is not True
+    assert "did not authorize blocked-card creation" in result["error"]
+
+
+def test_comment_without_turn_or_worker_authority_fails_closed(
+    worker_env, monkeypatch
+):
+    from tools import kanban_tools as kt
+    from tools.workflow_authority import clear_current_turn_user_authority
+
+    clear_current_turn_user_authority()
+    monkeypatch.delenv("HERMES_KANBAN_TASK", raising=False)
+    result = json.loads(
+        kt._handle_comment(
+            {"task_id": worker_env, "body": "must not write without authority"}
+        )
+    )
+    assert result.get("ok") is not True
+    assert "current-turn user authority" in result["error"]
 
 
 def test_create_inherits_worker_dir_workspace(monkeypatch, worker_env):
@@ -1640,12 +1793,13 @@ def test_board_param_routes_assign_via_create_to_alt(multi_board_env):
         assert task.assignee == "linguist"
 
 
-def test_board_param_routes_comment_to_alt_board(multi_board_env):
+def test_board_param_routes_comment_to_alt_board(multi_board_env, monkeypatch):
     """kanban_comment routes the insert to the alt board's DB."""
     from hermes_cli import kanban_db as kb
     from tools import kanban_tools as kt
 
     alt_seed = multi_board_env["alt_seed"]
+    monkeypatch.setenv("HERMES_KANBAN_TASK", alt_seed)
     out = kt._handle_comment({
         "task_id": alt_seed,
         "body": "alt comment",

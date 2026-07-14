@@ -202,9 +202,38 @@ command_allowlist:
 
 These patterns are loaded at startup and silently approved in all future sessions.
 
+Permanent entries are broad security policy. Prefer exact typed workflow commands and registered recorders over shell/interpreter globs. Audit the current list without changing it:
+
+```bash
+python scripts/audit_approval_allowlist.py --json
+```
+
+The audit emits only raw-minimized pattern labels, risk classes, and a non-applying migration preview. It never rewrites `config.yaml`. Review broad destructive/interpreter entries for removal; do not replace them with another broad glob.
+
 :::tip
 Use `hermes config edit` to review or remove patterns from your permanent allowlist.
 :::
+
+### Investigating an Unexpected Allow Prompt
+
+An Allow prompt is a terminal-security decision, not a request to reconfirm the conversation. The latest explicit user request is sufficient conversational authority for that exact action; Hermes must not ask for a second conversational confirmation.
+
+For covered workflow actions:
+
+- Existing-card comments, progress notes, artifact links, verification summaries, and handoffs are status-memory writes. They do not create or dispatch work.
+- Explicit blocked-card creation must use a deterministic idempotency key derived from the accepted current user action, board, and target scope.
+- Confirmed local records must go through the registered recorder dispatcher. The initial enforced registry contains only `diet_intake.v1`; child-health and medication routes remain guarded until separately registered and tested. Wrong cwd/script/database/payload root, extra argv, direct SQL, arbitrary interpreters, credentials, migrations, public delivery, and destructive actions remain guarded.
+- Do not pipe CLI or JSON output into Python or another interpreter for readback. Run the mutation and verification separately and inspect direct output or a fixed verifier.
+
+Approval results may include raw-free `approval-decision-evidence/v1` metadata: opaque action ID, action class, guard source, rule ID, decision, prompt count, session-cache influence, and command shape. It intentionally excludes commands, user text, record payloads, platform IDs, DB values, and credentials. Use `guard_source`, `rule_id`, and `command_shape` to identify whether Tirith, a dangerous-command pattern, or prior session approval affected the result.
+
+When diagnosing a duplicate prompt:
+
+1. Confirm the actual business action and whether the target already exists.
+2. Inspect decision evidence; do not copy raw private payloads into logs or bug reports.
+3. Check for compound shell shapes, especially interpreter pipes, before changing policy.
+4. Reproduce with synthetic fixtures and `scripts/smoke_natural_language_approval_no_live.py --json`.
+5. Narrow the command construction or registered workflow. Never solve the issue with global YOLO or a broad interpreter allowlist.
 
 ## User Authorization (Gateway)
 

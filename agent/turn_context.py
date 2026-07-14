@@ -34,8 +34,35 @@ from agent.model_metadata import (
     estimate_messages_tokens_rough,
     estimate_request_tokens_rough,
 )
+from tools.workflow_authority import (
+    CurrentTurnUserAuthority,
+    bind_current_turn_user_authority,
+    clear_current_turn_user_authority,
+    fingerprint_user_action,
+    infer_explicit_blocked_create_targets,
+    infer_explicit_workflow_scope,
+)
 
 logger = logging.getLogger(__name__)
+
+
+_NON_FOREGROUND_AUTHORITY_PLATFORMS = frozenset(
+    {"background", "cron", "delegate", "review", "subagent", "webhook"}
+)
+
+
+def _accepts_current_user_authority(agent) -> bool:
+    """Return whether this prologue represents a foreground user event.
+
+    Background-review forks already mark ``_skip_mcp_refresh``; automation
+    surfaces use non-interactive platform labels. Neither may inherit prior
+    conversational authority merely because a synthetic prompt is stored as a
+    ``role=user`` message for provider compatibility.
+    """
+    if getattr(agent, "_skip_mcp_refresh", False):
+        return False
+    platform = str(getattr(agent, "platform", "") or "").strip().lower()
+    return platform not in _NON_FOREGROUND_AUTHORITY_PLATFORMS
 
 
 def _compression_made_progress(
@@ -140,6 +167,10 @@ def build_turn_context(
     ``conversation_loop`` module are passed in explicitly to keep this module
     free of an import cycle with ``agent.conversation_loop``.
     """
+    # A context may be reused by sequential turns on the same thread. Clear
+    # prior authority before accepting the new foreground user event.
+    clear_current_turn_user_authority()
+
     # Guard stdio against OSError from broken pipes (systemd/headless/daemon).
     install_safe_stdio()
 
@@ -302,6 +333,28 @@ def build_turn_context(
     messages.append(user_msg)
     current_turn_user_idx = len(messages) - 1
     agent._persist_user_message_idx = current_turn_user_idx
+
+    if _accepts_current_user_authority(agent):
+        allowed_action_classes, target_fingerprints = infer_explicit_workflow_scope(
+            original_user_message
+        )
+        bind_current_turn_user_authority(
+            CurrentTurnUserAuthority(
+                turn_id=turn_id,
+                source_role="user",
+                session_scope=str(agent.session_id or "session"),
+                platform_scope=str(getattr(agent, "platform", "") or "unknown"),
+                user_message_index=current_turn_user_idx,
+                user_action_fingerprint=fingerprint_user_action(
+                    original_user_message
+                ),
+                allowed_action_classes=allowed_action_classes,
+                target_fingerprints=target_fingerprints,
+                blocked_create_target_fingerprints=(
+                    infer_explicit_blocked_create_targets(original_user_message)
+                ),
+            )
+        )
 
     if not agent.quiet_mode:
         _print_preview = summarize_user_message_for_log(user_message)

@@ -117,6 +117,23 @@ class TestBlockingGatewayApproval:
         assert entry.result == "once"
         unregister_gateway_notify(session_key)
 
+    def test_queue_entry_can_carry_raw_free_decision_evidence(self):
+        from tools.approval import _ApprovalEntry, build_approval_decision_evidence
+
+        evidence = build_approval_decision_evidence(
+            action_id="turn-1.call-1",
+            action_class="approval_required_live_mutation",
+            guard_source="tirith",
+            rule_id="pipe-to-interpreter",
+            decision="prompt",
+            prompt_count=1,
+            session_cache_influenced=False,
+            command_shape="interpreter_pipe",
+        )
+        entry = _ApprovalEntry({"decision_evidence": evidence})
+        assert entry.data["decision_evidence"] == evidence
+        assert "raw command" not in repr(entry.data["decision_evidence"])
+
     def test_resolve_returns_zero_when_no_pending(self):
         from tools.approval import resolve_gateway_approval
         assert resolve_gateway_approval("nonexistent", "once") == 0

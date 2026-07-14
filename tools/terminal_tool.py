@@ -37,6 +37,7 @@ import logging
 import os
 import platform
 import re
+import shlex
 import time
 import threading
 import atexit
@@ -962,6 +963,7 @@ Do NOT use grep/rg/find to search — use search_files instead.
 Do NOT use ls to list directories — use search_files(target='files') instead.
 Do NOT use sed/awk to edit files — use patch instead.
 Do NOT use echo/cat heredoc to create files — use write_file instead.
+Never pipe CLI or JSON output into Python or another interpreter for readback. Run mutation and verification as separate commands, then inspect direct stdout or use read_file or a fixed direct verifier.
 Reserve terminal for: builds, installs, git, processes, scripts, network, package managers, and anything that needs a shell.
 Because exported environment state persists, activate a virtualenv or export setup variables once per session; do not re-source the same environment before every command unless a command proves the shell state was reset.
 
@@ -1964,6 +1966,62 @@ def _resolve_notification_flag_conflict(
     return watch_patterns, ""
 
 
+def _command_with_current_turn_fingerprint(command: str) -> str:
+    """Inject hidden user-action provenance into a child command only."""
+    reserved_names = (
+        "HERMES_CURRENT_USER_ACTION_FINGERPRINT",
+        "HERMES_CURRENT_USER_REQUEST_TARGET_FINGERPRINT",
+    )
+    if any(name in command for name in reserved_names):
+        raise ValueError("reserved workflow-authority environment variable in command")
+    from tools.workflow_authority import (
+        get_current_turn_user_authority,
+        select_blocked_create_target_fingerprint,
+    )
+
+    authority = get_current_turn_user_authority()
+    if authority is None or not authority.user_action_fingerprint:
+        return command
+    normalized = command.casefold()
+    blocked_create = (
+        "hermes kanban" in normalized
+        and " create" in normalized
+        and "--initial-status blocked" in normalized
+        and authority.allows("explicit_blocked_card_create")
+    )
+    registered_record = (
+        "run_registered_lifelog_recorder.py" in normalized
+        and authority.allows("trusted_local_record")
+    )
+    if not (blocked_create or registered_record):
+        return command
+    assignments = [
+        "HERMES_CURRENT_USER_ACTION_FINGERPRINT="
+        + shlex.quote(authority.user_action_fingerprint)
+    ]
+    if blocked_create:
+        try:
+            tokens = shlex.split(command)
+            create_index = next(
+                index for index, token in enumerate(tokens) if token.casefold() == "create"
+            )
+            proposed_title = tokens[create_index + 1]
+            if proposed_title.startswith("-"):
+                raise ValueError("blocked-card title is not directly identifiable")
+            target_fingerprint = select_blocked_create_target_fingerprint(
+                authority, proposed_title
+            )
+        except (ValueError, IndexError, StopIteration):
+            if len(authority.blocked_create_target_fingerprints) > 1:
+                return command
+            target_fingerprint = select_blocked_create_target_fingerprint(authority, "card")
+        assignments.append(
+            "HERMES_CURRENT_USER_REQUEST_TARGET_FINGERPRINT="
+            + shlex.quote(target_fingerprint)
+        )
+    return f"{' '.join(assignments)} {command}"
+
+
 def _resolve_command_cwd(
     *,
     workdir: Optional[str],
@@ -2331,6 +2389,8 @@ def terminal_tool(
         except Exception:
             pass
 
+        execution_command = _command_with_current_turn_fingerprint(command)
+
         if background:
             # Spawn a tracked background process via the process registry.
             # For local backends: uses subprocess.Popen with output buffering.
@@ -2345,7 +2405,7 @@ def terminal_tool(
             try:
                 if env_type == "local":
                     proc_session = process_registry.spawn_local(
-                        command=command,
+                        command=execution_command,
                         cwd=effective_cwd,
                         task_id=effective_task_id,
                         session_key=session_key,
@@ -2355,7 +2415,7 @@ def terminal_tool(
                 else:
                     proc_session = process_registry.spawn_via_env(
                         env=env,
-                        command=command,
+                        command=execution_command,
                         cwd=effective_cwd,
                         task_id=effective_task_id,
                         session_key=session_key,
@@ -2593,7 +2653,7 @@ def terminal_tool(
                         "timeout": effective_timeout,
                         "cwd": command_cwd,
                     }
-                    result = env.execute(command, **execute_kwargs)
+                    result = env.execute(execution_command, **execute_kwargs)
                 except Exception as e:
                     error_str = str(e).lower()
                     if "timeout" in error_str:

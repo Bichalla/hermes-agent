@@ -48,6 +48,96 @@ _approval_tool_call_id: contextvars.ContextVar[str] = contextvars.ContextVar(
     default="",
 )
 
+_EVIDENCE_ACTION_CLASSES = {
+    "read_only",
+    "status_memory",
+    "explicit_blocked_card_create",
+    "trusted_local_record",
+    "approval_required_live_mutation",
+    "destructive_or_public",
+}
+_EVIDENCE_GUARD_SOURCES = {"tirith", "dangerous_pattern", "none"}
+_EVIDENCE_DECISIONS = {"allow", "prompt", "deny", "hard_block"}
+_EVIDENCE_TOKEN_RE = re.compile(r"^[A-Za-z0-9_.:-]{1,80}$")
+
+
+def build_approval_decision_evidence(
+    *,
+    action_id: str,
+    action_class: str,
+    guard_source: str,
+    rule_id: str,
+    decision: str,
+    prompt_count: int,
+    session_cache_influenced: bool,
+    command_shape: str,
+) -> dict:
+    """Build strict raw-free evidence for one approval decision."""
+    fields = {
+        "action_id": action_id,
+        "rule_id": rule_id,
+        "command_shape": command_shape,
+    }
+    for name, value in fields.items():
+        if not isinstance(value, str) or not _EVIDENCE_TOKEN_RE.fullmatch(value):
+            raise ValueError(f"{name} must be an opaque raw-free token")
+    if action_class not in _EVIDENCE_ACTION_CLASSES:
+        raise ValueError("unknown action_class")
+    if guard_source not in _EVIDENCE_GUARD_SOURCES:
+        raise ValueError("unknown guard_source")
+    if decision not in _EVIDENCE_DECISIONS:
+        raise ValueError("unknown decision")
+    if prompt_count not in {0, 1}:
+        raise ValueError("prompt_count must be 0 or 1")
+    if not isinstance(session_cache_influenced, bool):
+        raise ValueError("session_cache_influenced must be boolean")
+    return {
+        "schema": "approval-decision-evidence/v1",
+        "action_id": action_id,
+        "action_class": action_class,
+        "guard_source": guard_source,
+        "rule_id": rule_id,
+        "decision": decision,
+        "prompt_count": prompt_count,
+        "session_cache_influenced": session_cache_influenced,
+        "command_shape": command_shape,
+    }
+
+
+def emit_approval_decision_evidence(evidence: dict, sink=None) -> dict:
+    """Best-effort raw-free evidence emission; never alter safety decisions."""
+    if sink is not None:
+        try:
+            sink(dict(evidence))
+        except Exception as exc:
+            logger.debug("Approval decision evidence sink failed: %s", type(exc).__name__)
+    return evidence
+
+
+def _guard_evidence(
+    *,
+    guard_source: str,
+    rule_id: str,
+    decision: str,
+    prompt_count: int,
+    session_cache_influenced: bool = False,
+    command_shape: str = "guarded_terminal_command",
+) -> dict:
+    action_id = _approval_tool_call_id.get() or _approval_turn_id.get() or "opaque-turn-local"
+    if not _EVIDENCE_TOKEN_RE.fullmatch(action_id):
+        action_id = "opaque-turn-local"
+    safe_rule = re.sub(r"[^A-Za-z0-9_.:-]+", "-", rule_id).strip("-")[:80] or "none"
+    return build_approval_decision_evidence(
+        action_id=action_id,
+        action_class="approval_required_live_mutation",
+        guard_source=guard_source,
+        rule_id=safe_rule,
+        decision=decision,
+        prompt_count=prompt_count,
+        session_cache_influenced=session_cache_influenced,
+        command_shape=command_shape,
+    )
+
 
 def _fire_approval_hook(hook_name: str, **kwargs) -> None:
     """Invoke a plugin lifecycle hook for the approval system.
@@ -1573,7 +1663,18 @@ def check_all_command_guards(command: str, env_type: str,
     # Skip isolated container backends for both checks. Docker stops skipping
     # once host paths are bind-mounted into the sandbox.
     if _should_skip_container_guards(env_type, has_host_access=has_host_access):
-        return {"approved": True, "message": None}
+        return {
+            "approved": True,
+            "message": None,
+            "decision_evidence": emit_approval_decision_evidence(
+                _guard_evidence(
+                    guard_source="none",
+                    rule_id="isolated-backend",
+                    decision="allow",
+                    prompt_count=0,
+                )
+            ),
+        }
 
     # Hardline floor: unconditional block for catastrophic commands
     # (rm -rf /, mkfs, dd to raw device, shutdown/reboot, fork bomb,
@@ -1582,7 +1683,16 @@ def check_all_command_guards(command: str, env_type: str,
     is_hardline, hardline_desc = detect_hardline_command(command)
     if is_hardline:
         logger.warning("Hardline block: %s (command: %s)", hardline_desc, command[:200])
-        return _hardline_block_result(hardline_desc)
+        result = _hardline_block_result(hardline_desc)
+        result["decision_evidence"] = emit_approval_decision_evidence(
+            _guard_evidence(
+                guard_source="dangerous_pattern",
+                rule_id="hardline",
+                decision="hard_block",
+                prompt_count=0,
+            )
+        )
+        return result
 
     # == Sudo stdin guard ==
     # Like the hardline floor above, this is unconditional: there is never a
@@ -1593,16 +1703,47 @@ def check_all_command_guards(command: str, env_type: str,
     if is_sudo_guess:
         logger.warning("Sudo stdin guard block: %s (command: %s)",
                        sudo_guess_desc, command[:200])
-        return _sudo_stdin_block_result(sudo_guess_desc)
+        result = _sudo_stdin_block_result(sudo_guess_desc)
+        result["decision_evidence"] = emit_approval_decision_evidence(
+            _guard_evidence(
+                guard_source="dangerous_pattern",
+                rule_id="sudo-stdin-guard",
+                decision="hard_block",
+                prompt_count=0,
+            )
+        )
+        return result
 
     # --yolo or approvals.mode=off: bypass all approval prompts.
     # Gateway /yolo is session-scoped; CLI --yolo remains process-scoped.
     approval_mode = _get_approval_mode()
     if _YOLO_MODE_FROZEN or is_current_session_yolo_enabled() or approval_mode == "off":
-        return {"approved": True, "message": None}
+        return {
+            "approved": True,
+            "message": None,
+            "decision_evidence": emit_approval_decision_evidence(
+                _guard_evidence(
+                    guard_source="none",
+                    rule_id="approval-mode-bypass",
+                    decision="allow",
+                    prompt_count=0,
+                )
+            ),
+        }
 
     if _command_matches_permanent_allowlist(command):
-        return {"approved": True, "message": None}
+        return {
+            "approved": True,
+            "message": None,
+            "decision_evidence": emit_approval_decision_evidence(
+                _guard_evidence(
+                    guard_source="none",
+                    rule_id="permanent-allowlist",
+                    decision="allow",
+                    prompt_count=0,
+                )
+            ),
+        }
 
     is_cli = env_var_enabled("HERMES_INTERACTIVE")
     is_gateway = _is_gateway_approval_context()
@@ -1626,8 +1767,27 @@ def check_all_command_guards(command: str, env_type: str,
                             "To allow dangerous commands in cron jobs, set "
                             "approvals.cron_mode: approve in config.yaml."
                         ),
+                        "decision_evidence": emit_approval_decision_evidence(
+                            _guard_evidence(
+                                guard_source="dangerous_pattern",
+                                rule_id="cron-dangerous-deny",
+                                decision="deny",
+                                prompt_count=0,
+                            )
+                        ),
                     }
-        return {"approved": True, "message": None}
+        return {
+            "approved": True,
+            "message": None,
+            "decision_evidence": emit_approval_decision_evidence(
+                _guard_evidence(
+                    guard_source="none",
+                    rule_id="noninteractive-auto-allow",
+                    decision="allow",
+                    prompt_count=0,
+                )
+            ),
+        }
 
     # --- Phase 1: Gather findings from both checks ---
 
@@ -1687,6 +1847,9 @@ def check_all_command_guards(command: str, env_type: str,
     # Previously, tirith "block" was a hard block with no approval prompt.
     # Now both block and warn go through the approval flow so users can
     # inspect the explanation and approve if they understand the risk.
+    tirith_cache_hit = False
+    dangerous_cache_hit = False
+    tirith_key = "tirith:unknown"
     if tirith_result["action"] in {"block", "warn"}:
         findings = tirith_result.get("findings") or []
         rule_id = findings[0].get("rule_id", "unknown") if findings else "unknown"
@@ -1694,14 +1857,50 @@ def check_all_command_guards(command: str, env_type: str,
         tirith_desc = _format_tirith_description(tirith_result)
         if not is_approved(session_key, tirith_key):
             warnings.append((tirith_key, tirith_desc, True))
+        else:
+            tirith_cache_hit = True
 
     if is_dangerous:
         if not is_approved(session_key, pattern_key):
             warnings.append((pattern_key, description, False))
+        else:
+            dangerous_cache_hit = True
 
     # Nothing to warn about
     if not warnings:
-        return {"approved": True, "message": None}
+        if tirith_cache_hit or dangerous_cache_hit:
+            cache_source = "tirith" if tirith_cache_hit else "dangerous_pattern"
+            cache_rule = tirith_key if tirith_cache_hit else pattern_key
+            return {
+                "approved": True,
+                "message": None,
+                "decision_evidence": emit_approval_decision_evidence(
+                    _guard_evidence(
+                        guard_source=cache_source,
+                        rule_id=cache_rule,
+                        decision="allow",
+                        prompt_count=0,
+                        session_cache_influenced=True,
+                        command_shape=(
+                            "interpreter_pipe"
+                            if "pipe-to-interpreter" in cache_rule
+                            else "guarded_terminal_command"
+                        ),
+                    )
+                ),
+            }
+        return {
+            "approved": True,
+            "message": None,
+            "decision_evidence": emit_approval_decision_evidence(
+                _guard_evidence(
+                    guard_source="none",
+                    rule_id="clean-command",
+                    decision="allow",
+                    prompt_count=0,
+                )
+            ),
+        }
 
     # --- Phase 2.5: Smart approval (auxiliary LLM risk assessment) ---
     # When approvals.mode=smart, ask the aux LLM before prompting the user.
@@ -1709,6 +1908,8 @@ def check_all_command_guards(command: str, env_type: str,
     # (openai/codex#13860).
     if approval_mode == "smart":
         combined_desc_for_llm = "; ".join(desc for _, desc, _ in warnings)
+        smart_key, _, smart_is_tirith = warnings[0]
+        smart_rule = smart_key.removeprefix("tirith:")
         verdict = _smart_approve(command, combined_desc_for_llm)
         if verdict == "approve":
             # Auto-approve and grant session-level approval for these patterns
@@ -1718,7 +1919,17 @@ def check_all_command_guards(command: str, env_type: str,
                          command[:60], combined_desc_for_llm)
             return {"approved": True, "message": None,
                     "smart_approved": True,
-                    "description": combined_desc_for_llm}
+                    "description": combined_desc_for_llm,
+                    "decision_evidence": emit_approval_decision_evidence(
+                        _guard_evidence(
+                            guard_source=(
+                                "tirith" if smart_is_tirith else "dangerous_pattern"
+                            ),
+                            rule_id=smart_rule,
+                            decision="allow",
+                            prompt_count=0,
+                        )
+                    )}
         elif verdict == "deny":
             combined_desc_for_llm = "; ".join(desc for _, desc, _ in warnings)
             return {
@@ -1726,6 +1937,16 @@ def check_all_command_guards(command: str, env_type: str,
                 "message": f"BLOCKED by smart approval: {combined_desc_for_llm}. "
                            "The command was assessed as genuinely dangerous. Do NOT retry.",
                 "smart_denied": True,
+                "decision_evidence": emit_approval_decision_evidence(
+                    _guard_evidence(
+                        guard_source=(
+                            "tirith" if smart_is_tirith else "dangerous_pattern"
+                        ),
+                        rule_id=smart_rule,
+                        decision="deny",
+                        prompt_count=0,
+                    )
+                ),
             }
         # verdict == "escalate" → fall through to manual prompt
 
@@ -1736,6 +1957,21 @@ def check_all_command_guards(command: str, env_type: str,
     primary_key = warnings[0][0]
     all_keys = [key for key, _, _ in warnings]
     has_tirith = any(is_t for _, _, is_t in warnings)
+    primary_is_tirith = warnings[0][2]
+    evidence_rule = primary_key.removeprefix("tirith:")
+    prompt_evidence = emit_approval_decision_evidence(
+        _guard_evidence(
+            guard_source="tirith" if primary_is_tirith else "dangerous_pattern",
+            rule_id=evidence_rule,
+            decision="prompt",
+            prompt_count=1,
+            command_shape=(
+                "interpreter_pipe"
+                if evidence_rule == "pipe-to-interpreter"
+                else "guarded_terminal_command"
+            ),
+        )
+    )
 
     # Gateway/async approval — block the agent thread until the user
     # responds with /approve or /deny, mirroring the CLI's synchronous
@@ -1756,6 +1992,7 @@ def check_all_command_guards(command: str, env_type: str,
                 "pattern_key": primary_key,
                 "pattern_keys": all_keys,
                 "description": combined_desc,
+                "decision_evidence": prompt_evidence,
                 # Mirror the CLI's allow_permanent gate: a tirith warning downgrades
                 # "always" to session scope below, so the UI must not offer it.
                 "allow_permanent": not has_tirith,
@@ -1769,6 +2006,7 @@ def check_all_command_guards(command: str, env_type: str,
                     "message": "BLOCKED: Failed to send approval request to user. Do NOT retry.",
                     "pattern_key": primary_key,
                     "description": combined_desc,
+                    "decision_evidence": prompt_evidence,
                 }
             resolved = decision["resolved"]
             choice = decision["choice"]
@@ -1802,6 +2040,7 @@ def check_all_command_guards(command: str, env_type: str,
                     "description": combined_desc,
                     "outcome": outcome,
                     "user_consent": False,
+                    "decision_evidence": prompt_evidence,
                 }
 
             # User approved — persist based on scope (same logic as CLI)
@@ -1816,7 +2055,8 @@ def check_all_command_guards(command: str, env_type: str,
                 # single time only, matching the CLI's behavior.
 
             return {"approved": True, "message": None,
-                    "user_approved": True, "description": combined_desc}
+                    "user_approved": True, "description": combined_desc,
+                    "decision_evidence": prompt_evidence}
 
         # Fallback: no gateway callback registered (e.g. cron, batch).
         # Return approval_required for backward compat.
@@ -1825,6 +2065,7 @@ def check_all_command_guards(command: str, env_type: str,
             "pattern_key": primary_key,
             "pattern_keys": all_keys,
             "description": combined_desc,
+            "decision_evidence": prompt_evidence,
         })
         return {
             "approved": False,
@@ -1833,6 +2074,7 @@ def check_all_command_guards(command: str, env_type: str,
             "approval_pending": True,
             "command": command,
             "description": combined_desc,
+            "decision_evidence": prompt_evidence,
             "message": (
                 f"⚠️ {combined_desc}. Asking the user for approval.\n\n**Command:**\n```\n{command}\n```"
             ),
@@ -1878,6 +2120,7 @@ def check_all_command_guards(command: str, env_type: str,
             "description": combined_desc,
             "outcome": "denied",
             "user_consent": False,
+            "decision_evidence": prompt_evidence,
         }
 
     # Persist approval for each warning individually
@@ -1892,7 +2135,8 @@ def check_all_command_guards(command: str, env_type: str,
             save_permanent_allowlist(_permanent_approved)
 
     return {"approved": True, "message": None,
-            "user_approved": True, "description": combined_desc}
+            "user_approved": True, "description": combined_desc,
+            "decision_evidence": prompt_evidence}
 
 
 def check_execute_code_guard(code: str, env_type: str,
@@ -1921,19 +2165,46 @@ def check_execute_code_guard(code: str, env_type: str,
         "approval is one-shot for this run."
     )
 
+    def _evidence(
+        decision: str,
+        *,
+        prompt_count: int,
+        rule_id: str = "execute-code",
+        session_cache_influenced: bool = False,
+    ) -> dict:
+        return emit_approval_decision_evidence(
+            _guard_evidence(
+                guard_source="dangerous_pattern",
+                rule_id=rule_id,
+                decision=decision,
+                prompt_count=prompt_count,
+                session_cache_influenced=session_cache_influenced,
+                command_shape="execute_code_script",
+            )
+        )
+
     # Isolated backends already sandbox the child — matches the container skip
     # in check_all_command_guards / check_dangerous_command. Docker stops
     # skipping once host paths are bind-mounted into the sandbox; vercel_sandbox
     # has no host-bind concept so it stays always-skipped.
     if env_type == "vercel_sandbox":
-        return {"approved": True, "message": None}
+        return {"approved": True, "message": None,
+                "decision_evidence": _evidence(
+                    "allow", prompt_count=0, rule_id="isolated-backend"
+                )}
     if _should_skip_container_guards(env_type, has_host_access=has_host_access):
-        return {"approved": True, "message": None}
+        return {"approved": True, "message": None,
+                "decision_evidence": _evidence(
+                    "allow", prompt_count=0, rule_id="isolated-backend"
+                )}
 
     # --yolo or approvals.mode=off: bypass (session- or process-scoped).
     approval_mode = _get_approval_mode()
     if _YOLO_MODE_FROZEN or is_current_session_yolo_enabled() or approval_mode == "off":
-        return {"approved": True, "message": None}
+        return {"approved": True, "message": None,
+                "decision_evidence": _evidence(
+                    "allow", prompt_count=0, rule_id="approval-mode-bypass"
+                )}
 
     is_gateway = _is_gateway_approval_context()
     is_ask = env_var_enabled("HERMES_EXEC_ASK")
@@ -1955,8 +2226,17 @@ def check_execute_code_guard(code: str, env_type: str,
                 "description": description,
                 "outcome": "blocked",
                 "user_consent": False,
+                "decision_evidence": _evidence(
+                    "deny", prompt_count=0, rule_id="cron-deny"
+                ),
             }
-        return {"approved": True, "message": None}
+        return {
+            "approved": True,
+            "message": None,
+            "decision_evidence": _evidence(
+                "allow", prompt_count=0, rule_id="cron-trusted"
+            ),
+        }
 
     # Only gateway/ask contexts get the one-shot whole-script approval.
     #   * CLI interactive: the script's terminal() calls are guarded per-call
@@ -1964,7 +2244,13 @@ def check_execute_code_guard(code: str, env_type: str,
     #     prompt would fire on every execute_code call.
     #   * Local non-interactive non-gateway: documented limitation above.
     if not is_gateway and not is_ask:
-        return {"approved": True, "message": None}
+        return {
+            "approved": True,
+            "message": None,
+            "decision_evidence": _evidence(
+                "allow", prompt_count=0, rule_id="headless-local-trust"
+            ),
+        }
 
     session_key = get_current_session_key()
     # Built only now (past the early-return gates) so the common non-approval
@@ -1975,7 +2261,16 @@ def check_execute_code_guard(code: str, env_type: str,
     # Without this, "Approve session" / "Always" choices are stored but never
     # consulted, so every execute_code call re-prompts the user (#39275).
     if is_approved(session_key, pattern_key):
-        return {"approved": True, "message": None}
+        return {
+            "approved": True,
+            "message": None,
+            "decision_evidence": _evidence(
+                "allow",
+                prompt_count=0,
+                rule_id="execute-code-cache",
+                session_cache_influenced=True,
+            ),
+        }
 
     # Smart mode: ask the aux LLM about the whole script. An APPROVE here only
     # suppresses the redundant whole-script prompt; the per-call terminal()
@@ -1986,7 +2281,10 @@ def check_execute_code_guard(code: str, env_type: str,
             logger.debug("Smart approval: auto-approved execute_code for session %s",
                          session_key)
             return {"approved": True, "message": None,
-                    "smart_approved": True, "description": description}
+                    "smart_approved": True, "description": description,
+                    "decision_evidence": _evidence(
+                        "allow", prompt_count=0, rule_id="smart-approve"
+                    )}
         if verdict == "deny":
             return {
                 "approved": False,
@@ -1998,9 +2296,13 @@ def check_execute_code_guard(code: str, env_type: str,
                 "description": description,
                 "outcome": "denied",
                 "user_consent": False,
+                "decision_evidence": _evidence(
+                    "deny", prompt_count=0, rule_id="smart-deny"
+                ),
             }
         # verdict == "escalate" → fall through to manual approval
 
+    prompt_evidence = _evidence("prompt", prompt_count=1)
     notify_cb = None
     with _lock:
         notify_cb = _gateway_notify_cbs.get(session_key)
@@ -2013,6 +2315,7 @@ def check_execute_code_guard(code: str, env_type: str,
             "pattern_key": pattern_key,
             "pattern_keys": [pattern_key],
             "description": description,
+            "decision_evidence": prompt_evidence,
         })
         return {
             "approved": False,
@@ -2021,6 +2324,7 @@ def check_execute_code_guard(code: str, env_type: str,
             "approval_pending": True,
             "command": command,
             "description": description,
+            "decision_evidence": prompt_evidence,
             "message": (
                 f"⚠️ {description}. Asking the user for approval.\n\n"
                 f"**Code:**\n```python\n{code}\n```"
@@ -2032,6 +2336,7 @@ def check_execute_code_guard(code: str, env_type: str,
         "pattern_key": pattern_key,
         "pattern_keys": [pattern_key],
         "description": description,
+        "decision_evidence": prompt_evidence,
     }
     decision = _await_gateway_decision(
         session_key, notify_cb, approval_data, surface="gateway"
@@ -2045,6 +2350,7 @@ def check_execute_code_guard(code: str, env_type: str,
             "description": description,
             "outcome": "notify_failed",
             "user_consent": False,
+            "decision_evidence": prompt_evidence,
         }
 
     resolved = decision["resolved"]
@@ -2065,6 +2371,7 @@ def check_execute_code_guard(code: str, env_type: str,
             "description": description,
             "outcome": "timeout" if not resolved else "denied",
             "user_consent": False,
+            "decision_evidence": prompt_evidence,
         }
 
     # Approved — persist based on scope (same logic as check_all_command_guards).
@@ -2077,7 +2384,8 @@ def check_execute_code_guard(code: str, env_type: str,
     # choice == "once": no persistence — approval lasts this single call only.
 
     return {"approved": True, "message": None,
-            "user_approved": True, "description": description}
+            "user_approved": True, "description": description,
+            "decision_evidence": prompt_evidence}
 
 
 # =========================================================================

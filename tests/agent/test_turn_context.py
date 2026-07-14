@@ -14,6 +14,10 @@ from unittest.mock import patch
 import pytest
 
 from agent.turn_context import TurnContext, build_turn_context
+from tools.workflow_authority import (
+    clear_current_turn_user_authority,
+    get_current_turn_user_authority,
+)
 
 
 class _FakeTodoStore:
@@ -110,8 +114,10 @@ def _stub_runtime_main():
     resolution) when the per-test process isolation plugin is disabled. Stub
     it out so the prologue tests stay hermetic.
     """
+    clear_current_turn_user_authority()
     with patch("agent.auxiliary_client.set_runtime_main", lambda *a, **k: None):
         yield
+    clear_current_turn_user_authority()
 
 
 def _build(agent, **overrides):
@@ -166,6 +172,37 @@ def test_task_id_passthrough():
     ctx = _build(agent, task_id="fixed-task")
     assert ctx.effective_task_id == "fixed-task"
     assert agent._current_task_id == "fixed-task"
+
+
+def test_foreground_user_turn_binds_hidden_authority_without_message_text():
+    agent = _FakeAgent()
+    ctx = _build(agent, user_message="synthetic private content")
+    authority = get_current_turn_user_authority()
+    assert authority is not None
+    assert authority.turn_id == ctx.turn_id
+    assert authority.source_role == "user"
+    assert authority.session_scope == agent.session_id
+    assert authority.platform_scope == agent.platform
+    assert authority.user_message_index == ctx.current_turn_user_idx
+    assert "synthetic private content" not in repr(authority)
+
+
+def test_background_review_turn_clears_and_does_not_bind_authority():
+    foreground = _FakeAgent()
+    _build(foreground)
+    assert get_current_turn_user_authority() is not None
+
+    background = _FakeAgent()
+    background._skip_mcp_refresh = True
+    _build(background)
+    assert get_current_turn_user_authority() is None
+
+
+def test_automation_platform_does_not_bind_foreground_authority():
+    agent = _FakeAgent()
+    agent.platform = "cron"
+    _build(agent)
+    assert get_current_turn_user_authority() is None
 
 
 def test_persist_user_message_becomes_original():

@@ -142,9 +142,29 @@ def _register_resolver(session_key: str, result):
         A._gateway_notify_cbs[session_key] = cb
 
 
+def _assert_evidence(
+    result: dict,
+    *,
+    decision: str,
+    prompt_count: int,
+    cache: bool = False,
+) -> dict:
+    evidence = result["decision_evidence"]
+    assert evidence["schema"] == "approval-decision-evidence/v1"
+    assert evidence["action_class"] == "approval_required_live_mutation"
+    assert evidence["decision"] == decision
+    assert evidence["prompt_count"] == prompt_count
+    assert evidence["session_cache_influenced"] is cache
+    assert evidence["command_shape"] == "execute_code_script"
+    assert "import os" not in repr(evidence)
+    return evidence
+
+
 def test_guard_isolated_backend_approved():
     # Container backends already sandbox the child — no-op approve.
-    assert A.check_execute_code_guard("import os", "docker")["approved"] is True
+    res = A.check_execute_code_guard("import os", "docker")
+    assert res["approved"] is True
+    _assert_evidence(res, decision="allow", prompt_count=0)
 
 
 def test_guard_headless_local_approved(monkeypatch):
@@ -154,7 +174,9 @@ def test_guard_headless_local_approved(monkeypatch):
     monkeypatch.delenv("HERMES_CRON_SESSION", raising=False)
     monkeypatch.delenv("HERMES_EXEC_ASK", raising=False)
     monkeypatch.setattr(A, "_get_approval_mode", lambda: "manual")
-    assert A.check_execute_code_guard("import os", "local")["approved"] is True
+    res = A.check_execute_code_guard("import os", "local")
+    assert res["approved"] is True
+    _assert_evidence(res, decision="allow", prompt_count=0)
 
 
 def test_guard_cron_deny_blocks(monkeypatch):
@@ -165,6 +187,7 @@ def test_guard_cron_deny_blocks(monkeypatch):
     res = A.check_execute_code_guard("import os", "local")
     assert res["approved"] is False
     assert res["outcome"] == "blocked"
+    _assert_evidence(res, decision="deny", prompt_count=0)
 
 
 def test_guard_gateway_user_approves_is_one_shot(gw_session):
@@ -172,6 +195,7 @@ def test_guard_gateway_user_approves_is_one_shot(gw_session):
     res = A.check_execute_code_guard("import os; print(1)", "local")
     assert res["approved"] is True
     assert res.get("user_approved") is True
+    _assert_evidence(res, decision="prompt", prompt_count=1)
     # One-shot: approval must NOT persist to future scripts.
     assert A.is_approved(gw_session, "execute_code") is False
 
@@ -182,11 +206,13 @@ def test_guard_gateway_user_approves_session_persists(gw_session):
     res = A.check_execute_code_guard("import os; print(1)", "local")
     assert res["approved"] is True
     assert res.get("user_approved") is True
+    _assert_evidence(res, decision="prompt", prompt_count=1)
     # Session approval should now be stored.
     assert A.is_approved(gw_session, "execute_code") is True
     # Subsequent calls should auto-approve without prompting.
     res2 = A.check_execute_code_guard("import os; print(2)", "local")
     assert res2["approved"] is True
+    _assert_evidence(res2, decision="allow", prompt_count=0, cache=True)
     # Cleanup
     with A._lock:
         s = A._session_approved.get(gw_session, set())
@@ -199,6 +225,7 @@ def test_guard_gateway_user_approves_always_persists(gw_session):
     res = A.check_execute_code_guard("import os; print(1)", "local")
     assert res["approved"] is True
     assert res.get("user_approved") is True
+    _assert_evidence(res, decision="prompt", prompt_count=1)
     # Permanent approval should now be stored.
     assert A.is_approved(gw_session, "execute_code") is True
     # Cleanup
@@ -229,6 +256,7 @@ def test_guard_gateway_user_denies_blocks(gw_session):
     assert res["approved"] is False
     assert res["outcome"] == "denied"
     assert res["user_consent"] is False
+    _assert_evidence(res, decision="prompt", prompt_count=1)
 
 
 def test_guard_gateway_timeout_blocks(gw_session, monkeypatch):
@@ -239,6 +267,7 @@ def test_guard_gateway_timeout_blocks(gw_session, monkeypatch):
     res = A.check_execute_code_guard("import os", "local")
     assert res["approved"] is False
     assert res["outcome"] == "timeout"
+    _assert_evidence(res, decision="prompt", prompt_count=1)
 
 
 def test_guard_gateway_missing_notify_is_pending(gw_session):
@@ -246,6 +275,7 @@ def test_guard_gateway_missing_notify_is_pending(gw_session):
     res = A.check_execute_code_guard("import os", "local")
     assert res["approved"] is False
     assert res["status"] == "pending_approval"
+    _assert_evidence(res, decision="prompt", prompt_count=1)
 
 
 def test_guard_smart_mode(gw_session, monkeypatch):
@@ -254,10 +284,12 @@ def test_guard_smart_mode(gw_session, monkeypatch):
     monkeypatch.setattr(A, "_smart_approve", lambda c, d: "approve")
     res = A.check_execute_code_guard("import os", "local")
     assert res["approved"] is True and res.get("smart_approved") is True
+    _assert_evidence(res, decision="allow", prompt_count=0)
 
     monkeypatch.setattr(A, "_smart_approve", lambda c, d: "deny")
     res = A.check_execute_code_guard("import os", "local")
     assert res["approved"] is False and res.get("smart_denied") is True
+    _assert_evidence(res, decision="deny", prompt_count=0)
 
     # escalate → falls through to manual gateway approval
     monkeypatch.setattr(A, "_smart_approve", lambda c, d: "escalate")

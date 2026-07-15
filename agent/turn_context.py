@@ -468,29 +468,84 @@ def build_turn_context(
     # Plugin hook: pre_llm_call (context injected into user message, not system prompt).
     plugin_user_context = ""
     try:
+        from gateway.session_context import get_session_env
         from hermes_cli.plugins import invoke_hook as _invoke_hook
+        from hermes_cli.profiles import get_active_profile_name
+
+        def _exact_text(value):
+            return value if type(value) is str else ""
+
+        def _exact_text_tuple(value):
+            if type(value) is not tuple:
+                return ()
+            if any(type(item) is not str or not item for item in value):
+                return ()
+            return value
+
+        active_profile = _exact_text(get_active_profile_name())
+        session_platform = _exact_text(
+            get_session_env("HERMES_SESSION_PLATFORM", "")
+        )
+        authenticated_sender_id = _exact_text(
+            get_session_env("HERMES_SESSION_USER_ID", "")
+        )
+        session_chat_id = _exact_text(
+            get_session_env("HERMES_SESSION_CHAT_ID", "")
+        )
+        session_thread_id = _exact_text(
+            get_session_env("HERMES_SESSION_THREAD_ID", "")
+        )
+        runtime_mode = _exact_text(getattr(agent, "api_mode", ""))
+        sender_id = _exact_text(getattr(agent, "_user_id", ""))
+        model = _exact_text(getattr(agent, "model", ""))
+        allowed_subject_scope = _exact_text_tuple(
+            getattr(agent, "allowed_subject_scope", ())
+        )
+        allowed_domains = _exact_text_tuple(
+            getattr(agent, "allowed_domains", ())
+        )
+        hook_history = []
+        for message in messages:
+            if type(message) is not dict:
+                hook_history.append({"role": "", "content": ""})
+                continue
+            role = message.get("role")
+            content = message.get("content")
+            hook_history.append({
+                "role": role if type(role) is str else "",
+                "content": content if type(content) is str else "",
+            })
         _pre_results = _invoke_hook(
             "pre_llm_call",
             session_id=agent.session_id,
             task_id=effective_task_id,
             turn_id=turn_id,
             user_message=original_user_message,
-            conversation_history=list(messages),
+            conversation_history=hook_history,
             is_first_turn=(not bool(conversation_history)),
-            model=agent.model,
-            platform=getattr(agent, "platform", None) or "",
-            sender_id=getattr(agent, "_user_id", None) or "",
+            model=model,
+            platform=session_platform,
+            sender_id=sender_id,
+            authenticated_sender_id=authenticated_sender_id,
+            active_profile=active_profile,
+            chat_id=session_chat_id,
+            thread_id=session_thread_id,
+            tenant_scope=f"local-profile:{active_profile}",
+            allowed_subject_scope=allowed_subject_scope,
+            allowed_domains=allowed_domains,
+            current_turn_user_idx=current_turn_user_idx,
+            runtime_mode=runtime_mode,
         )
         _ctx_parts: list[str] = []
         for r in _pre_results:
-            if isinstance(r, dict) and r.get("context"):
-                _ctx_parts.append(str(r["context"]))
-            elif isinstance(r, str) and r.strip():
+            if type(r) is dict and type(r.get("context")) is str and r["context"]:
+                _ctx_parts.append(r["context"])
+            elif type(r) is str and r.strip():
                 _ctx_parts.append(r)
         if _ctx_parts:
             plugin_user_context = "\n\n".join(_ctx_parts)
-    except Exception as exc:
-        logger.warning("pre_llm_call hook failed: %s", exc)
+    except Exception:
+        logger.warning("pre_llm_call hook failed")
 
     # Per-turn file-mutation verifier state.
     agent._turn_failed_file_mutations = {}

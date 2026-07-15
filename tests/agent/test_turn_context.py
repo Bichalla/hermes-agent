@@ -14,6 +14,7 @@ from unittest.mock import patch
 import pytest
 
 from agent.turn_context import TurnContext, build_turn_context
+from gateway.session_context import clear_session_vars, set_session_vars
 from tools.workflow_authority import (
     clear_current_turn_user_authority,
     get_current_turn_user_authority,
@@ -46,7 +47,10 @@ class _FakeAgent:
         self.base_url = "https://openrouter.ai/api/v1"
         self.api_key = "sk-x"
         self.api_mode = "chat_completions"
+        self.allowed_subject_scope = ("self", "family")
+        self.allowed_domains = ("health-illness",)
         self.platform = "cli"
+        self._user_id = "legacy-sender"
         self.quiet_mode = True
         self.max_iterations = 90
         self.tools = []
@@ -115,9 +119,11 @@ def _stub_runtime_main():
     it out so the prologue tests stay hermetic.
     """
     clear_current_turn_user_authority()
+    clear_session_vars([])
     with patch("agent.auxiliary_client.set_runtime_main", lambda *a, **k: None):
         yield
     clear_current_turn_user_authority()
+    clear_session_vars([])
 
 
 def _build(agent, **overrides):
@@ -212,6 +218,246 @@ def test_persist_user_message_becomes_original():
     assert ctx.original_user_message == "clean"
     # but the appended user turn carries the full (sanitized) message.
     assert ctx.messages[-1]["content"] == "api-prefixed"
+
+
+def test_pre_llm_hook_receives_profile_and_real_session_authority_contextvars():
+    agent = _FakeAgent()
+    captured = {}
+    tokens = set_session_vars(
+        platform="discord",
+        chat_id="chat-42",
+        thread_id="thread-7",
+        user_id="authenticated-user",
+    )
+
+    def _capture(_hook_name, **kwargs):
+        captured.update(kwargs)
+        return [{"context": "synthetic plugin context"}]
+
+    try:
+        with patch("hermes_cli.profiles.get_active_profile_name", return_value="work"), \
+             patch("hermes_cli.plugins.invoke_hook", side_effect=_capture):
+            ctx = _build(agent)
+    finally:
+        clear_session_vars(tokens)
+
+    assert captured["active_profile"] == "work"
+    assert captured["authenticated_sender_id"] == "authenticated-user"
+    assert captured["platform"] == "discord"
+    assert captured["chat_id"] == "chat-42"
+    assert captured["thread_id"] == "thread-7"
+    assert captured["tenant_scope"] == "local-profile:work"
+    assert captured["current_turn_user_idx"] == ctx.current_turn_user_idx
+    assert captured["runtime_mode"] == "chat_completions"
+    assert captured["allowed_subject_scope"] == ("self", "family")
+    assert captured["allowed_domains"] == ("health-illness",)
+    assert captured["sender_id"] == "legacy-sender"
+    assert ctx.plugin_user_context == "synthetic plugin context"
+
+
+def test_pre_llm_hook_history_is_detached_from_persisted_messages():
+    agent = _FakeAgent()
+    observed = {}
+
+    def _mutate_history(_hook_name, **kwargs):
+        history = kwargs["conversation_history"]
+        observed["history"] = history
+        history[kwargs["current_turn_user_idx"]]["content"] = "mutated"
+        history.append({"role": "user", "content": "injected"})
+        return []
+
+    with patch("hermes_cli.plugins.invoke_hook", side_effect=_mutate_history):
+        ctx = _build(agent, user_message="original user message")
+
+    assert observed["history"][-1]["content"] == "injected"
+    assert len(ctx.messages) == 1
+    assert ctx.messages[0] == {"role": "user", "content": "original user message"}
+
+
+def test_hostile_runtime_subclass_is_rejected_without_private_log(caplog):
+    private_marker = "PRIVATE_RUNTIME_BOOL_MUST_NOT_LEAK"
+
+    class HostileRuntime(str):
+        def __bool__(self):
+            raise RuntimeError(private_marker)
+
+        def __repr__(self):
+            return private_marker
+
+        def __str__(self):
+            raise RuntimeError(private_marker)
+
+    agent = _FakeAgent()
+    agent.api_mode = HostileRuntime("chat_completions")
+    captured = {}
+
+    def _capture(_hook_name, **kwargs):
+        captured.update(kwargs)
+        return []
+
+    with patch("hermes_cli.plugins.invoke_hook", side_effect=_capture):
+        _build(agent)
+
+    assert captured["runtime_mode"] == ""
+    assert private_marker not in caplog.text
+
+
+def test_pre_llm_authority_contextvars_remain_isolated_across_contexts():
+    from contextvars import Context
+
+    first_context = Context()
+    second_context = Context()
+    first_context.run(
+        set_session_vars,
+        platform="discord",
+        chat_id="chat-a",
+        thread_id="thread-a",
+        user_id="user-a",
+    )
+    second_context.run(
+        set_session_vars,
+        platform="telegram",
+        chat_id="chat-b",
+        thread_id="thread-b",
+        user_id="user-b",
+    )
+
+    def _capture(context, profile):
+        captured = {}
+        with patch(
+            "hermes_cli.profiles.get_active_profile_name",
+            return_value=profile,
+        ), patch(
+            "hermes_cli.plugins.invoke_hook",
+            side_effect=lambda _name, **kwargs: captured.update(kwargs) or [],
+        ):
+            context.run(_build, _FakeAgent())
+        return captured
+
+    first = _capture(first_context, "first")
+    second = _capture(second_context, "second")
+    first_again = _capture(first_context, "first")
+
+    assert (
+        first["active_profile"],
+        first["platform"],
+        first["chat_id"],
+        first["thread_id"],
+        first["authenticated_sender_id"],
+        first["tenant_scope"],
+    ) == (
+        "first",
+        "discord",
+        "chat-a",
+        "thread-a",
+        "user-a",
+        "local-profile:first",
+    )
+    assert (
+        second["active_profile"],
+        second["platform"],
+        second["chat_id"],
+        second["thread_id"],
+        second["authenticated_sender_id"],
+        second["tenant_scope"],
+    ) == (
+        "second",
+        "telegram",
+        "chat-b",
+        "thread-b",
+        "user-b",
+        "local-profile:second",
+    )
+    authority_keys = (
+        "active_profile",
+        "platform",
+        "chat_id",
+        "thread_id",
+        "authenticated_sender_id",
+        "tenant_scope",
+        "allowed_subject_scope",
+        "allowed_domains",
+    )
+    assert {key: first_again[key] for key in authority_keys} == {
+        key: first[key] for key in authority_keys
+    }
+    first_context.run(clear_session_vars, [])
+    second_context.run(clear_session_vars, [])
+
+
+def test_default_chat_completions_plugin_context_is_ephemeral_and_appended_exactly():
+    from agent import conversation_loop
+
+    agent = _FakeAgent()
+    tokens = set_session_vars(
+        platform="discord",
+        chat_id="chat-42",
+        thread_id="thread-7",
+        user_id="authenticated-user",
+    )
+    try:
+        with patch("hermes_cli.profiles.get_active_profile_name", return_value="work"), \
+             patch(
+                 "hermes_cli.plugins.invoke_hook",
+                 return_value=[{"context": "synthetic plugin context"}],
+             ):
+            ctx = _build(agent, user_message="original user message")
+    finally:
+        clear_session_vars(tokens)
+
+    persisted_snapshot = [message.copy() for message in ctx.messages]
+
+    class CapturedApiMessages(BaseException):
+        def __init__(self, messages):
+            self.messages = messages
+
+    agent.iteration_budget = types.SimpleNamespace(
+        remaining=1,
+        consume=lambda: True,
+        refund=lambda: None,
+    )
+    agent._budget_grace_call = False
+    agent._checkpoint_mgr = types.SimpleNamespace(new_turn=lambda: None)
+    agent._touch_activity = lambda *_a, **_k: None
+    agent.step_callback = None
+    agent._skill_nudge_interval = 0
+    agent._drain_pending_steer = lambda: None
+    agent._sanitize_tool_call_arguments = lambda *_a, **_k: 0
+    agent._copy_reasoning_content_for_api = lambda *_a, **_k: None
+    agent._should_sanitize_tool_calls = lambda: False
+    agent.ephemeral_system_prompt = ""
+    agent.prefill_messages = []
+    agent._use_prompt_caching = False
+    agent._sanitize_api_messages = lambda messages: messages
+    agent._drop_thinking_only_and_merge_users = lambda messages, **_k: messages
+    agent._has_stream_consumers = lambda: False
+    agent._should_start_quiet_spinner = lambda: False
+    agent.thinking_callback = None
+    agent.verbose_logging = False
+    agent._api_max_retries = 1
+    agent._force_ascii_payload = False
+    agent._reset_stream_delivery_tracking = lambda: None
+    agent._reapply_reasoning_echo_for_provider = lambda _messages: None
+
+    def _capture_api(messages):
+        raise CapturedApiMessages([message.copy() for message in messages])
+
+    agent._build_api_kwargs = _capture_api
+
+    with patch.object(conversation_loop, "build_turn_context", return_value=ctx):
+        with pytest.raises(CapturedApiMessages) as captured:
+            conversation_loop.run_conversation(agent, "ignored by patched prologue")
+
+    api_user = next(
+        message
+        for message in captured.value.messages
+        if message.get("role") == "user"
+    )
+    assert api_user["content"] == (
+        "original user message\n\nsynthetic plugin context"
+    )
+    assert ctx.messages == persisted_snapshot
+    assert ctx.messages[ctx.current_turn_user_idx]["content"] == "original user message"
 
 
 def test_memory_nudge_fires_at_interval():

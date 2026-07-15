@@ -7,12 +7,57 @@ covered by a separate live test gated on `codex --version`.
 
 from __future__ import annotations
 
+from unittest.mock import patch
+
 import pytest
 
+from gateway.session_context import clear_session_vars, set_session_vars
 from hermes_cli.runtime_provider import (
     _VALID_API_MODES,
     _maybe_apply_codex_app_server_runtime,
 )
+from tests.agent.test_turn_context import _FakeAgent, _build
+
+
+def test_codex_runtime_two_turns_never_send_or_retain_plugin_context() -> None:
+    marker = "SYNTHETIC_V3_PLUGIN_CONTEXT_MUST_NOT_REACH_CODEX"
+    seen_runtime_modes = []
+
+    def _codex_fail_closed_hook(_hook_name, **kwargs):
+        seen_runtime_modes.append(kwargs.get("runtime_mode"))
+        if kwargs.get("runtime_mode") == "codex_app_server":
+            return []
+        return [{"context": marker}]
+
+    agent = _FakeAgent()
+    agent.api_mode = "codex_app_server"
+    tokens = set_session_vars(
+        platform="discord",
+        chat_id="chat-42",
+        thread_id="thread-7",
+        user_id="authenticated-user",
+    )
+    try:
+        with patch("hermes_cli.profiles.get_active_profile_name", return_value="work"), \
+             patch("hermes_cli.plugins.invoke_hook", side_effect=_codex_fail_closed_hook):
+            first = _build(agent, user_message="first turn")
+            retained_after_first = [message.copy() for message in first.messages]
+            retained_after_first.append({"role": "assistant", "content": "first answer"})
+            second = _build(
+                agent,
+                user_message="second turn",
+                conversation_history=retained_after_first,
+            )
+    finally:
+        clear_session_vars(tokens)
+
+    assert seen_runtime_modes == ["codex_app_server", "codex_app_server"]
+    assert first.plugin_user_context == ""
+    assert second.plugin_user_context == ""
+    assert marker not in repr(first.messages)
+    assert marker not in repr(retained_after_first)
+    assert marker not in repr(second.messages)
+    assert second.messages[-1] == {"role": "user", "content": "second turn"}
 
 
 class TestApiModeRegistration:

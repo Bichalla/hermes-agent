@@ -801,15 +801,21 @@ def _select_pool_entry(provider: str) -> Tuple[bool, Optional[Any]]:
     """Return (pool_exists_for_provider, selected_entry)."""
     try:
         pool = load_pool(provider)
-    except Exception as exc:
-        logger.debug("Auxiliary client: could not load pool for %s: %s", provider, exc)
+    except Exception:
+        logger.debug(
+            "Auxiliary client: provider=%s category=credential_pool_load_failed",
+            provider,
+        )
         return False, None
     if not pool or not pool.has_credentials():
         return False, None
     try:
         return True, pool.select()
-    except Exception as exc:
-        logger.debug("Auxiliary client: could not select pool entry for %s: %s", provider, exc)
+    except Exception:
+        logger.debug(
+            "Auxiliary client: provider=%s category=credential_pool_select_failed",
+            provider,
+        )
         return True, None
 
 
@@ -817,8 +823,11 @@ def _peek_pool_entry(provider: str) -> Optional[Any]:
     """Best-effort current/next pool entry without mutating selection order."""
     try:
         pool = load_pool(provider)
-    except Exception as exc:
-        logger.debug("Auxiliary client: could not load pool for %s (peek): %s", provider, exc)
+    except Exception:
+        logger.debug(
+            "Auxiliary client: provider=%s category=credential_pool_peek_load_failed",
+            provider,
+        )
         return None
     if not pool or not pool.has_credentials():
         return None
@@ -831,8 +840,11 @@ def _peek_pool_entry(provider: str) -> Optional[Any]:
         peek_fn = getattr(pool, "peek", None)
         if callable(peek_fn):
             return peek_fn()
-    except Exception as exc:
-        logger.debug("Auxiliary client: could not peek pool entry for %s: %s", provider, exc)
+    except Exception:
+        logger.debug(
+            "Auxiliary client: provider=%s category=credential_pool_peek_failed",
+            provider,
+        )
     return None
 
 
@@ -902,6 +914,28 @@ def _nous_min_key_ttl_seconds() -> int:
 # calls to the Codex Responses API so callers don't need any changes.
 
 
+def _closed_provider_error_log_fields(exc: BaseException) -> tuple[str, int | None]:
+    """Normalize provider failures without serializing exception text or identifiers."""
+    name = type(exc).__name__.lower()
+    status = getattr(exc, "status_code", None)
+    status = status if type(status) is int and 100 <= status <= 599 else None
+    if "timeout" in name:
+        category = "provider_timeout"
+    elif "ratelimit" in name or status == 429:
+        category = "provider_rate_limit"
+    elif "authentication" in name or status in {401, 403}:
+        category = "provider_auth"
+    elif "connection" in name:
+        category = "provider_connection"
+    elif status is not None and 400 <= status < 500:
+        category = "provider_http_4xx"
+    elif status is not None and 500 <= status < 600:
+        category = "provider_http_5xx"
+    else:
+        category = "provider_unclassified"
+    return category, status
+
+
 class _CodexCompletionsAdapter:
     """Drop-in shim that accepts chat.completions.create() kwargs and
     routes them through the Codex Responses streaming API."""
@@ -911,6 +945,9 @@ class _CodexCompletionsAdapter:
         self._model = model
 
     def create(self, **kwargs) -> Any:
+        timeout = kwargs.get("timeout")
+        total_timeout = timeout if isinstance(timeout, (int, float)) and timeout > 0 else None
+        deadline = time.monotonic() + float(total_timeout) if total_timeout else None
         messages = kwargs.get("messages", [])
         model = kwargs.get("model", self._model)
 
@@ -964,7 +1001,6 @@ class _CodexCompletionsAdapter:
         # by auxiliary calls such as context compression; if the timeout is not
         # forwarded and enforced, a Codex Responses stream can sit behind a
         # dead-looking CLI until the user force-interrupts the whole session.
-        timeout = kwargs.get("timeout")
         if timeout is not None:
             resp_kwargs["timeout"] = timeout
 
@@ -978,6 +1014,30 @@ class _CodexCompletionsAdapter:
         # same behavior as the main agent's Codex transport.
         extra_body = kwargs.get("extra_body") or {}
         if isinstance(extra_body, dict):
+            response_format = extra_body.get("response_format")
+            if response_format is not None:
+                if (
+                    not isinstance(response_format, dict)
+                    or response_format.get("type") != "json_schema"
+                    or set(response_format) != {"type", "json_schema"}
+                    or not isinstance(response_format.get("json_schema"), dict)
+                ):
+                    raise ValueError("Unsupported Codex auxiliary response_format")
+                json_schema = response_format["json_schema"]
+                if (
+                    set(json_schema) != {"name", "strict", "schema"}
+                    or not isinstance(json_schema.get("name"), str)
+                    or not json_schema["name"]
+                    or json_schema.get("strict") is not True
+                    or not isinstance(json_schema.get("schema"), dict)
+                ):
+                    raise ValueError("Invalid Codex auxiliary json_schema response_format")
+                resp_kwargs["text"] = {
+                    "format": {
+                        "type": "json_schema", "name": json_schema["name"],
+                        "strict": True, "schema": json_schema["schema"],
+                    }
+                }
             reasoning_cfg = extra_body.get("reasoning")
             if isinstance(reasoning_cfg, dict):
                 if reasoning_cfg.get("enabled") is False:
@@ -1074,8 +1134,6 @@ class _CodexCompletionsAdapter:
         text_parts: List[str] = []
         tool_calls_raw: List[Any] = []
         usage = None
-        total_timeout = timeout if isinstance(timeout, (int, float)) and timeout > 0 else None
-        deadline = time.monotonic() + float(total_timeout) if total_timeout else None
         timed_out = threading.Event()
         timeout_timer: Optional[threading.Timer] = None
 
@@ -1089,7 +1147,9 @@ class _CodexCompletionsAdapter:
                 try:
                     close()
                 except Exception:
-                    logger.debug("Codex auxiliary: client close during timeout failed", exc_info=True)
+                    logger.debug(
+                        "Codex auxiliary: category=timeout_client_close_failed"
+                    )
             # The cached auxiliary client wraps this same ``self._client``
             # (or *is* a ``CodexAuxiliaryClient`` whose ``_real_client`` is
             # this instance).  After we close the httpx transport above, the
@@ -1099,7 +1159,9 @@ class _CodexCompletionsAdapter:
             try:
                 _evict_cached_client_instance(self._client)
             except Exception:
-                logger.debug("Codex auxiliary: cache eviction on timeout failed", exc_info=True)
+                logger.debug(
+                    "Codex auxiliary: category=timeout_cache_eviction_failed"
+                )
 
         def _check_cancelled() -> None:
             if deadline is not None and time.monotonic() >= deadline:
@@ -1123,7 +1185,12 @@ class _CodexCompletionsAdapter:
 
         try:
             if total_timeout:
-                timeout_timer = threading.Timer(float(total_timeout), _close_client_on_timeout)
+                assert deadline is not None
+                remaining = max(0.0, deadline - time.monotonic())
+                if remaining == 0.0:
+                    _close_client_on_timeout()
+                    raise TimeoutError(_timeout_message())
+                timeout_timer = threading.Timer(remaining, _close_client_on_timeout)
                 timeout_timer.daemon = True
                 timeout_timer.start()
             _check_cancelled()
@@ -1165,6 +1232,11 @@ class _CodexCompletionsAdapter:
 
             if final is None:
                 raise RuntimeError("Codex auxiliary Responses stream did not return a final response")
+            terminal_status = getattr(final, "status", None)
+            if terminal_status == "failed":
+                raise RuntimeError("Codex auxiliary Responses terminal status failed")
+            if terminal_status == "incomplete":
+                raise RuntimeError("Codex auxiliary Responses terminal status incomplete")
 
             # Extract text and tool calls from the Responses output.
             # Items may be SimpleNamespace (raw-event path) or dicts
@@ -1205,7 +1277,11 @@ class _CodexCompletionsAdapter:
         except Exception as exc:
             if timed_out.is_set():
                 raise TimeoutError(_timeout_message()) from exc
-            logger.debug("Codex auxiliary Responses API call failed: %s", exc)
+            category, status_code = _closed_provider_error_log_fields(exc)
+            logger.debug(
+                "Codex auxiliary Responses API call failed: category=%s status_code=%s",
+                category, status_code,
+            )
             raise
         finally:
             if timeout_timer is not None:
@@ -1227,6 +1303,7 @@ class _CodexCompletionsAdapter:
         return SimpleNamespace(
             choices=[choice],
             model=model,
+            wire_model=getattr(final, "wire_model", None),
             usage=usage,
         )
 
@@ -1912,8 +1989,11 @@ def _read_codex_access_token() -> Optional[str]:
             pass  # Non-JWT token or decode error — use as-is
 
         return access_token.strip()
-    except Exception as exc:
-        logger.debug("Could not read Codex auth for auxiliary client: %s", exc)
+    except Exception:
+        logger.debug(
+            "Auxiliary client: provider=openai-codex "
+            "category=credential_auth_store_read_failed"
+        )
         return None
 
 

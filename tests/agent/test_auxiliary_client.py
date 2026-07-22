@@ -659,6 +659,63 @@ class TestAnthropicOAuthFlag:
         assert mock_build.call_args.args[0] == "sk-ant-oat01-pooled"
 
 
+class TestCredentialPoolDiagnosticRedaction:
+    @pytest.mark.parametrize("operation", ["load", "select", "peek"])
+    def test_pool_failures_never_log_raw_exception_text(self, operation, caplog):
+        import logging
+        import agent.auxiliary_client as aux
+
+        sentinel = "SECRET credential=/private/auth.json req-sensitive-123"
+
+        class _Pool:
+            def has_credentials(self):
+                return True
+
+            def select(self):
+                if operation == "select":
+                    raise RuntimeError(sentinel)
+                return object()
+
+            def current(self):
+                if operation == "peek":
+                    raise RuntimeError(sentinel)
+                return None
+
+        def load(_provider):
+            if operation == "load":
+                raise RuntimeError(sentinel)
+            return _Pool()
+
+        with patch("agent.auxiliary_client.load_pool", side_effect=load):
+            with caplog.at_level(logging.DEBUG, logger="agent.auxiliary_client"):
+                if operation in {"load", "select"}:
+                    aux._select_pool_entry("openai-codex")
+                else:
+                    aux._peek_pool_entry("openai-codex")
+
+        assert "SECRET" not in caplog.text
+        assert "/private/auth.json" not in caplog.text
+        assert "req-sensitive-123" not in caplog.text
+        assert "category=credential_pool_" in caplog.text
+
+    def test_codex_auth_store_failure_never_logs_raw_exception_text(self, caplog):
+        import logging
+        import agent.auxiliary_client as aux
+
+        sentinel = "SECRET credential=/private/auth.json req-sensitive-456"
+        with (
+            patch("agent.auxiliary_client._select_pool_entry", return_value=(False, None)),
+            patch("hermes_cli.auth._read_codex_tokens", side_effect=RuntimeError(sentinel)),
+        ):
+            with caplog.at_level(logging.DEBUG, logger="agent.auxiliary_client"):
+                assert aux._read_codex_access_token() is None
+
+        assert "SECRET" not in caplog.text
+        assert "/private/auth.json" not in caplog.text
+        assert "req-sensitive-456" not in caplog.text
+        assert "category=credential_auth_store_read_failed" in caplog.text
+
+
 class TestBuildCodexClient:
     def test_pool_without_selected_entry_falls_back_to_auth_store(self):
         with (
@@ -4341,7 +4398,7 @@ class TestCodexAdapterPromptCacheKey:
             SimpleNamespace(
                 type="response.completed",
                 response=SimpleNamespace(
-                    status="completed", id="resp_test",
+                    status="completed", id="resp_test", model="gpt-5.5-wire",
                     usage=SimpleNamespace(input_tokens=1, output_tokens=1, total_tokens=2),
                 ),
             ),
@@ -4371,6 +4428,72 @@ class TestCodexAdapterPromptCacheKey:
         ])
         key = captured.get("prompt_cache_key")
         assert isinstance(key, str) and key.startswith("pck_")
+
+    def test_json_schema_response_format_reaches_responses_text_format(self):
+        adapter, captured = self._build_adapter()
+        schema = {
+            "type": "json_schema",
+            "json_schema": {
+                "name": "impact_v3",
+                "strict": True,
+                "schema": {"type": "object", "additionalProperties": False},
+            },
+        }
+        response = adapter.create(
+            messages=[{"role": "user", "content": "synthetic"}],
+            extra_body={"response_format": schema},
+        )
+        assert captured["text"] == {
+            "format": {
+                "type": "json_schema", "name": "impact_v3", "strict": True,
+                "schema": {"type": "object", "additionalProperties": False},
+            }
+        }
+        assert response.wire_model == "gpt-5.5-wire"
+
+    def test_terminal_failed_event_raises_closed_error(self):
+        from agent.auxiliary_client import _CodexCompletionsAdapter
+
+        events = [
+            SimpleNamespace(
+                type="response.failed",
+                response=SimpleNamespace(
+                    status="failed", id="resp_secret_not_propagated", model="gpt-5.5-wire",
+                    usage=None, error=SimpleNamespace(code="provider_secret_code", message="SECRET body"),
+                ),
+            ),
+        ]
+
+        class _FakeCreateStream:
+            def __iter__(self): return iter(events)
+            def close(self): pass
+
+        real_client = MagicMock()
+        real_client.base_url = "https://chatgpt.com/backend-api/codex"
+        real_client.responses.create = lambda **kwargs: _FakeCreateStream()
+        adapter = _CodexCompletionsAdapter(real_client, "gpt-5.5")
+        with pytest.raises(RuntimeError, match="^Codex auxiliary Responses terminal status failed$"):
+            adapter.create(messages=[{"role": "user", "content": "synthetic"}])
+
+    def test_provider_exception_debug_log_is_closed_and_redacted(self, caplog):
+        import logging
+
+        adapter, _ = self._build_adapter()
+
+        class ProviderBadRequest(Exception):
+            status_code = 400
+
+        def _raise(**kwargs):
+            raise ProviderBadRequest("SECRET response body req-sensitive-123")
+
+        adapter._client.responses.create = _raise
+        with caplog.at_level(logging.DEBUG):
+            with pytest.raises(ProviderBadRequest):
+                adapter.create(messages=[{"role": "user", "content": "synthetic"}])
+        assert "SECRET" not in caplog.text
+        assert "req-sensitive-123" not in caplog.text
+        assert "category=provider_http_4xx" in caplog.text
+        assert "status_code=400" in caplog.text
 
     def test_cache_key_stable_across_identical_prefix(self):
         """Same instructions + tools → same key (content-addressed, not per-call)."""
@@ -4440,7 +4563,7 @@ class TestCodexAdapterGithubResponsesMessageIdDrop:
             SimpleNamespace(
                 type="response.completed",
                 response=SimpleNamespace(
-                    status="completed", id="resp_test",
+                    status="completed", id="resp_test", model="gpt-5.5-wire",
                     usage=SimpleNamespace(input_tokens=1, output_tokens=1, total_tokens=2),
                 ),
             ),
@@ -4646,10 +4769,13 @@ class TestCodexAuxiliaryAdapterTimeout:
         assert response.choices[0].message.content == "summary"
 
     def test_enforces_total_timeout_while_stream_keeps_emitting_events(self):
+        emitted = []
+
         class _SlowAliveCreateStream:
             def __iter__(self):
-                for _ in range(5):
+                for index in range(5):
                     time.sleep(0.03)
+                    emitted.append(index)
                     yield SimpleNamespace(type="response.in_progress")
 
             def close(self): pass
@@ -4668,7 +4794,52 @@ class TestCodexAuxiliaryAdapterTimeout:
                 timeout=0.05,
             )
 
-        assert time.monotonic() - started < 0.14
+        elapsed = time.monotonic() - started
+        assert len(emitted) < 5
+        assert elapsed < 0.5
+
+    def test_timeout_client_close_failure_log_is_closed_and_redacted(self, caplog, monkeypatch):
+        import logging
+
+        sentinel = "SECRET credential=/private/auth.json req-timeout-close-123"
+        eviction_sentinel = "SECRET cache=/private/cache.json req-timeout-evict-456"
+
+        class _SlowAliveCreateStream:
+            def __iter__(self):
+                for _ in range(5):
+                    time.sleep(0.03)
+                    yield SimpleNamespace(type="response.in_progress")
+
+            def close(self): pass
+
+        class FakeResponses:
+            def create(self, **kwargs):
+                return _SlowAliveCreateStream()
+
+        def failing_close():
+            raise RuntimeError(sentinel)
+
+        fake_client = SimpleNamespace(responses=FakeResponses(), close=failing_close)
+        monkeypatch.setattr(
+            "agent.auxiliary_client._evict_cached_client_instance",
+            lambda _client: (_ for _ in ()).throw(RuntimeError(eviction_sentinel)),
+        )
+        adapter = _CodexCompletionsAdapter(fake_client, "gpt-5.5")
+        with caplog.at_level(logging.DEBUG, logger="agent.auxiliary_client"):
+            with pytest.raises(TimeoutError):
+                adapter.create(
+                    messages=[{"role": "user", "content": "synthetic"}], timeout=0.05,
+                )
+            log_deadline = time.monotonic() + 0.2
+            while "category=timeout_cache_eviction_failed" not in caplog.text and time.monotonic() < log_deadline:
+                time.sleep(0.005)
+        assert "SECRET" not in caplog.text
+        assert "/private/auth.json" not in caplog.text
+        assert "req-timeout-close-123" not in caplog.text
+        assert "cache=/private/cache.json" not in caplog.text
+        assert "req-timeout-evict-456" not in caplog.text
+        assert "category=timeout_client_close_failed" in caplog.text
+        assert "category=timeout_cache_eviction_failed" in caplog.text
 
 
 class TestCodexAuxiliaryToolMessageConversion:

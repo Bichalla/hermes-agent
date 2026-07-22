@@ -669,6 +669,7 @@ def _consume_codex_event_stream(
     terminal_status: str = "completed"
     terminal_usage: Any = None
     terminal_response_id: str = None
+    terminal_wire_model: str | None = None
     terminal_incomplete_details: Any = None
     terminal_error: Any = None
     saw_terminal = False
@@ -774,6 +775,11 @@ def _consume_codex_event_stream(
                 if rid is None and isinstance(resp_obj, dict):
                     rid = resp_obj.get("id")
                 terminal_response_id = rid
+                wire_model = getattr(resp_obj, "model", None)
+                if wire_model is None and isinstance(resp_obj, dict):
+                    wire_model = resp_obj.get("model")
+                if isinstance(wire_model, str) and wire_model:
+                    terminal_wire_model = wire_model
                 rstatus = getattr(resp_obj, "status", None)
                 if rstatus is None and isinstance(resp_obj, dict):
                     rstatus = resp_obj.get("status")
@@ -832,6 +838,7 @@ def _consume_codex_event_stream(
         status=terminal_status,
         id=terminal_response_id,
         model=model,
+        wire_model=terminal_wire_model,
         incomplete_details=terminal_incomplete_details,
         error=terminal_error,
     )

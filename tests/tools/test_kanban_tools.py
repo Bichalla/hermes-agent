@@ -983,6 +983,7 @@ def test_comment_foreground_exact_retry_returns_same_comment_id(
 ):
     from hermes_cli import kanban_db as kb
     from tools import kanban_tools as kt
+    import tools.workflow_authority as workflow_authority
     from tools.workflow_authority import (
         CurrentTurnUserAuthority,
         bind_active_workflow_turn,
@@ -994,6 +995,11 @@ def test_comment_foreground_exact_retry_returns_same_comment_id(
     )
 
     monkeypatch.delenv("HERMES_KANBAN_TASK", raising=False)
+    monkeypatch.setattr(
+        workflow_authority,
+        "matches_current_workflow_session",
+        lambda _authority: True,
+    )
     with kb.connect() as conn:
         kb.migrate_status_memory_idempotency(conn, dry_run=False)
 
@@ -1171,9 +1177,66 @@ def test_create_happy_path(worker_env):
         conn.close()
 
 
-def test_create_blocked_auto_idempotency_and_evidence(worker_env):
+def test_registered_workflow_exposes_direct_blocked_create(monkeypatch):
+    import toolsets
+    from tools import kanban_tools as kt
+    from tools import registered_local_workflow as registered
+    from tools.registry import invalidate_check_fn_cache, registry
+
+    assert "kanban_create_blocked" in toolsets.TOOLSETS["registered-workflow"]["tools"]
+    assert "kanban_create" not in toolsets.TOOLSETS["registered-workflow"]["tools"]
+    entry = registry.get_entry("kanban_create_blocked")
+    assert entry is not None
+    assert entry.toolset == "registered-workflow"
+    assert entry.handler is kt._handle_registered_blocked_create
+
+    monkeypatch.setattr(registered, "_feature_enabled", lambda: True)
+    invalidate_check_fn_cache()
+    try:
+        definitions = registry.get_definitions({"kanban_create_blocked"}, quiet=True)
+    finally:
+        invalidate_check_fn_cache()
+
+    assert [item["function"]["name"] for item in definitions] == [
+        "kanban_create_blocked"
+    ]
+
+    monkeypatch.setattr(registered, "_feature_enabled", lambda: False)
+    invalidate_check_fn_cache()
+    try:
+        assert registry.get_definitions({"kanban_create_blocked"}, quiet=True) == []
+    finally:
+        invalidate_check_fn_cache()
+
+
+def test_registered_blocked_create_schema_and_handler_are_closed(
+    worker_env, monkeypatch
+):
+    from tools import kanban_tools as kt
+    from tools import registered_local_workflow as registered
+
+    monkeypatch.setattr(registered, "_feature_enabled", lambda: True)
+    params = kt.KANBAN_CREATE_BLOCKED_SCHEMA["parameters"]
+    assert params["additionalProperties"] is False
+    assert "initial_status" not in params["properties"]
+    assert "idempotency_key" not in params["properties"]
+    result = json.loads(
+        kt._handle_registered_blocked_create(
+            {
+                "title": "Must not override status",
+                "assignee": "peer",
+                "initial_status": "running",
+            }
+        )
+    )
+    assert result.get("ok") is not True
+    assert "unsupported field" in result["error"]
+
+
+def test_create_blocked_auto_idempotency_and_evidence(worker_env, monkeypatch):
     from tools import kanban_tools as kt
     from hermes_cli import kanban_db as kb
+    import tools.workflow_authority as workflow_authority
     from tools.workflow_authority import (
         CurrentTurnUserAuthority,
         bind_active_workflow_turn,
@@ -1181,6 +1244,12 @@ def test_create_blocked_auto_idempotency_and_evidence(worker_env):
         clear_current_turn_user_authority,
         fingerprint_user_action,
         reset_current_turn_user_authority,
+    )
+
+    monkeypatch.setattr(
+        workflow_authority,
+        "matches_current_workflow_session",
+        lambda _authority: True,
     )
 
     def authority(message: str, turn_id: str) -> CurrentTurnUserAuthority:
@@ -1244,8 +1313,11 @@ def test_create_blocked_auto_idempotency_and_evidence(worker_env):
     assert task.idempotency_key.startswith("blocked-card:v1:")
 
 
-def test_same_turn_blocked_creates_use_distinct_authorized_target_discriminators(worker_env):
+def test_same_turn_blocked_creates_use_distinct_authorized_target_discriminators(
+    worker_env, monkeypatch
+):
     from tools import kanban_tools as kt
+    import tools.workflow_authority as workflow_authority
     from tools.workflow_authority import (
         CurrentTurnUserAuthority,
         bind_active_workflow_turn,
@@ -1254,6 +1326,12 @@ def test_same_turn_blocked_creates_use_distinct_authorized_target_discriminators
         fingerprint_user_action,
         fingerprint_workflow_target,
         reset_current_turn_user_authority,
+    )
+
+    monkeypatch.setattr(
+        workflow_authority,
+        "matches_current_workflow_session",
+        lambda _authority: True,
     )
 
     authority = CurrentTurnUserAuthority(

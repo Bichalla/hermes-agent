@@ -8,6 +8,7 @@ turn; domain-specific validation and terminal hard guards remain separate.
 from __future__ import annotations
 
 import hashlib
+import hmac
 import re
 import secrets
 import threading
@@ -73,6 +74,14 @@ _NON_COMMAND_TOKENS = (
     "할까요",
     "해도 될까",
 )
+_REPORTED_SPEECH_TOKENS = (
+    "라고 말",
+    "라고 요청",
+    "라고 기록",
+    "라고 설명",
+    "라며 말",
+    "라며 요청",
+)
 
 
 def fingerprint_user_action(user_message: str) -> str:
@@ -113,10 +122,7 @@ def infer_explicit_workflow_scope(
     grant_operations = {operation for operation, _target in grants}
     if "kanban_status_memory_comment" in grant_operations:
         classes.add("status_memory")
-    mentions_card = any(token in normalized for token in ("card", "kanban", "카드"))
-    if _is_affirmative_command(normalized) and mentions_card and any(
-        token in normalized for token in ("create", "make", "생성", "만들")
-    ):
+    if _is_direct_blocked_create_command(normalized):
         classes.add("explicit_blocked_card_create")
 
     pending_ids = tuple(_PENDING_ID_RE.finditer(normalized))
@@ -141,8 +147,11 @@ def _has_negation(normalized: str) -> bool:
 
 
 def _is_affirmative_command(normalized: str) -> bool:
-    if not normalized or _has_negation(normalized) or any(
-        token in normalized for token in _NON_COMMAND_TOKENS
+    if (
+        not normalized
+        or _has_negation(normalized)
+        or any(token in normalized for token in _NON_COMMAND_TOKENS)
+        or any(token in normalized for token in _REPORTED_SPEECH_TOKENS)
     ):
         return False
     english_starts = (
@@ -174,7 +183,11 @@ def _is_affirmative_command(normalized: str) -> bool:
         "업데이트해줘",
         "첨부해",
         "첨부해줘",
+        "만들어",
+        "만들어라",
         "만들어줘",
+        "생성해",
+        "생성해라",
         "생성해줘",
         "삭제",
         "삭제해",
@@ -192,9 +205,49 @@ def _is_affirmative_command(normalized: str) -> bool:
         " please",
         " now",
     )
-    return normalized.startswith(english_starts) or normalized.endswith(
-        korean_or_polite_endings
+    # A direct command often has a short explanatory sentence after it
+    # (for example, "카드 만들어라. 이제 될 거야."). Keep whole-message
+    # negation/question guards above, then accept any imperative clause.
+    clauses = tuple(
+        clause.strip()
+        for clause in re.split(r"[.!?。！？\n]+", normalized)
+        if clause.strip()
     )
+    return any(
+        clause.startswith(english_starts) or clause.endswith(korean_or_polite_endings)
+        for clause in clauses
+    )
+
+
+def _is_direct_blocked_create_command(normalized: str) -> bool:
+    """Recognize a create imperative whose verb belongs to the card clause."""
+    if (
+        not normalized
+        or _has_negation(normalized)
+        or any(token in normalized for token in _NON_COMMAND_TOKENS)
+        or any(token in normalized for token in _REPORTED_SPEECH_TOKENS)
+    ):
+        return False
+    clauses = tuple(
+        clause.strip(" \t\"'“”‘’")
+        for clause in re.split(r"[.!?。！？\n]+", normalized)
+        if clause.strip()
+    )
+    english_card_object = re.compile(
+        r"^(?:please\s+)?(?:create|make|add)\s+"
+        r"(?:(?:a|an|the|one|new|blocked|kanban)\s+)*card\b"
+    )
+    korean_card_object = re.compile(
+        r"카드(?:를|은|는|도|로)?"
+        r"(?:\s+(?:하나(?:만)?|한\s*장|1\s*장|새로|다시|바로|좀|먼저))*\s+"
+        r"(?:만들어|만들어라|만들어줘|만들어주세요|생성해|생성해라|생성해줘|생성해주세요)$"
+    )
+    for clause in clauses:
+        if english_card_object.match(clause):
+            return True
+        if korean_card_object.search(clause):
+            return True
+    return False
 
 
 def infer_explicit_workflow_grants(
@@ -456,6 +509,32 @@ def matches_active_workflow_turn(authority: CurrentTurnUserAuthority) -> bool:
         return False
     with _active_turn_lock:
         return _active_turn_registry.get((expected[1], expected[2])) == expected[0]
+
+
+def matches_current_workflow_session(authority: CurrentTurnUserAuthority) -> bool:
+    """Require authority to match the independently bound host session."""
+    if not matches_active_workflow_turn(authority):
+        return False
+    from gateway.session_context import get_session_env
+
+    platform = get_session_env("HERMES_SESSION_PLATFORM", "").strip().lower()
+    if not platform:
+        return authority.platform_scope.strip().lower() in {"manual", "cli", "tui"}
+    if platform in {
+        "background",
+        "cron",
+        "delegate",
+        "review",
+        "subagent",
+        "webhook",
+    }:
+        return False
+    session_id = get_session_env("HERMES_SESSION_ID", "").strip()
+    if not session_id:
+        return False
+    return hmac.compare_digest(
+        authority.platform_scope.strip().lower(), platform
+    ) and hmac.compare_digest(authority.session_scope, session_id)
 
 
 def opaque_workflow_action_id(

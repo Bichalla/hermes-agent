@@ -285,6 +285,8 @@ def test_registered_workflow_toolset_is_default_off_and_not_in_core():
     assert "registered-workflow" in configurable
     assert "registered-workflow" in _DEFAULT_OFF_TOOLSETS
     assert TOOLSETS["registered-workflow"]["tools"] == [
-        "registered_local_workflow"
+        "registered_local_workflow",
+        "kanban_create_blocked",
     ]
     assert "registered_local_workflow" not in _HERMES_CORE_TOOLS
+    assert "kanban_create_blocked" not in _HERMES_CORE_TOOLS

@@ -329,11 +329,14 @@ def _probe_registered_recorder() -> dict[str, Any]:
 
 
 def _probe_kanban_tools() -> dict[str, Any]:
+    from gateway.session_context import clear_session_vars, set_session_vars
     from hermes_cli import kanban_db as kb
     from tools import kanban_tools
     from tools.workflow_authority import (
         CurrentTurnUserAuthority,
+        bind_active_workflow_turn,
         bind_current_turn_user_authority,
+        clear_current_turn_user_authority,
         fingerprint_user_action,
         fingerprint_workflow_target,
         reset_current_turn_user_authority,
@@ -348,7 +351,18 @@ def _probe_kanban_tools() -> dict[str, Any]:
         user_action_fingerprint=fingerprint_user_action(
             "create one blocked synthetic approval card"
         ),
+        source_event_fingerprint=fingerprint_user_action(
+            "source-event:no-live-blocked-create"
+        ),
         allowed_action_classes=frozenset({"explicit_blocked_card_create"}),
+    )
+    session_tokens = set_session_vars(
+        platform=authority.platform_scope,
+        session_id=authority.session_scope,
+        message_id="no-live-source-event",
+    )
+    bind_active_workflow_turn(
+        authority.turn_id, authority.platform_scope, authority.session_scope
     )
     authority_token = bind_current_turn_user_authority(authority)
     try:
@@ -364,6 +378,10 @@ def _probe_kanban_tools() -> dict[str, Any]:
             }
             with mock.patch.dict(os.environ, env, clear=False):
                 kb.init_db()
+                with kb.connect_closing() as migration_conn:
+                    kb.migrate_status_memory_idempotency(
+                        migration_conn, dry_run=False
+                    )
                 create_args = {
                     "title": "Review synthetic blocked approval card",
                     "assignee": "default",
@@ -372,22 +390,42 @@ def _probe_kanban_tools() -> dict[str, Any]:
                 first = json.loads(kanban_tools._handle_create(dict(create_args)))
                 retry = json.loads(kanban_tools._handle_create(dict(create_args)))
                 reset_current_turn_user_authority(authority_token)
-                authority_token = bind_current_turn_user_authority(
-                    CurrentTurnUserAuthority(
-                        turn_id="opaque-no-live-comment-turn",
-                        source_role="user",
-                        session_scope="no-live",
-                        platform_scope="synthetic",
-                        user_message_index=1,
-                        user_action_fingerprint=fingerprint_user_action(
-                            f"comment on card {first['task_id']}"
-                        ),
-                        allowed_action_classes=frozenset({"status_memory"}),
-                        target_fingerprints=frozenset(
-                            {fingerprint_workflow_target(first["task_id"])}
-                        ),
-                    )
+                authority_token = None
+                clear_current_turn_user_authority()
+                comment_authority = CurrentTurnUserAuthority(
+                    turn_id="opaque-no-live-comment-turn",
+                    source_role="user",
+                    session_scope="no-live",
+                    platform_scope="synthetic",
+                    user_message_index=1,
+                    user_action_fingerprint=fingerprint_user_action(
+                        f"comment on card {first['task_id']}"
+                    ),
+                    source_event_fingerprint=fingerprint_user_action(
+                        "source-event:no-live-comment"
+                    ),
+                    allowed_action_classes=frozenset({"status_memory"}),
+                    allowed_operations=frozenset(
+                        {"kanban_status_memory_comment"}
+                    ),
+                    operation_target_grants=frozenset(
+                        {
+                            (
+                                "kanban_status_memory_comment",
+                                fingerprint_workflow_target(first["task_id"]),
+                            )
+                        }
+                    ),
+                    target_fingerprints=frozenset(
+                        {fingerprint_workflow_target(first["task_id"])}
+                    ),
                 )
+                bind_active_workflow_turn(
+                    comment_authority.turn_id,
+                    comment_authority.platform_scope,
+                    comment_authority.session_scope,
+                )
+                authority_token = bind_current_turn_user_authority(comment_authority)
                 comment = json.loads(
                     kanban_tools._handle_comment(
                         {
@@ -400,7 +438,10 @@ def _probe_kanban_tools() -> dict[str, Any]:
                     count = connection.execute("SELECT count(*) FROM tasks").fetchone()[0]
                     stored = kb.get_task(connection, first["task_id"])
     finally:
-        reset_current_turn_user_authority(authority_token)
+        if authority_token is not None:
+            reset_current_turn_user_authority(authority_token)
+        clear_current_turn_user_authority()
+        clear_session_vars(session_tokens)
 
     create_evidence = first["decision_evidence"]
     comment_evidence = comment["decision_evidence"]

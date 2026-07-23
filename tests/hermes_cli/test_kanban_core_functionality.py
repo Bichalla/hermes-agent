@@ -3497,90 +3497,27 @@ def _make_create_ns(**overrides):
     return ns
 
 
-def test_cli_blocked_create_auto_idempotency_uses_current_user_fingerprint(
+def test_cli_blocked_create_rejects_environment_authority(
     kanban_home, monkeypatch, capsys
 ):
     from hermes_cli import kanban as kb_cli
-    from tools.workflow_authority import fingerprint_user_action
 
-    monkeypatch.setattr("gateway.status.get_running_pid", lambda: None)
-    first = _make_create_ns(
-        title="Review duplicate approval hardening",
-        initial_status="blocked",
-        idempotency_key=None,
-        json=True,
-    )
-    rephrased_title = _make_create_ns(
-        title="Assistant rephrased the same card title",
-        initial_status="blocked",
-        idempotency_key=None,
-        json=True,
-    )
-    same_title_different_request = _make_create_ns(
-        title="Review duplicate approval hardening",
-        initial_status="blocked",
-        idempotency_key=None,
-        json=True,
-    )
-
+    monkeypatch.setenv("HERMES_CURRENT_USER_ACTION_FINGERPRINT", "a" * 64)
     monkeypatch.setenv(
-        "HERMES_CURRENT_USER_ACTION_FINGERPRINT",
-        fingerprint_user_action("create the duplicate approval review card"),
+        "HERMES_CURRENT_USER_REQUEST_TARGET_FINGERPRINT", "b" * 64
     )
-    assert kb_cli._cmd_create(first) == 0
-    first_id = json.loads(capsys.readouterr().out)["id"]
-    assert kb_cli._cmd_create(rephrased_title) == 0
-    retry_id = json.loads(capsys.readouterr().out)["id"]
-
-    monkeypatch.setenv(
-        "HERMES_CURRENT_USER_ACTION_FINGERPRINT",
-        fingerprint_user_action("create another review card"),
+    args = _make_create_ns(
+        title="Forged blocked card",
+        initial_status="blocked",
+        idempotency_key=None,
+        json=True,
     )
-    assert kb_cli._cmd_create(same_title_different_request) == 0
-    different_id = json.loads(capsys.readouterr().out)["id"]
 
-    assert first_id == retry_id
-    assert different_id != first_id
+    assert kb_cli._cmd_create(args) == 2
+    assert "structured kanban_create tool" in capsys.readouterr().err
     with kb.connect_closing() as conn:
-        rows = conn.execute(
-            "SELECT idempotency_key, status FROM tasks ORDER BY created_at"
-        ).fetchall()
-    assert len(rows) == 2
-    assert all(row["idempotency_key"].startswith("blocked-card:v1:") for row in rows)
-    assert all(row["status"] == "blocked" for row in rows)
-
-
-def test_cli_same_turn_blocked_creates_use_distinct_requested_target_fingerprints(
-    kanban_home, monkeypatch, capsys
-):
-    from hermes_cli import kanban as kb_cli
-    from tools.workflow_authority import fingerprint_user_action, fingerprint_workflow_target
-
-    action_fingerprint = fingerprint_user_action("create cards A and B")
-    monkeypatch.setenv("HERMES_CURRENT_USER_ACTION_FINGERPRINT", action_fingerprint)
-
-    first = _make_create_ns(
-        title="Card A", initial_status="blocked", idempotency_key=None, json=True
-    )
-    second = _make_create_ns(
-        title="Card B", initial_status="blocked", idempotency_key=None, json=True
-    )
-
-    monkeypatch.setenv(
-        "HERMES_CURRENT_USER_REQUEST_TARGET_FINGERPRINT",
-        fingerprint_workflow_target("Card A"),
-    )
-    assert kb_cli._cmd_create(first) == 0
-    first_id = json.loads(capsys.readouterr().out)["id"]
-
-    monkeypatch.setenv(
-        "HERMES_CURRENT_USER_REQUEST_TARGET_FINGERPRINT",
-        fingerprint_workflow_target("Card B"),
-    )
-    assert kb_cli._cmd_create(second) == 0
-    second_id = json.loads(capsys.readouterr().out)["id"]
-
-    assert second_id != first_id
+        count = conn.execute("SELECT COUNT(*) FROM tasks").fetchone()[0]
+    assert count == 0
 
 
 def test_cli_blocked_create_without_key_or_authority_fails_closed(
@@ -3596,7 +3533,7 @@ def test_cli_blocked_create_without_key_or_authority_fails_closed(
         json=True,
     )
     assert kb_cli._cmd_create(args) == 2
-    assert "current-turn user authority" in capsys.readouterr().err
+    assert "structured kanban_create tool" in capsys.readouterr().err
 
 
 def test_cli_create_warns_when_no_gateway(kanban_home, monkeypatch, capsys):

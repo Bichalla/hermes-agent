@@ -94,6 +94,16 @@ def _check_kanban_orchestrator_mode() -> bool:
     return _profile_has_kanban_toolset()
 
 
+def _check_registered_blocked_create_mode() -> bool:
+    """Expose the bounded blocked-create alias only when its service is enabled."""
+    try:
+        from tools.registered_local_workflow import _feature_enabled
+
+        return _feature_enabled()
+    except Exception:
+        return False
+
+
 # ---------------------------------------------------------------------------
 # Shared helpers
 # ---------------------------------------------------------------------------
@@ -827,7 +837,7 @@ def _handle_comment(args: dict, **kw) -> str:
     board = args.get("board")
     from tools.workflow_authority import (
         get_current_turn_user_authority,
-        matches_active_workflow_turn,
+        matches_current_workflow_session,
         opaque_workflow_action_id,
     )
 
@@ -838,7 +848,7 @@ def _handle_comment(args: dict, **kw) -> str:
             "kanban_comment: current-turn user authority or worker-task scope required"
         )
     if authority is not None and (
-        not matches_active_workflow_turn(authority)
+        not matches_current_workflow_session(authority)
         or not authority.source_event_fingerprint
         or not authority.allows_operation_target(
             "kanban_status_memory_comment", str(tid)
@@ -984,7 +994,7 @@ def _handle_create(args: dict, **kw) -> str:
         )
         from tools.workflow_authority import (
             get_current_turn_user_authority,
-            matches_active_workflow_turn,
+            matches_current_workflow_session,
             select_blocked_create_target_fingerprint,
         )
 
@@ -993,7 +1003,7 @@ def _handle_create(args: dict, **kw) -> str:
             blocked_authority is None
             or not blocked_authority.user_action_fingerprint
             or not blocked_authority.source_event_fingerprint
-            or not matches_active_workflow_turn(blocked_authority)
+            or not matches_current_workflow_session(blocked_authority)
             or not blocked_authority.allows("explicit_blocked_card_create")
         ):
             return tool_error(
@@ -1120,6 +1130,20 @@ def _handle_create(args: dict, **kw) -> str:
     except Exception as e:
         logger.exception("kanban_create failed")
         return tool_error(f"kanban_create: {e}")
+
+
+def _handle_registered_blocked_create(args: dict, **kw) -> str:
+    """Closed foreground adapter for explicitly-authorized blocked cards."""
+    if not _check_registered_blocked_create_mode():
+        return tool_error("kanban_create_blocked: registered route unavailable")
+    allowed = frozenset({"title", "assignee", "body", "tenant", "priority", "board"})
+    unknown = set(args) - allowed
+    if unknown:
+        return tool_error(
+            "kanban_create_blocked: unsupported field(s): "
+            + ", ".join(sorted(str(name) for name in unknown))
+        )
+    return _handle_create({**args, "initial_status": "blocked"}, **kw)
 
 
 def _maybe_auto_subscribe(conn: Any, task_id: str) -> bool:
@@ -1726,6 +1750,28 @@ KANBAN_CREATE_SCHEMA = {
     },
 }
 
+KANBAN_CREATE_BLOCKED_SCHEMA = {
+    "name": "kanban_create_blocked",
+    "description": (
+        "Create one blocked Kanban card from the accepted current user turn. "
+        "This bounded route never dispatches work and derives its idempotency "
+        "key from trusted foreground authority."
+    ),
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "title": {"type": "string", "description": "User-authorized card title."},
+            "assignee": {"type": "string", "description": "Profile owner for the blocked card."},
+            "body": {"type": "string", "description": "Optional opening context."},
+            "tenant": {"type": "string", "description": "Optional tenant namespace."},
+            "priority": {"type": "integer", "description": "Optional priority tiebreaker."},
+            "board": _board_schema_prop(),
+        },
+        "required": ["title", "assignee"],
+        "additionalProperties": False,
+    },
+}
+
 KANBAN_UNBLOCK_SCHEMA = {
     "name": "kanban_unblock",
     "description": (
@@ -1830,6 +1876,15 @@ registry.register(
     handler=_handle_create,
     check_fn=_check_kanban_mode,
     emoji="➕",
+)
+
+registry.register(
+    name="kanban_create_blocked",
+    toolset="registered-workflow",
+    schema=KANBAN_CREATE_BLOCKED_SCHEMA,
+    handler=_handle_registered_blocked_create,
+    check_fn=_check_registered_blocked_create_mode,
+    emoji="⊘",
 )
 
 registry.register(

@@ -158,6 +158,28 @@ def test_scope_inference_is_action_and_explicit_card_target_specific():
     assert unrelated_targets == frozenset()
 
 
+def test_blocked_create_accepts_imperative_clause_before_trailing_context():
+    classes, targets = infer_explicit_workflow_scope(
+        "다시 1번 카드 만들어라. 이제 될 거야."
+    )
+    assert classes == frozenset({"explicit_blocked_card_create"})
+    assert targets == frozenset()
+
+
+@pytest.mark.parametrize(
+    "message",
+    [
+        "Create a blocked Kanban card.",
+        "Please add a new card.",
+        "Writing Plan 개선 카드 하나 만들어줘.",
+        "이걸 카드로 만들어줘.",
+    ],
+)
+def test_blocked_create_requires_card_as_direct_create_object(message):
+    classes, _targets = infer_explicit_workflow_scope(message)
+    assert "explicit_blocked_card_create" in classes
+
+
 @pytest.mark.parametrize(
     "message,operation",
     [
@@ -204,6 +226,17 @@ def test_ambiguous_or_targetless_pending_language_mints_no_operation():
         "Record that I did not eat this meal",
         "kp_0123456789abcdef 삭제 안 해줘",
         "t_deadbeef와 t_cafebabe 카드에 댓글을 기록해줘",
+        "1번 카드 만들지 마.",
+        "1번 카드를 만들면 될 거야.",
+        "1번 카드 만들어라?",
+        "카드 만드는 방법을 설명해줘.",
+        "그는 1번 카드 만들어라. 이제 될 거야라고 말했다.",
+        "사용자가 '카드 만들어라'라고 요청했다고 기록해줘.",
+        "사용자가 '카드 만들어라'고 말했다고 기록해줘.",
+        "사용자가 카드 만들어달라고 했다고 기록해줘.",
+        "Add a comment saying create a card.",
+        "Create a note saying add a card.",
+        "카드에 댓글을 기록하고 문서를 만들어줘.",
     ],
 )
 def test_non_commands_and_multi_target_text_mint_no_grants(message):

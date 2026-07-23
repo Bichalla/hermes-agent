@@ -5,12 +5,14 @@ Covers the fix for slash commands not being recognized when sent via
 """
 
 import asyncio
+import json
 from types import SimpleNamespace
-from unittest.mock import AsyncMock
+from unittest.mock import AsyncMock, patch
 
 import pytest
 
 from tests.e2e.conftest import (
+    _make_discord_adapter_wired,
     BOT_USER_ID,
     E2E_MESSAGE_SETTLE_DELAY,
     get_response_text,
@@ -25,6 +27,106 @@ pytestmark = pytest.mark.asyncio
 async def dispatch(adapter, msg):
     await adapter._handle_message(msg)
     await asyncio.sleep(E2E_MESSAGE_SETTLE_DELAY)
+
+
+async def test_discord_ingress_reaches_registered_blocked_create_no_live(
+    tmp_path, monkeypatch
+):
+    """Real Discord adapter ingress binds one turn and reaches the registry alias."""
+    import run_agent
+    from gateway.run import GatewayRunner
+    from gateway.session import build_session_context
+    from tests.agent.test_turn_context import _FakeAgent, _build
+    from tools.workflow_authority import clear_current_turn_user_authority
+
+    hermes_home = tmp_path / "hermes-home"
+    hermes_home.mkdir()
+    monkeypatch.setenv("HERMES_HOME", str(hermes_home))
+    monkeypatch.setenv("HOME", str(tmp_path))
+    monkeypatch.setenv("HERMES_PROFILE", "test-profile")
+    for name in (
+        "HERMES_KANBAN_DB",
+        "HERMES_KANBAN_BOARD",
+        "HERMES_KANBAN_WORKSPACES_ROOT",
+        "HERMES_CURRENT_USER_ACTION_FINGERPRINT",
+        "HERMES_CURRENT_USER_REQUEST_TARGET_FINGERPRINT",
+    ):
+        monkeypatch.delenv(name, raising=False)
+
+    from hermes_cli import kanban_db as kb
+    from tools import registered_local_workflow as registered
+
+    monkeypatch.setattr(registered, "_feature_enabled", lambda: True)
+    adapter, runner = _make_discord_adapter_wired()
+    cached_agent = _FakeAgent()
+    cached_agent.platform = "discord"
+    cached_agent.session_id = (
+        runner.session_store.get_or_create_session.return_value.session_id
+    )
+    observed: dict[str, dict] = {}
+
+    async def _run_registered_create(event, source, _session_key, _generation):
+        session_entry = runner.session_store.get_or_create_session.return_value
+        context = build_session_context(source, runner.config, session_entry)
+        session_tokens = GatewayRunner._set_session_env(runner, context)
+        try:
+            with patch("agent.auxiliary_client.set_runtime_main", lambda *a, **k: None):
+                _build(
+                    cached_agent,
+                    user_message=event.text,
+                    task_id="discord-authority-registered-e2e",
+                )
+            result = json.loads(
+                run_agent.handle_function_call(
+                    "kanban_create_blocked",
+                    {"title": "Writing Plan first improvement", "assignee": "peer"},
+                    "discord-authority-registered-e2e",
+                    session_id=session_entry.session_id,
+                    enabled_tools=["kanban_create_blocked"],
+                )
+            )
+            observed["result"] = result
+            return result
+        finally:
+            clear_current_turn_user_authority()
+            GatewayRunner._clear_session_env(runner, session_tokens)
+
+    runner._handle_message_with_agent = _run_registered_create
+    original_message_handler = adapter._message_handler
+    assert original_message_handler is not None
+
+    async def _capture_ingress_failure(event):
+        try:
+            return await original_message_handler(event)
+        except Exception as exc:
+            observed["ingress_error"] = {"type": type(exc).__name__, "message": str(exc)}
+            raise
+
+    adapter.set_message_handler(_capture_ingress_failure)
+    msg = make_discord_message(
+        content=f"<@{BOT_USER_ID}> 다시 1번 카드 만들어라. 이제 될 거야.",
+        channel=make_fake_thread(),
+        mentions=[adapter._client.user],
+        message_id=812345,
+    )
+    await dispatch(adapter, msg)
+    for _ in range(40):
+        if "result" in observed or "ingress_error" in observed:
+            break
+        await asyncio.sleep(0.05)
+
+    assert "result" in observed, observed
+    result = observed["result"]
+    assert result["ok"] is True, result
+    db_path = kb.kanban_db_path().resolve()
+    assert db_path.is_relative_to(hermes_home.resolve())
+    with kb.connect_closing() as conn:
+        task = kb.get_task(conn, result["task_id"])
+        count = conn.execute("SELECT COUNT(*) FROM tasks").fetchone()[0]
+    assert count == 1
+    assert task is not None
+    assert task.title == "Writing Plan first improvement"
+    assert task.status == "blocked"
 
 
 class TestMentionStrippedCommandDispatch:

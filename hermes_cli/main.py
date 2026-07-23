@@ -13020,7 +13020,17 @@ def cmd_claw(args):
     claw_command(args)
 
 
-def main():
+def _normalize_cli_exit_code(result) -> int:
+    """Map command-handler results to a process exit code.
+
+    Only an exact ``int`` is authoritative. ``bool`` is deliberately not:
+    although it subclasses ``int``, legacy handlers returning True/False did
+    not previously control the process status.
+    """
+    return result if type(result) is int else 0
+
+
+def main() -> int:
     """Main entry point for hermes CLI."""
     # Cosmetic: make the process show up as 'hermes' instead of 'python3.11'
     # in ps/top/htop.  Non-fatal — just a nicer UX.
@@ -13058,9 +13068,9 @@ def main():
         pass
 
     if _try_termux_fast_tui_launch():
-        return
+        return 0
     if _try_termux_fast_cli_launch():
-        return
+        return 0
 
     from hermes_cli._parser import build_top_level_parser
 
@@ -14927,7 +14937,7 @@ def main():
     # Handle --version flag
     if args.version:
         cmd_version(args)
-        return
+        return 0
 
     # --yolo: set HERMES_YOLO_MODE *before* plugin discovery.  The call to
     # _prepare_agent_startup() below triggers discover_plugins() → tool
@@ -14974,7 +14984,7 @@ def main():
             if not hasattr(args, attr):
                 setattr(args, attr, default)
         cmd_chat(args)
-        return
+        return 0
 
     # Default to chat if no command specified
     if args.command is None:
@@ -14991,14 +15001,15 @@ def main():
             if not hasattr(args, attr):
                 setattr(args, attr, default)
         cmd_chat(args)
-        return
+        return 0
 
     # Execute the command
     if hasattr(args, "func"):
-        args.func(args)
+        return _normalize_cli_exit_code(args.func(args))
     else:
         parser.print_help()
+        return 0
 
 
 if __name__ == "__main__":
-    main()
+    raise SystemExit(main())

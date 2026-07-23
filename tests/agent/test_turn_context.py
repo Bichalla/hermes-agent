@@ -226,6 +226,75 @@ def test_foreground_user_turn_binds_hidden_authority_without_message_text():
     assert "synthetic private content" not in repr(authority)
 
 
+def test_foreground_card_imperative_with_trailing_context_binds_create_authority(
+    tmp_path, monkeypatch
+):
+    import json
+
+    home = tmp_path / ".hermes"
+    home.mkdir()
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    monkeypatch.setenv("HERMES_PROFILE", "test-profile")
+    agent = _FakeAgent()
+    agent.platform = "discord"
+    tokens = set_session_vars(
+        platform="discord",
+        chat_id="chat-42",
+        thread_id="thread-7",
+        user_id="user-9",
+        session_id=agent.session_id,
+        message_id="message-123",
+    )
+    try:
+        _build(agent, user_message="다시 1번 카드 만들어라. 이제 될 거야.")
+        authority = get_current_turn_user_authority()
+        assert authority is not None
+        assert authority.allows("explicit_blocked_card_create") is True
+        assert authority.source_event_fingerprint
+
+        from hermes_cli import kanban_db as kb
+        from tools import kanban_tools as kt
+
+        kb._INITIALIZED_PATHS.clear()
+        result = json.loads(
+            kt._handle_create(
+                {
+                    "title": "Writing Plan first improvement",
+                    "assignee": "default",
+                    "initial_status": "blocked",
+                }
+            )
+        )
+        assert result["ok"] is True
+        assert result["status"] == "blocked"
+        with kb.connect_closing() as conn:
+            task = kb.get_task(conn, result["task_id"])
+        assert task is not None
+        assert task.status == "blocked"
+
+        set_session_vars(
+            platform="discord",
+            chat_id="chat-42",
+            thread_id="thread-7",
+            user_id="user-9",
+            session_id="different-cached-session",
+            message_id="message-123",
+        )
+        mismatched = json.loads(
+            kt._handle_create(
+                {
+                    "title": "Writing Plan first improvement",
+                    "assignee": "default",
+                    "initial_status": "blocked",
+                }
+            )
+        )
+        assert mismatched.get("ok") is not True
+        assert "did not authorize" in mismatched["error"]
+    finally:
+        clear_session_vars(tokens)
+
+
 def test_background_review_turn_clears_and_does_not_bind_authority():
     foreground = _FakeAgent()
     _build(foreground)

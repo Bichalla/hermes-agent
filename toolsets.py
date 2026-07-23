@@ -262,7 +262,7 @@ TOOLSETS = {
             "Default-off registered local workflows. Visibility and direct dispatch "
             "also require registered_workflow.enabled and owner/schema readiness."
         ),
-        "tools": ["registered_local_workflow"],
+        "tools": ["registered_local_workflow", "kanban_create_blocked"],
         "includes": [],
     },
 

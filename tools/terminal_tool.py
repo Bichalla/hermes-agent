@@ -2038,7 +2038,12 @@ def _resolve_notification_flag_conflict(
 
 
 def _command_with_current_turn_fingerprint(command: str) -> str:
-    """Inject hidden user-action provenance into a child command only."""
+    """Reject literal reserved/owner routes; never inject authority into shell.
+
+    Blocked-card creation uses the in-process structured ``kanban_create`` tool.
+    A shell command is not an authority boundary because shell syntax can
+    synthesize variable names that are absent from the raw command text.
+    """
     normalized_command = command.casefold()
     owner_only_tokens = (
         "review_ledger",
@@ -2055,48 +2060,7 @@ def _command_with_current_turn_fingerprint(command: str) -> str:
     )
     if any(name in command for name in reserved_names):
         raise ValueError("reserved workflow-authority environment variable in command")
-    from tools.workflow_authority import (
-        get_current_turn_user_authority,
-        select_blocked_create_target_fingerprint,
-    )
-
-    authority = get_current_turn_user_authority()
-    if authority is None or not authority.user_action_fingerprint:
-        return command
-    normalized = command.casefold()
-    blocked_create = (
-        "hermes kanban" in normalized
-        and " create" in normalized
-        and "--initial-status blocked" in normalized
-        and authority.allows("explicit_blocked_card_create")
-    )
-    if not blocked_create:
-        return command
-    assignments = [
-        "HERMES_CURRENT_USER_ACTION_FINGERPRINT="
-        + shlex.quote(authority.user_action_fingerprint)
-    ]
-    if blocked_create:
-        try:
-            tokens = shlex.split(command)
-            create_index = next(
-                index for index, token in enumerate(tokens) if token.casefold() == "create"
-            )
-            proposed_title = tokens[create_index + 1]
-            if proposed_title.startswith("-"):
-                raise ValueError("blocked-card title is not directly identifiable")
-            target_fingerprint = select_blocked_create_target_fingerprint(
-                authority, proposed_title
-            )
-        except (ValueError, IndexError, StopIteration):
-            if len(authority.blocked_create_target_fingerprints) > 1:
-                return command
-            target_fingerprint = select_blocked_create_target_fingerprint(authority, "card")
-        assignments.append(
-            "HERMES_CURRENT_USER_REQUEST_TARGET_FINGERPRINT="
-            + shlex.quote(target_fingerprint)
-        )
-    return f"{' '.join(assignments)} {command}"
+    return command
 
 
 def _resolve_command_cwd(
@@ -2173,6 +2137,22 @@ def terminal_tool(
                 "exit_code": -1,
                 "error": f"Invalid command: expected string, got {type(command).__name__}",
                 "status": "error",
+            }, ensure_ascii=False)
+
+        # Validate and transform the model-supplied command before *any*
+        # config lookup, task override, environment cache access, lock, or
+        # sandbox creation. Reserved authority names and registered-owner
+        # routes are host-controlled and fail closed without reflecting the
+        # rejected command or authority material.
+        try:
+            execution_command = _command_with_current_turn_fingerprint(command)
+        except ValueError:
+            logger.warning("Blocked invalid terminal command before environment lookup")
+            return json.dumps({
+                "output": "",
+                "exit_code": -1,
+                "error": "Blocked: invalid terminal command",
+                "status": "blocked",
             }, ensure_ascii=False)
 
         # Get configuration
@@ -2474,8 +2454,6 @@ def terminal_tool(
         from tools.approval import get_current_session_key
 
         session_key = get_current_session_key(default="") or (task_id or "")
-
-        execution_command = _command_with_current_turn_fingerprint(command)
 
         if background:
             # Spawn a tracked background process via the process registry.

@@ -1364,51 +1364,18 @@ def _cmd_create(args: argparse.Namespace) -> int:
 
     initial_status = getattr(args, "initial_status", "running")
     idempotency_key = getattr(args, "idempotency_key", None)
-    user_action_fingerprint = os.environ.get(
-        "HERMES_CURRENT_USER_ACTION_FINGERPRINT", ""
-    )
-    requested_target_fingerprint = os.environ.get(
-        "HERMES_CURRENT_USER_REQUEST_TARGET_FINGERPRINT", ""
-    )
     if initial_status == "blocked":
-        if not user_action_fingerprint:
-            print(
-                "kanban: blocked creation requires current-turn user authority",
-                file=sys.stderr,
-            )
-            return 2
-        from agent.workflow_action_policy import (  # pyright: ignore[reportMissingImports]
-            build_blocked_card_idempotency_key_from_fingerprint,
+        # A shell child can synthesize arbitrary environment-variable names
+        # (quotes, expansion, command substitution), so no environment value
+        # can prove current-turn authority here. Agent-originated blocked-card
+        # creation must stay in-process through the structured tool, where the
+        # trusted CurrentTurnUserAuthority ContextVar is checked directly.
+        print(
+            "kanban: blocked creation is available only through the structured "
+            "kanban_create tool with current-turn user authority",
+            file=sys.stderr,
         )
-
-        if requested_target_fingerprint and not re.fullmatch(
-            r"[a-f0-9]{64}", requested_target_fingerprint
-        ):
-            print(
-                "kanban: invalid current-turn requested target fingerprint",
-                file=sys.stderr,
-            )
-            return 2
-        target_scope = "|".join(
-            (
-                f"tenant:{args.tenant or 'default'}",
-                f"project:{getattr(args, 'project', None) or 'none'}",
-                f"assignee:{args.assignee or 'none'}",
-                f"requested-target:{requested_target_fingerprint or user_action_fingerprint}",
-            )
-        )
-        expected_key = build_blocked_card_idempotency_key_from_fingerprint(
-            board=kb.get_current_board(),
-            user_action_fingerprint=user_action_fingerprint,
-            target_scope=target_scope,
-        )
-        if idempotency_key and idempotency_key != expected_key:
-            print(
-                "kanban: --idempotency-key does not match current user action",
-                file=sys.stderr,
-            )
-            return 2
-        idempotency_key = expected_key
+        return 2
 
     with kb.connect_closing() as conn:
         task_id = kb.create_task(

@@ -256,6 +256,27 @@ def test_check_fn_requires_false_by_default_flag_and_pending_readiness(monkeypat
     assert tool.check_registered_workflow_requirements() is True
 
 
+def test_registry_dispatch_accepts_injected_task_context(monkeypatch):
+    import tools.registered_local_workflow as tool
+    from tools.registry import registry
+
+    monkeypatch.setattr(
+        tool,
+        "registered_local_workflow",
+        lambda **_kwargs: {"decision": "allow", "prompt_count": 0, "write_count": 0},
+    )
+    raw = registry.dispatch(
+        "registered_local_workflow",
+        {"action": "pending_read", "pending_id": "kp_0123456789abcdef"},
+        task_id="runtime-injected-task",
+    )
+    assert isinstance(raw, str)
+    result = json.loads(raw)
+    assert result["decision"] == "allow"
+    assert result["prompt_count"] == 0
+    assert result["write_count"] == 0
+
+
 def test_registered_workflow_toolset_is_default_off_and_not_in_core():
     from hermes_cli.tools_config import CONFIGURABLE_TOOLSETS, _DEFAULT_OFF_TOOLSETS
     from toolsets import TOOLSETS, _HERMES_CORE_TOOLS

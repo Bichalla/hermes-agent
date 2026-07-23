@@ -290,7 +290,7 @@ def registered_local_workflow(action: str, **kwargs: Any) -> dict[str, Any]:
         return _result(CapabilityDecision.DENY_OWNER_UNAVAILABLE)
 
 
-def _handle_registered_local_workflow(args: Any) -> str:
+def _handle_registered_local_workflow(args: Any, **_context: Any) -> str:
     if type(args) is not dict:
         return json.dumps(_result(CapabilityDecision.DENY_SCHEMA_INVALID), sort_keys=True)
     try:

@@ -137,6 +137,29 @@ KNOWN_TOOLSET_NAMES = frozenset(name.casefold() for name in get_toolset_names())
 _IS_WINDOWS = sys.platform == "win32"
 KANBAN_ATTACHMENT_MAX_BYTES = 25 * 1024 * 1024
 
+# This capability is intentionally NOT part of ``SCHEMA_SQL`` or the ordinary
+# additive migration pass. Existing boards keep append-only comment semantics
+# until an operator explicitly enables exact-retry protection with
+# ``python -m hermes_cli.kanban_capability_migrate``.
+STATUS_MEMORY_IDEMPOTENCY_TABLE = "kanban_status_memory_idempotency"
+_STATUS_MEMORY_IDEMPOTENCY_COLUMNS = (
+    "idempotency_key",
+    "board",
+    "task_id",
+    "author",
+    "body_digest",
+    "comment_id",
+    "created_at",
+)
+
+
+class StatusMemoryCapabilityError(RuntimeError):
+    """The explicit status-memory capability is present but malformed."""
+
+
+class StatusMemoryIdempotencyConflict(ValueError):
+    """An idempotency key was replayed with a different immutable scope."""
+
 
 def _fire_kanban_lifecycle_hook(event: str, task_id: str, **fields: Any) -> None:
     """Fire a kanban lifecycle plugin hook, fully best-effort.
@@ -2537,11 +2560,9 @@ def create_task(
             )
         skills_list = cleaned
 
-    # Idempotency check — return the existing task instead of creating a
-    # duplicate. Done BEFORE entering write_txn to keep the fast path fast
-    # and to avoid holding a write lock during the lookup. Race is
-    # acceptable: two concurrent creators with the same key might both
-    # insert, at which point both rows exist but the next lookup stabilises.
+    # Fast-path read avoids a write lock for ordinary exact retries. The same
+    # lookup is repeated under ``write_txn`` below; correctness does not depend
+    # on this optimistic read.
     if idempotency_key:
         row = conn.execute(
             "SELECT id FROM tasks WHERE idempotency_key = ? "
@@ -2579,6 +2600,15 @@ def create_task(
         task_id = _new_task_id()
         try:
             with write_txn(conn):
+                if idempotency_key:
+                    existing = conn.execute(
+                        "SELECT id FROM tasks WHERE idempotency_key = ? "
+                        "AND status != 'archived' "
+                        "ORDER BY created_at DESC LIMIT 1",
+                        (idempotency_key,),
+                    ).fetchone()
+                    if existing:
+                        return existing["id"]
                 # Determine task status from parent status, unless the caller
                 # parks it directly in blocked for human-ops review or in
                 # triage for a specifier.
@@ -2931,15 +2961,191 @@ def parent_results(conn: sqlite3.Connection, task_id: str) -> list[tuple[str, Op
 # Comments & events
 # ---------------------------------------------------------------------------
 
+def _status_memory_idempotency_state(conn: sqlite3.Connection) -> str:
+    """Return ``absent`` or ``ready``; reject partial/foreign table shapes."""
+    row = conn.execute(
+        "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = ?",
+        (STATUS_MEMORY_IDEMPOTENCY_TABLE,),
+    ).fetchone()
+    if row is None:
+        return "absent"
+
+    info = conn.execute(
+        f"PRAGMA table_info({STATUS_MEMORY_IDEMPOTENCY_TABLE})"
+    ).fetchall()
+    columns = tuple(column["name"] for column in info)
+    shape = tuple(
+        (
+            column["name"],
+            (column["type"] or "").upper(),
+            int(column["notnull"] or 0),
+            int(column["pk"] or 0),
+        )
+        for column in info
+    )
+    expected_shape = (
+        ("idempotency_key", "TEXT", 0, 1),
+        ("board", "TEXT", 1, 0),
+        ("task_id", "TEXT", 1, 0),
+        ("author", "TEXT", 1, 0),
+        ("body_digest", "TEXT", 1, 0),
+        ("comment_id", "INTEGER", 1, 0),
+        ("created_at", "INTEGER", 1, 0),
+    )
+    primary_key = tuple(
+        column["name"]
+        for column in sorted(info, key=lambda item: int(item["pk"] or 0))
+        if int(column["pk"] or 0) > 0
+    )
+    unique_comment_id = False
+    for index in conn.execute(
+        f"PRAGMA index_list({STATUS_MEMORY_IDEMPOTENCY_TABLE})"
+    ).fetchall():
+        if not int(index["unique"] or 0):
+            continue
+        indexed_columns = tuple(
+            item["name"]
+            for item in conn.execute(
+                f"PRAGMA index_info({index['name']})"
+            ).fetchall()
+        )
+        if indexed_columns == ("comment_id",):
+            unique_comment_id = True
+            break
+    foreign_keys = conn.execute(
+        f"PRAGMA foreign_key_list({STATUS_MEMORY_IDEMPOTENCY_TABLE})"
+    ).fetchall()
+    comment_foreign_key = any(
+        foreign_key["table"] == "task_comments"
+        and foreign_key["from"] == "comment_id"
+        and foreign_key["to"] == "id"
+        and (foreign_key["on_delete"] or "").upper() == "CASCADE"
+        for foreign_key in foreign_keys
+    )
+    if (
+        columns != _STATUS_MEMORY_IDEMPOTENCY_COLUMNS
+        or shape != expected_shape
+        or primary_key != ("idempotency_key",)
+        or not unique_comment_id
+        or not comment_foreign_key
+    ):
+        raise StatusMemoryCapabilityError(
+            "status-memory idempotency capability has an unexpected schema"
+        )
+    return "ready"
+
+
+def migrate_status_memory_idempotency(
+    conn: sqlite3.Connection, *, dry_run: bool
+) -> dict[str, bool]:
+    """Preview or explicitly install exact-retry status-memory support.
+
+    Ordinary :func:`connect` and :func:`init_db` never call this function.
+    Keeping the migration separate lets existing boards retain their legacy
+    append-on-every-call behavior until an operator names the exact DB path.
+    """
+    if not isinstance(dry_run, bool):
+        raise TypeError("dry_run must be a boolean")
+    with write_txn(conn):
+        for required_table in ("tasks", "task_comments"):
+            if conn.execute(
+                "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?",
+                (required_table,),
+            ).fetchone() is None:
+                raise StatusMemoryCapabilityError(
+                    f"not a supported Kanban DB: missing {required_table} table"
+                )
+        migrated_before = _status_memory_idempotency_state(conn) == "ready"
+        changed = False
+        if not dry_run and not migrated_before:
+            conn.execute(
+                f"CREATE TABLE {STATUS_MEMORY_IDEMPOTENCY_TABLE} ("
+                " idempotency_key TEXT PRIMARY KEY,"
+                " board TEXT NOT NULL,"
+                " task_id TEXT NOT NULL,"
+                " author TEXT NOT NULL,"
+                " body_digest TEXT NOT NULL,"
+                " comment_id INTEGER NOT NULL UNIQUE "
+                "REFERENCES task_comments(id) ON DELETE CASCADE,"
+                " created_at INTEGER NOT NULL)"
+            )
+            changed = True
+        migrated_after = _status_memory_idempotency_state(conn) == "ready"
+        if not dry_run and not migrated_after:
+            raise StatusMemoryCapabilityError(
+                "status-memory migration readback failed"
+            )
+    return {
+        "migrated_before": migrated_before,
+        "migrated_after": migrated_after,
+        "exact_schema_ready": migrated_after,
+        "would_change": not migrated_before,
+        "changed": changed,
+    }
+
+
 def add_comment(
-    conn: sqlite3.Connection, task_id: str, author: str, body: str
+    conn: sqlite3.Connection,
+    task_id: str,
+    author: str,
+    body: str,
+    *,
+    board: Optional[str] = None,
+    idempotency_key: Optional[str] = None,
 ) -> int:
     if not body or not body.strip():
         raise ValueError("comment body is required")
     if not author or not author.strip():
         raise ValueError("comment author is required")
+    author_text = author.strip()
+    body_text = body.strip()
+    board_text = (board or DEFAULT_BOARD).strip().lower()
+    key_text = idempotency_key.strip() if idempotency_key is not None else None
+    if key_text == "":
+        raise ValueError("comment idempotency_key must be non-empty when provided")
+    if key_text is not None and len(key_text) > 255:
+        raise ValueError("comment idempotency_key is too long")
+    body_digest = hashlib.sha256(body_text.encode("utf-8")).hexdigest()
     now = int(time.time())
     with write_txn(conn):
+        capability_state = (
+            _status_memory_idempotency_state(conn) if key_text is not None else "absent"
+        )
+        if key_text is not None and capability_state == "ready":
+            replay = conn.execute(
+                f"SELECT board, task_id, author, body_digest, comment_id "
+                f"FROM {STATUS_MEMORY_IDEMPOTENCY_TABLE} "
+                "WHERE idempotency_key = ?",
+                (key_text,),
+            ).fetchone()
+            if replay is not None:
+                expected = (board_text, task_id, author_text, body_digest)
+                observed = (
+                    replay["board"],
+                    replay["task_id"],
+                    replay["author"],
+                    replay["body_digest"],
+                )
+                if observed != expected:
+                    raise StatusMemoryIdempotencyConflict(
+                        "comment idempotency key conflicts with board/task/author/body"
+                    )
+                comment_id = int(replay["comment_id"])
+                existing = conn.execute(
+                    "SELECT task_id, author, body FROM task_comments WHERE id = ?",
+                    (comment_id,),
+                ).fetchone()
+                if (
+                    existing is None
+                    or existing["task_id"] != task_id
+                    or existing["author"] != author_text
+                    or hashlib.sha256(existing["body"].encode("utf-8")).hexdigest()
+                    != body_digest
+                ):
+                    raise StatusMemoryCapabilityError(
+                        "status-memory idempotency receipt does not match its comment"
+                    )
+                return comment_id
         if not conn.execute(
             "SELECT 1 FROM tasks WHERE id = ?", (task_id,)
         ).fetchone():
@@ -2947,10 +3153,31 @@ def add_comment(
         cur = conn.execute(
             "INSERT INTO task_comments (task_id, author, body, created_at) "
             "VALUES (?, ?, ?, ?)",
-            (task_id, author.strip(), body.strip(), now),
+            (task_id, author_text, body_text, now),
         )
-        _append_event(conn, task_id, "commented", {"author": author, "len": len(body)})
-        return int(cur.lastrowid or 0)
+        comment_id = int(cur.lastrowid or 0)
+        if key_text is not None and capability_state == "ready":
+            conn.execute(
+                f"INSERT INTO {STATUS_MEMORY_IDEMPOTENCY_TABLE} "
+                "(idempotency_key, board, task_id, author, body_digest, "
+                "comment_id, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
+                (
+                    key_text,
+                    board_text,
+                    task_id,
+                    author_text,
+                    body_digest,
+                    comment_id,
+                    now,
+                ),
+            )
+        _append_event(
+            conn,
+            task_id,
+            "commented",
+            {"author": author_text, "len": len(body_text)},
+        )
+        return comment_id
 
 
 def list_comments(conn: sqlite3.Connection, task_id: str) -> list[Comment]:

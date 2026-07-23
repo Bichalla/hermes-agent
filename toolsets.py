@@ -257,6 +257,15 @@ TOOLSETS = {
         "includes": []
     },
 
+    "registered-workflow": {
+        "description": (
+            "Default-off registered local workflows. Visibility and direct dispatch "
+            "also require registered_workflow.enabled and owner/schema readiness."
+        ),
+        "tools": ["registered_local_workflow"],
+        "includes": [],
+    },
+
     "kanban": {
         "description": (
             "Kanban multi-agent coordination — only active when the agent "

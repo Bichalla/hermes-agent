@@ -7,9 +7,11 @@ phrases can execute only an exact, source-bound pending proposal.
 
 from __future__ import annotations
 
+import hmac
 import json
 import re
 import sqlite3
+import threading
 import time
 import uuid
 from dataclasses import dataclass, field
@@ -42,6 +44,7 @@ _SENSITIVE_PATTERNS = (
 )
 _ID_LIKE_RE = re.compile(r"\b\d{8,}\b")
 _TITLE_MAX_CHARS = 72
+_PENDING_DB_INIT_LOCK = threading.RLock()
 CURRENT_POLICY_VERSION = "kanban-intake-policy/v3"
 POST_TURN_POLICY_TITLE = "Fix post-turn intake policy for Kanban"
 PERSONAL_CONTEXT_TITLE = "Improve personal context workflow"
@@ -305,6 +308,7 @@ class PendingKanbanApproval:
     source_ids: dict[str, Any] = field(default_factory=dict)
     purge_after: float = 0.0
     policy_version: str = CURRENT_POLICY_VERSION
+    updated_at: float = 0.0
 
 
 @dataclass(frozen=True)
@@ -527,6 +531,24 @@ def _safe_contract_body(proposal: KanbanCardProposal) -> str:
     return json.dumps(contract, ensure_ascii=False, sort_keys=True, indent=2)
 
 
+def _task_matches_execution_contract(
+    task: object, pending: PendingKanbanApproval
+) -> bool:
+    proposal = pending.proposal
+    expected = {
+        "title": proposal.title,
+        "body": _safe_contract_body(proposal),
+        "assignee": proposal.assignee,
+        "status": proposal.proposed_status,
+        "priority": int(proposal.priority),
+        "created_by": "kanban-intake",
+        "tenant": proposal.tenant,
+        "idempotency_key": proposal.idempotency_key,
+        "session_id": pending.binding.session_key,
+    }
+    return all(getattr(task, key, None) == value for key, value in expected.items())
+
+
 def render_proposal_message(proposal: KanbanCardProposal) -> str:
     status_label = "blocked review" if proposal.proposed_status == "blocked" else proposal.proposed_status
     return (
@@ -542,19 +564,278 @@ def render_proposal_message(proposal: KanbanCardProposal) -> str:
     )
 
 
+TRANSITION_AUDIT_TABLE = "kanban_intake_transition_audit"
+_TRANSITION_AUDIT_COLUMNS = (
+    "id",
+    "invocation_key",
+    "pending_id",
+    "from_status",
+    "to_status",
+    "reason_code",
+    "occurred_at",
+    "retain_until",
+)
+_TRANSITION_REASONS = frozenset(
+    {
+        "legacy_state_observed",
+        "user_dismissed",
+        "superseded",
+        "cleanup_confirmed",
+        "user_restored",
+        "user_denied",
+        "policy_version_mismatch",
+        "approval_execution_claimed",
+        "approval_execution_succeeded",
+        "approval_execution_invalid",
+        "bulk_invalidated",
+    }
+)
+_PENDING_REQUIRED_COLUMNS = frozenset(
+    {
+        "pending_id",
+        "created_at",
+        "expires_at",
+        "status",
+        "platform",
+        "chat_id",
+        "thread_id",
+        "user_id",
+        "session_key",
+        "policy_version",
+        "purge_after",
+        "updated_at",
+    }
+)
+
+
+def transition_audit_ready(conn: sqlite3.Connection) -> bool:
+    table = conn.execute(
+        "SELECT 1 FROM sqlite_master WHERE type='table' AND name=?",
+        (TRANSITION_AUDIT_TABLE,),
+    ).fetchone()
+    if table is None:
+        return False
+    info = conn.execute(f"PRAGMA table_info({TRANSITION_AUDIT_TABLE})").fetchall()
+    columns = tuple(row["name"] if isinstance(row, sqlite3.Row) else row[1] for row in info)
+    shape = tuple(
+        (
+            row["name"] if isinstance(row, sqlite3.Row) else row[1],
+            (row["type"] if isinstance(row, sqlite3.Row) else row[2]).upper(),
+            int(row["notnull"] if isinstance(row, sqlite3.Row) else row[3]),
+            int(row["pk"] if isinstance(row, sqlite3.Row) else row[5]),
+        )
+        for row in info
+    )
+    expected_shape = (
+        ("id", "INTEGER", 0, 1),
+        ("invocation_key", "TEXT", 1, 0),
+        ("pending_id", "TEXT", 1, 0),
+        ("from_status", "TEXT", 1, 0),
+        ("to_status", "TEXT", 1, 0),
+        ("reason_code", "TEXT", 1, 0),
+        ("occurred_at", "REAL", 1, 0),
+        ("retain_until", "REAL", 1, 0),
+    )
+    if columns != _TRANSITION_AUDIT_COLUMNS or shape != expected_shape:
+        raise ValueError("transition audit schema is invalid")
+    indexes: dict[tuple[str, ...], bool] = {}
+    for index in conn.execute(f"PRAGMA index_list({TRANSITION_AUDIT_TABLE})"):
+        index_name = index["name"] if isinstance(index, sqlite3.Row) else index[1]
+        unique = bool(index["unique"] if isinstance(index, sqlite3.Row) else index[2])
+        indexed = tuple(
+            item["name"] if isinstance(item, sqlite3.Row) else item[2]
+            for item in conn.execute(f'PRAGMA index_info("{index_name}")')
+        )
+        indexes[indexed] = unique
+    if indexes.get(("invocation_key",)) is not True or (
+        "pending_id",
+        "id",
+    ) not in indexes:
+        raise ValueError("transition audit indexes are invalid")
+    trigger_rows = conn.execute(
+        "SELECT name, sql FROM sqlite_master WHERE type='trigger' AND tbl_name=?",
+        (TRANSITION_AUDIT_TABLE,),
+    ).fetchall()
+    triggers = {
+        (row["name"] if isinstance(row, sqlite3.Row) else row[0]):
+        (row["sql"] if isinstance(row, sqlite3.Row) else row[1]) or ""
+        for row in trigger_rows
+    }
+    if set(triggers) != {
+        "kanban_intake_transition_audit_no_update",
+        "kanban_intake_transition_audit_guard_delete",
+    }:
+        raise ValueError("transition audit guards are invalid")
+    update_sql = " ".join(
+        triggers["kanban_intake_transition_audit_no_update"].casefold().split()
+    )
+    delete_sql = " ".join(
+        triggers["kanban_intake_transition_audit_guard_delete"].casefold().split()
+    )
+    if (
+        "before update" not in update_sql
+        or "transition audit is append-only" not in update_sql
+        or "before delete" not in delete_sql
+        or "kanban_intake_pending" not in delete_sql
+        or "transition audit owner still exists" not in delete_sql
+    ):
+        raise ValueError("transition audit guards are invalid")
+    executing_guard = conn.execute(
+        "SELECT sql FROM sqlite_master WHERE type='trigger' "
+        "AND name='kanban_intake_pending_no_delete_executing' "
+        "AND tbl_name='kanban_intake_pending'"
+    ).fetchone()
+    guard_sql = "" if executing_guard is None else (
+        executing_guard["sql"]
+        if isinstance(executing_guard, sqlite3.Row)
+        else executing_guard[0]
+    )
+    normalized_guard = " ".join((guard_sql or "").casefold().split())
+    if (
+        "before delete" not in normalized_guard
+        or "old.status = 'executing'" not in normalized_guard
+        or "executing pending rows cannot be deleted" not in normalized_guard
+    ):
+        raise ValueError("executing retention guard is invalid")
+    executing_index = conn.execute(
+        "SELECT sql FROM sqlite_master WHERE type='index' "
+        "AND name='uq_kanban_intake_one_executing_binding'"
+    ).fetchone()
+    executing_index_sql = "" if executing_index is None else (
+        executing_index["sql"]
+        if isinstance(executing_index, sqlite3.Row)
+        else executing_index[0]
+    )
+    normalized_index = " ".join((executing_index_sql or "").casefold().split())
+    if (
+        "unique index" not in normalized_index
+        or "where status = 'executing'" not in normalized_index
+    ):
+        raise ValueError("executing source-binding index is invalid")
+    return True
+
+
+def migrate_transition_audit(
+    conn: sqlite3.Connection, *, dry_run: bool, now: Optional[float] = None
+) -> dict[str, Any]:
+    if type(dry_run) is not bool:
+        raise TypeError("dry_run must be boolean")
+    conn.execute("BEGIN IMMEDIATE")
+    try:
+        pending_columns = {
+            row["name"] if isinstance(row, sqlite3.Row) else row[1]
+            for row in conn.execute("PRAGMA table_info(kanban_intake_pending)")
+        }
+        if not _PENDING_REQUIRED_COLUMNS.issubset(pending_columns):
+            raise ValueError("pending schema is invalid")
+        ready = transition_audit_ready(conn)
+        baseline_rows = int(
+            conn.execute("SELECT COUNT(*) FROM kanban_intake_pending").fetchone()[0]
+        )
+        if dry_run or ready:
+            result = {
+                "would_change": not ready,
+                "changed": False,
+                "baseline_rows": baseline_rows,
+            }
+            if dry_run:
+                conn.rollback()
+            else:
+                conn.commit()
+            return result
+        timestamp = time.time() if now is None else float(now)
+        conn.execute(
+            f"""
+            CREATE TABLE {TRANSITION_AUDIT_TABLE} (
+              id INTEGER PRIMARY KEY AUTOINCREMENT,
+              invocation_key TEXT NOT NULL UNIQUE,
+              pending_id TEXT NOT NULL,
+              from_status TEXT NOT NULL,
+              to_status TEXT NOT NULL,
+              reason_code TEXT NOT NULL,
+              occurred_at REAL NOT NULL,
+              retain_until REAL NOT NULL
+            )
+            """
+        )
+        conn.execute(
+            f"CREATE INDEX idx_kanban_intake_transition_pending "
+            f"ON {TRANSITION_AUDIT_TABLE}(pending_id, id)"
+        )
+        conn.execute(
+            f"""
+            CREATE TRIGGER kanban_intake_transition_audit_no_update
+            BEFORE UPDATE ON {TRANSITION_AUDIT_TABLE}
+            BEGIN SELECT RAISE(ABORT, 'transition audit is append-only'); END
+            """
+        )
+        conn.execute(
+            f"""
+            CREATE TRIGGER kanban_intake_transition_audit_guard_delete
+            BEFORE DELETE ON {TRANSITION_AUDIT_TABLE}
+            WHEN EXISTS (
+              SELECT 1 FROM kanban_intake_pending p
+               WHERE p.pending_id = OLD.pending_id
+            )
+            BEGIN SELECT RAISE(ABORT, 'transition audit owner still exists'); END
+            """
+        )
+        conn.execute(
+            """
+            CREATE TRIGGER kanban_intake_pending_no_delete_executing
+            BEFORE DELETE ON kanban_intake_pending
+            WHEN OLD.status = 'executing'
+            BEGIN SELECT RAISE(ABORT, 'executing pending rows cannot be deleted'); END
+            """
+        )
+        conn.execute(
+            """
+            CREATE UNIQUE INDEX uq_kanban_intake_one_executing_binding
+            ON kanban_intake_pending(
+              platform, chat_id, COALESCE(thread_id, ''), user_id, session_key
+            ) WHERE status = 'executing'
+            """
+        )
+        conn.execute(
+            f"""
+            INSERT INTO {TRANSITION_AUDIT_TABLE}
+              (invocation_key, pending_id, from_status, to_status,
+               reason_code, occurred_at, retain_until)
+            SELECT 'migration:v1:' || pending_id || ':' || status,
+                   pending_id, status, status, 'legacy_state_observed', ?, purge_after
+              FROM kanban_intake_pending
+             ORDER BY pending_id
+            """,
+            (timestamp,),
+        )
+        if not transition_audit_ready(conn):
+            raise ValueError("transition audit migration readback failed")
+        conn.commit()
+        return {"would_change": True, "changed": True, "baseline_rows": baseline_rows}
+    except Exception:
+        conn.rollback()
+        raise
+
+
 class PendingKanbanStore:
     def __init__(self, path: Optional[Path] = None):
         self.path = path or (get_hermes_home() / "kanban" / "intake_pending.db")
 
     def connect(self) -> sqlite3.Connection:
-        self.path.parent.mkdir(parents=True, exist_ok=True)
-        conn = sqlite3.connect(self.path)
-        conn.row_factory = sqlite3.Row
-        conn.execute("PRAGMA journal_mode=WAL")
-        conn.execute("PRAGMA foreign_keys=ON")
-        conn.executescript(_SCHEMA)
-        self._migrate(conn)
-        return conn
+        with _PENDING_DB_INIT_LOCK:
+            self.path.parent.mkdir(parents=True, exist_ok=True)
+            conn = sqlite3.connect(self.path, timeout=5.0)
+            try:
+                conn.row_factory = sqlite3.Row
+                conn.execute("PRAGMA busy_timeout=5000")
+                conn.execute("PRAGMA journal_mode=WAL")
+                conn.execute("PRAGMA foreign_keys=ON")
+                conn.executescript(_SCHEMA)
+                self._migrate(conn)
+                return conn
+            except Exception:
+                conn.close()
+                raise
 
     def connect_readonly(self) -> Optional[sqlite3.Connection]:
         if not self.path.exists():
@@ -603,10 +884,11 @@ class PendingKanbanStore:
             purge_after=now + cfg.pending_retention_seconds,
         )
         with self.connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
             active_count = conn.execute(
                 """
                 SELECT COUNT(*) AS n FROM kanban_intake_pending
-                WHERE status = 'pending'
+                WHERE status IN ('pending', 'executing')
                   AND platform = ? AND chat_id = ? AND COALESCE(thread_id, '') = COALESCE(?, '')
                   AND user_id = ? AND session_key = ? AND expires_at > ?
                 """,
@@ -655,9 +937,320 @@ class PendingKanbanStore:
             return ActiveLookup("ambiguous", None, len(rows))
         return ActiveLookup("one", self._from_row(rows[0]), 1)
 
+    def get_executing_for_source(self, binding: SourceBinding) -> ActiveLookup:
+        conn = self.connect_readonly()
+        if conn is None:
+            return ActiveLookup("none", None, 0)
+        with conn:
+            rows = conn.execute(
+                """
+                SELECT * FROM kanban_intake_pending
+                WHERE status = 'executing'
+                  AND platform = ? AND chat_id = ?
+                  AND COALESCE(thread_id, '') = COALESCE(?, '')
+                  AND user_id = ? AND session_key = ?
+                ORDER BY created_at DESC
+                """,
+                (
+                    binding.platform,
+                    binding.chat_id,
+                    binding.thread_id,
+                    binding.user_id,
+                    binding.session_key,
+                ),
+            ).fetchall()
+        if not rows:
+            return ActiveLookup("none", None, 0)
+        if len(rows) > 1:
+            return ActiveLookup("ambiguous", None, len(rows))
+        return ActiveLookup("one", self._from_row(rows[0]), 1)
+
+    @staticmethod
+    def _binding_matches(row: sqlite3.Row, binding: SourceBinding) -> bool:
+        pairs = (
+            (row["platform"] or "", binding.platform or ""),
+            (row["chat_id"] or "", binding.chat_id or ""),
+            (row["thread_id"] or "", binding.thread_id or ""),
+            (row["user_id"] or "", binding.user_id or ""),
+            (row["session_key"] or "", binding.session_key or ""),
+        )
+        return all(hmac.compare_digest(str(left), str(right)) for left, right in pairs)
+
+    @staticmethod
+    def _closed_projection(
+        row: sqlite3.Row,
+        *,
+        action: str,
+        replayed: bool,
+        reason_code: str | None,
+        status: str | None = None,
+    ) -> dict[str, Any]:
+        return {
+            "schema": "kanban-intake-pending-operation/v1",
+            "action": action,
+            "decision": "allow",
+            "pending_id": row["pending_id"],
+            "status": status if status is not None else row["status"],
+            "expires_at": float(row["expires_at"]),
+            "retain_until": float(row["purge_after"]),
+            "policy_version": row["policy_version"],
+            "replayed": replayed,
+            "reason_code": reason_code,
+        }
+
+    def registered_projection(
+        self, pending_id: str, binding: SourceBinding, *, now: Optional[float] = None
+    ) -> dict[str, Any]:
+        del now
+        conn = self.connect_readonly()
+        if conn is None:
+            raise RuntimeError("transition audit owner unavailable")
+        with conn:
+            if not transition_audit_ready(conn):
+                raise RuntimeError("transition audit owner unavailable")
+            row = conn.execute(
+                "SELECT pending_id, status, expires_at, purge_after, policy_version, "
+                "platform, chat_id, thread_id, user_id, session_key "
+                "FROM kanban_intake_pending WHERE pending_id=?",
+                (pending_id,),
+            ).fetchone()
+            if row is None or not self._binding_matches(row, binding):
+                raise PermissionError("target unavailable")
+            return self._closed_projection(
+                row, action="pending_read", replayed=False, reason_code=None
+            )
+
+    def transition_status(
+        self,
+        pending_id: str,
+        *,
+        expected_status: str,
+        status: str,
+        reason_code: str,
+        invocation_key: str,
+        now: Optional[float] = None,
+    ) -> dict[str, Any]:
+        if reason_code not in _TRANSITION_REASONS:
+            raise ValueError("invalid transition reason")
+        if not isinstance(invocation_key, str) or not invocation_key or len(invocation_key) > 255:
+            raise ValueError("invalid transition invocation")
+        timestamp = time.time() if now is None else float(now)
+        with self.connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            ready = transition_audit_ready(conn)
+            if not ready:
+                cur = conn.execute(
+                    "UPDATE kanban_intake_pending SET status=?, updated_at=? "
+                    "WHERE pending_id=? AND status=?",
+                    (status, timestamp, pending_id, expected_status),
+                )
+                if int(cur.rowcount or 0) != 1:
+                    conn.rollback()
+                    raise ValueError("pending transition state mismatch")
+                conn.commit()
+                return {"status": status, "replayed": False}
+            try:
+                replay = conn.execute(
+                    f"SELECT pending_id, from_status, to_status, reason_code "
+                    f"FROM {TRANSITION_AUDIT_TABLE} WHERE invocation_key=?",
+                    (invocation_key,),
+                ).fetchone()
+                if replay is not None:
+                    exact = (
+                        replay["pending_id"] == pending_id
+                        and replay["from_status"] == expected_status
+                        and replay["to_status"] == status
+                        and replay["reason_code"] == reason_code
+                    )
+                    if not exact:
+                        raise ValueError("transition invocation conflict")
+                    conn.commit()
+                    return {"status": status, "replayed": True}
+                row = conn.execute(
+                    "SELECT status, purge_after FROM kanban_intake_pending WHERE pending_id=?",
+                    (pending_id,),
+                ).fetchone()
+                if row is None or row["status"] != expected_status:
+                    raise ValueError("pending transition state mismatch")
+                cur = conn.execute(
+                    "UPDATE kanban_intake_pending SET status=?, updated_at=? "
+                    "WHERE pending_id=? AND status=?",
+                    (status, timestamp, pending_id, expected_status),
+                )
+                if int(cur.rowcount or 0) != 1:
+                    raise ValueError("pending transition lost CAS")
+                conn.execute(
+                    f"INSERT INTO {TRANSITION_AUDIT_TABLE} "
+                    "(invocation_key, pending_id, from_status, to_status, reason_code, "
+                    "occurred_at, retain_until) VALUES (?, ?, ?, ?, ?, ?, ?)",
+                    (
+                        invocation_key,
+                        pending_id,
+                        expected_status,
+                        status,
+                        reason_code,
+                        timestamp,
+                        float(row["purge_after"]),
+                    ),
+                )
+                readback = conn.execute(
+                    "SELECT status FROM kanban_intake_pending WHERE pending_id=?",
+                    (pending_id,),
+                ).fetchone()
+                if readback is None or readback["status"] != status:
+                    raise ValueError("pending transition readback failed")
+                conn.commit()
+                return {"status": status, "replayed": False}
+            except Exception:
+                conn.rollback()
+                raise
+
+    def _registered_transition(
+        self,
+        pending_id: str,
+        binding: SourceBinding,
+        *,
+        action: str,
+        expected_status: str,
+        status: str,
+        reason_code: str,
+        invocation_key: str,
+        now: float,
+    ) -> dict[str, Any]:
+        with self.connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            try:
+                if not transition_audit_ready(conn):
+                    raise RuntimeError("transition audit owner unavailable")
+                row = conn.execute(
+                    "SELECT * FROM kanban_intake_pending WHERE pending_id=?",
+                    (pending_id,),
+                ).fetchone()
+                if row is None or not self._binding_matches(row, binding):
+                    raise PermissionError("target unavailable")
+                replay = conn.execute(
+                    f"SELECT pending_id, from_status, to_status, reason_code "
+                    f"FROM {TRANSITION_AUDIT_TABLE} WHERE invocation_key=?",
+                    (invocation_key,),
+                ).fetchone()
+                if replay is not None:
+                    exact = (
+                        replay["pending_id"] == pending_id
+                        and replay["from_status"] == expected_status
+                        and replay["to_status"] == status
+                        and replay["reason_code"] == reason_code
+                    )
+                    if not exact:
+                        raise ValueError("transition invocation conflict")
+                    if row["status"] != replay["to_status"]:
+                        raise ValueError(
+                            "stale transition replay conflicts with current state"
+                        )
+                    result = self._closed_projection(
+                        row,
+                        action=action,
+                        replayed=True,
+                        reason_code=reason_code,
+                        status=replay["to_status"],
+                    )
+                    conn.commit()
+                    return result
+                if row["status"] != expected_status:
+                    raise ValueError("pending transition state mismatch")
+                if (
+                    float(row["expires_at"]) <= now
+                    or float(row["purge_after"]) <= now
+                    or row["policy_version"] != CURRENT_POLICY_VERSION
+                ):
+                    raise ValueError("pending row is not restorable")
+                cur = conn.execute(
+                    "UPDATE kanban_intake_pending SET status=?, updated_at=? "
+                    "WHERE pending_id=? AND status=?",
+                    (status, now, pending_id, expected_status),
+                )
+                if int(cur.rowcount or 0) != 1:
+                    raise ValueError("pending transition lost CAS")
+                conn.execute(
+                    f"INSERT INTO {TRANSITION_AUDIT_TABLE} "
+                    "(invocation_key, pending_id, from_status, to_status, reason_code, "
+                    "occurred_at, retain_until) VALUES (?, ?, ?, ?, ?, ?, ?)",
+                    (
+                        invocation_key,
+                        pending_id,
+                        expected_status,
+                        status,
+                        reason_code,
+                        now,
+                        float(row["purge_after"]),
+                    ),
+                )
+                readback = conn.execute(
+                    "SELECT status FROM kanban_intake_pending WHERE pending_id=?",
+                    (pending_id,),
+                ).fetchone()
+                if readback is None or readback["status"] != status:
+                    raise ValueError("pending transition readback failed")
+                result = self._closed_projection(
+                    row,
+                    action=action,
+                    replayed=False,
+                    reason_code=reason_code,
+                    status=status,
+                )
+                conn.commit()
+                return result
+            except Exception:
+                conn.rollback()
+                raise
+
+    def registered_soft_delete(
+        self,
+        pending_id: str,
+        binding: SourceBinding,
+        *,
+        reason_code: str,
+        invocation_key: str,
+        now: Optional[float] = None,
+    ) -> dict[str, Any]:
+        timestamp = time.time() if now is None else float(now)
+        if reason_code not in {"user_dismissed", "superseded", "cleanup_confirmed"}:
+            raise ValueError("invalid dismissal reason")
+        return self._registered_transition(
+            pending_id,
+            binding,
+            action="pending_soft_delete",
+            expected_status="pending",
+            status="dismissed",
+            reason_code=reason_code,
+            invocation_key=invocation_key,
+            now=timestamp,
+        )
+
+    def registered_restore(
+        self,
+        pending_id: str,
+        binding: SourceBinding,
+        *,
+        invocation_key: str,
+        now: Optional[float] = None,
+    ) -> dict[str, Any]:
+        timestamp = time.time() if now is None else float(now)
+        return self._registered_transition(
+            pending_id,
+            binding,
+            action="pending_restore",
+            expected_status="dismissed",
+            status="pending",
+            reason_code="user_restored",
+            invocation_key=invocation_key,
+            now=timestamp,
+        )
+
     def mark_status(self, pending_id: str, status: str, *, now: Optional[float] = None) -> None:
         now = time.time() if now is None else float(now)
         with self.connect() as conn:
+            if transition_audit_ready(conn):
+                raise RuntimeError("unaudited status changes are disabled after migration")
             conn.execute(
                 "UPDATE kanban_intake_pending SET status = ?, updated_at = ? WHERE pending_id = ?",
                 (status, now, pending_id),
@@ -667,12 +1260,38 @@ class PendingKanbanStore:
     def purge(self, *, now: Optional[float] = None) -> int:
         now = time.time() if now is None else float(now)
         with self.connect() as conn:
-            cur = conn.execute(
-                "DELETE FROM kanban_intake_pending WHERE purge_after <= ? OR (status = 'pending' AND expires_at <= ?)",
-                (now, now),
-            )
-            conn.commit()
-            return int(cur.rowcount or 0)
+            if not transition_audit_ready(conn):
+                cur = conn.execute(
+                    "DELETE FROM kanban_intake_pending WHERE status != 'executing' "
+                    "AND (purge_after <= ? OR (status = 'pending' AND expires_at <= ?))",
+                    (now, now),
+                )
+                conn.commit()
+                return int(cur.rowcount or 0)
+            conn.execute("BEGIN IMMEDIATE")
+            try:
+                ids = [
+                    row["pending_id"]
+                    for row in conn.execute(
+                        "SELECT pending_id FROM kanban_intake_pending "
+                        "WHERE purge_after <= ? AND status != 'executing'",
+                        (now,),
+                    )
+                ]
+                for target in ids:
+                    conn.execute(
+                        "DELETE FROM kanban_intake_pending WHERE pending_id=?",
+                        (target,),
+                    )
+                    conn.execute(
+                        f"DELETE FROM {TRANSITION_AUDIT_TABLE} WHERE pending_id=?",
+                        (target,),
+                    )
+                conn.commit()
+                return len(ids)
+            except Exception:
+                conn.rollback()
+                raise
 
     def review_pending(self, *, now: Optional[float] = None, include_all: bool = False, limit: int = 100) -> dict[str, Any]:
         now = time.time() if now is None else float(now)
@@ -752,17 +1371,34 @@ class PendingKanbanStore:
         if not dry_run and targets:
             timestamp = time.time() if now is None else float(now)
             with self.connect() as conn:
+                audited = transition_audit_ready(conn)
+            if audited:
                 for pending_id in targets:
-                    cur = conn.execute(
-                        """
-                        UPDATE kanban_intake_pending
-                        SET status = 'invalid', updated_at = ?
-                        WHERE pending_id = ? AND status = 'pending'
-                        """,
-                        (timestamp, pending_id),
-                    )
-                    updated += int(cur.rowcount or 0)
-                conn.commit()
+                    try:
+                        self.transition_status(
+                            pending_id,
+                            expected_status="pending",
+                            status="invalid",
+                            reason_code="bulk_invalidated",
+                            invocation_key=f"bulk:v1:{pending_id}:invalid",
+                            now=timestamp,
+                        )
+                    except ValueError:
+                        continue
+                    updated += 1
+            else:
+                with self.connect() as conn:
+                    for pending_id in targets:
+                        cur = conn.execute(
+                            """
+                            UPDATE kanban_intake_pending
+                            SET status = 'invalid', updated_at = ?
+                            WHERE pending_id = ? AND status = 'pending'
+                            """,
+                            (timestamp, pending_id),
+                        )
+                        updated += int(cur.rowcount or 0)
+                    conn.commit()
         return {"dry_run": dry_run, "where": where, "matched": len(targets), "updated": updated, "pending_ids": targets[:25]}
 
     def _from_row(self, row: sqlite3.Row) -> PendingKanbanApproval:
@@ -787,6 +1423,7 @@ class PendingKanbanStore:
             created_at=float(row["created_at"]), expires_at=float(row["expires_at"]),
             status=row["status"], source_ids=source_ids, purge_after=float(row["purge_after"]),
             policy_version=(row["policy_version"] or ""),
+            updated_at=float(row["updated_at"] or 0.0),
         )
 
 
@@ -849,12 +1486,90 @@ def execute_pending_approval(pending: PendingKanbanApproval, cfg: KanbanIntakeCo
             kwargs["triage"] = True
         task_id = kb.create_task(conn, **kwargs)
         task = kb.get_task(conn, task_id)
-        verified = bool(task and task.status == proposal.proposed_status and task.title == proposal.title)
+        verified = bool(task and _task_matches_execution_contract(task, pending))
     finally:
         conn.close()
     if not verified:
         return ApprovalResult(True, f"Kanban 카드 생성 후 검증 실패: {task_id}", task_id=task_id, verified=False, action=APPROVAL)
     return ApprovalResult(True, f"Kanban {proposal.proposed_status} 카드 생성/검증 완료: {task_id}", task_id=task_id, verified=True, action=APPROVAL)
+
+
+def reconcile_or_resume_pending_execution(
+    pending: PendingKanbanApproval,
+    cfg: KanbanIntakeConfig,
+    store: PendingKanbanStore,
+) -> ApprovalResult:
+    proposal = pending.proposal.normalized(cfg)
+    if not proposal.idempotency_key:
+        return ApprovalResult(
+            True,
+            "Kanban 실행 상태가 모호해 자동 재실행하지 않았다. 수동 reconciliation이 필요하다.",
+            action=APPROVAL,
+        )
+    from hermes_cli import kanban_db as kb
+
+    conn = kb.connect(board=proposal.board)
+    try:
+        rows = conn.execute(
+            "SELECT id FROM tasks WHERE idempotency_key=? "
+            "AND status != 'archived' ORDER BY created_at DESC LIMIT 2",
+            (proposal.idempotency_key,),
+        ).fetchall()
+        task = kb.get_task(conn, rows[0]["id"]) if len(rows) == 1 else None
+    finally:
+        conn.close()
+    if len(rows) > 1:
+        return ApprovalResult(
+            True,
+            "Kanban idempotency readback이 모호해 자동 재실행하지 않았다.",
+            action=APPROVAL,
+        )
+    if rows:
+        assert task is not None
+        verified = _task_matches_execution_contract(task, pending)
+        if not verified:
+            return ApprovalResult(
+                True,
+                "Kanban 실행 readback이 예상 계약과 달라 자동 종료하지 않았다.",
+                task_id=task.id,
+                verified=False,
+                action=APPROVAL,
+            )
+        store.transition_status(
+            pending.pending_id,
+            expected_status="executing",
+            status="executed",
+            reason_code="approval_execution_succeeded",
+            invocation_key=f"reply:v1:{pending.pending_id}:final:executed",
+        )
+        return ApprovalResult(
+            True,
+            f"Kanban 카드 실행 결과 reconciliation 완료: {task.id}",
+            task_id=task.id,
+            verified=True,
+            action=APPROVAL,
+        )
+    if time.time() - pending.updated_at < 120.0:
+        return ApprovalResult(
+            True,
+            "Kanban 실행 lease가 활성 상태라 중복 실행하지 않았다.",
+            verified=False,
+            action=APPROVAL,
+        )
+    result = execute_pending_approval(pending, cfg)
+    final_status = "executed" if result.verified else "invalid"
+    store.transition_status(
+        pending.pending_id,
+        expected_status="executing",
+        status=final_status,
+        reason_code=(
+            "approval_execution_succeeded"
+            if result.verified
+            else "approval_execution_invalid"
+        ),
+        invocation_key=f"reply:v1:{pending.pending_id}:final:{final_status}",
+    )
+    return result
 
 
 def handle_reply(
@@ -866,6 +1581,21 @@ def handle_reply(
     action = classify_reply(text, cfg)
     if action == NONE:
         return ApprovalResult(False)
+    executing = store.get_executing_for_source(binding)
+    if executing.state != "none":
+        if executing.state == "ambiguous" or executing.pending is None:
+            return ApprovalResult(
+                True,
+                "Kanban executing 후보가 모호해 자동 재실행하지 않았다.",
+                action=action,
+            )
+        if action != APPROVAL:
+            return ApprovalResult(
+                True,
+                "이미 executing 상태라 취소/변경하지 않았다. 승인 재시도로 reconciliation만 가능하다.",
+                action=action,
+            )
+        return reconcile_or_resume_pending_execution(executing.pending, cfg, store)
     lookup = store.get_active_for_source(binding)
     if lookup.state == "none":
         return ApprovalResult(False)
@@ -873,17 +1603,55 @@ def handle_reply(
         return ApprovalResult(True, "Kanban 카드 후보가 여러 개라서 실행하지 않았다. 하나만 남기고 다시 승인해줘.", action=action)
     assert lookup.pending is not None
     if action == DENY:
-        store.mark_status(lookup.pending.pending_id, "denied")
+        store.transition_status(
+            lookup.pending.pending_id,
+            expected_status="pending",
+            status="denied",
+            reason_code="user_denied",
+            invocation_key=f"reply:v1:{lookup.pending.pending_id}:deny",
+        )
         return ApprovalResult(True, "Kanban 카드 후보 취소 완료.", action=DENY)
     if lookup.pending.policy_version != CURRENT_POLICY_VERSION:
-        store.mark_status(lookup.pending.pending_id, "needs_revalidation")
+        store.transition_status(
+            lookup.pending.pending_id,
+            expected_status="pending",
+            status="needs_revalidation",
+            reason_code="policy_version_mismatch",
+            invocation_key=f"reply:v1:{lookup.pending.pending_id}:policy",
+        )
         return ApprovalResult(
             True,
             "Kanban 카드 후보 정책 버전이 오래되어 실행하지 않았다. revalidate 또는 새 후보 생성이 필요하다.",
             action=APPROVAL,
         )
+    claim = store.transition_status(
+        lookup.pending.pending_id,
+        expected_status="pending",
+        status="executing",
+        reason_code="approval_execution_claimed",
+        invocation_key=f"reply:v1:{lookup.pending.pending_id}:claim",
+    )
+    if claim["replayed"]:
+        return ApprovalResult(
+            True,
+            "Kanban 실행이 이미 다른 승인 호출에서 진행 중이다.",
+            verified=False,
+            action=APPROVAL,
+        )
     result = execute_pending_approval(lookup.pending, cfg)
-    store.mark_status(lookup.pending.pending_id, "executed" if result.verified else "invalid")
+    final_status = "executed" if result.verified else "invalid"
+    final_reason = (
+        "approval_execution_succeeded"
+        if result.verified
+        else "approval_execution_invalid"
+    )
+    store.transition_status(
+        lookup.pending.pending_id,
+        expected_status="executing",
+        status=final_status,
+        reason_code=final_reason,
+        invocation_key=f"reply:v1:{lookup.pending.pending_id}:final:{final_status}",
+    )
     return result
 
 

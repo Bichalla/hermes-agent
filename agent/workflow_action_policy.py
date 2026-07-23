@@ -12,6 +12,8 @@ import re
 import unicodedata
 from dataclasses import dataclass
 from enum import StrEnum
+from types import MappingProxyType
+from typing import Mapping
 
 
 class WorkflowActionClass(StrEnum):
@@ -21,6 +23,249 @@ class WorkflowActionClass(StrEnum):
     TRUSTED_LOCAL_RECORD = "trusted_local_record"
     APPROVAL_REQUIRED_LIVE_MUTATION = "approval_required_live_mutation"
     DESTRUCTIVE_OR_PUBLIC = "destructive_or_public"
+
+
+class WorkflowEffect(StrEnum):
+    CREATE = "create"
+    READ = "read"
+    UPDATE = "update"
+    SOFT_DELETE = "soft_delete"
+    RESTORE = "restore"
+
+
+class AuthorityMode(StrEnum):
+    FOREGROUND_CURRENT_TURN = "foreground_current_turn"
+    EXISTING_DISPATCHER_WORKER = "existing_dispatcher_worker"
+    MAIN_CONTROLLER = "main_controller"
+    LOCAL_READ_BOUNDARY = "local_read_boundary"
+
+
+class IdempotencyMode(StrEnum):
+    OWNER_ATOMIC = "owner_atomic"
+    DETERMINISTIC_REPLAY = "deterministic_replay"
+    READ_ONLY = "read_only"
+
+
+class CapabilityDecision(StrEnum):
+    ALLOW = "allow"
+    DENY_UNREGISTERED_ACTION = "deny_unregistered_action"
+    DENY_AUTHORITY_MISSING = "deny_authority_missing"
+    DENY_TARGET_MISMATCH = "deny_target_mismatch"
+    DENY_SCHEMA_INVALID = "deny_schema_invalid"
+    DENY_OWNER_UNAVAILABLE = "deny_owner_unavailable"
+    DENY_SOFT_DELETE_NOT_RESTORABLE = "deny_soft_delete_not_restorable"
+    DENY_LIVE_OR_EXTERNAL_BOUNDARY = "deny_live_or_external_boundary"
+    HARD_BLOCK = "hard_block"
+
+
+@dataclass(frozen=True, slots=True)
+class RegisteredCapability:
+    capability_id: str
+    effects: frozenset[WorkflowEffect]
+    authority_modes: frozenset[AuthorityMode]
+    adapter_id: str
+    input_schema_id: str
+    result_schema_id: str
+    idempotency: IdempotencyMode
+    readback_required: bool
+    soft_delete_restore_required: bool
+
+
+_CAPABILITY_ID_RE = re.compile(
+    r"^[a-z][a-z0-9-]*(?:\.[a-z0-9-]+)*\.v[1-9][0-9]*$"
+)
+_SCHEMA_ID_RE = re.compile(r"^[a-z][a-z0-9-]*/v[1-9][0-9]*$")
+_ADAPTER_ID_RE = re.compile(r"^[a-z][a-z0-9-]*$")
+_ADAPTER_IDS = frozenset(
+    {
+        "kanban-status-memory",
+        "kanban-intake-pending",
+    }
+)
+
+
+def validate_registered_capability(capability: RegisteredCapability) -> None:
+    if type(capability) is not RegisteredCapability:
+        raise TypeError("capability must be an exact RegisteredCapability")
+    if type(capability.capability_id) is not str or not _CAPABILITY_ID_RE.fullmatch(
+        capability.capability_id
+    ):
+        raise ValueError("capability_id must be a versioned lowercase ID")
+    if type(capability.effects) is not frozenset or not capability.effects:
+        raise ValueError("effects must be a non-empty frozenset")
+    if any(type(effect) is not WorkflowEffect for effect in capability.effects):
+        raise TypeError("effects must contain exact WorkflowEffect values")
+    if (
+        type(capability.authority_modes) is not frozenset
+        or not capability.authority_modes
+    ):
+        raise ValueError("authority_modes must be a non-empty frozenset")
+    if any(
+        type(mode) is not AuthorityMode for mode in capability.authority_modes
+    ):
+        raise TypeError("authority_modes must contain exact AuthorityMode values")
+    if (
+        type(capability.adapter_id) is not str
+        or not _ADAPTER_ID_RE.fullmatch(capability.adapter_id)
+        or capability.adapter_id not in _ADAPTER_IDS
+    ):
+        raise ValueError("adapter_id is not registered")
+    for name, value in (
+        ("input_schema_id", capability.input_schema_id),
+        ("result_schema_id", capability.result_schema_id),
+    ):
+        if type(value) is not str or not _SCHEMA_ID_RE.fullmatch(value):
+            raise ValueError(f"{name} must be a versioned lowercase schema ID")
+    if type(capability.idempotency) is not IdempotencyMode:
+        raise TypeError("idempotency must be an exact IdempotencyMode")
+    if type(capability.readback_required) is not bool:
+        raise TypeError("readback_required must be an exact bool")
+    if type(capability.soft_delete_restore_required) is not bool:
+        raise TypeError("soft_delete_restore_required must be an exact bool")
+    if WorkflowEffect.SOFT_DELETE in capability.effects and (
+        WorkflowEffect.RESTORE not in capability.effects
+        or not capability.soft_delete_restore_required
+    ):
+        raise ValueError("soft delete requires an explicit restore contract")
+
+
+_REGISTERED_CAPABILITIES: Mapping[str, RegisteredCapability] = MappingProxyType(
+    {
+        "kanban.status-memory.v1": RegisteredCapability(
+            capability_id="kanban.status-memory.v1",
+            effects=frozenset({WorkflowEffect.CREATE, WorkflowEffect.READ}),
+            authority_modes=frozenset(
+                {
+                    AuthorityMode.FOREGROUND_CURRENT_TURN,
+                    AuthorityMode.EXISTING_DISPATCHER_WORKER,
+                    AuthorityMode.LOCAL_READ_BOUNDARY,
+                }
+            ),
+            adapter_id="kanban-status-memory",
+            input_schema_id="kanban-status-memory/v1",
+            result_schema_id="kanban-status-memory-result/v1",
+            idempotency=IdempotencyMode.OWNER_ATOMIC,
+            readback_required=True,
+            soft_delete_restore_required=False,
+        ),
+
+        "kanban-intake.pending-soft-delete.v1": RegisteredCapability(
+            capability_id="kanban-intake.pending-soft-delete.v1",
+            effects=frozenset(
+                {
+                    WorkflowEffect.READ,
+                    WorkflowEffect.SOFT_DELETE,
+                    WorkflowEffect.RESTORE,
+                }
+            ),
+            authority_modes=frozenset(
+                {
+                    AuthorityMode.FOREGROUND_CURRENT_TURN,
+                    AuthorityMode.LOCAL_READ_BOUNDARY,
+                }
+            ),
+            adapter_id="kanban-intake-pending",
+            input_schema_id="kanban-intake-pending/v1",
+            result_schema_id="kanban-intake-pending-result/v1",
+            idempotency=IdempotencyMode.OWNER_ATOMIC,
+            readback_required=True,
+            soft_delete_restore_required=True,
+        ),
+    }
+)
+
+_REGISTERED_OPERATIONS: Mapping[tuple[str, str], WorkflowEffect] = MappingProxyType(
+    {
+        ("kanban.status-memory.v1", "kanban_status_memory_comment"): WorkflowEffect.CREATE,
+        ("kanban.status-memory.v1", "list_comments"): WorkflowEffect.READ,
+
+        ("kanban-intake.pending-soft-delete.v1", "pending_read"): WorkflowEffect.READ,
+        ("kanban-intake.pending-soft-delete.v1", "pending_soft_delete"): WorkflowEffect.SOFT_DELETE,
+        ("kanban-intake.pending-soft-delete.v1", "pending_restore"): WorkflowEffect.RESTORE,
+    }
+)
+_REGISTERED_OPERATION_AUTHORITIES: Mapping[
+    tuple[str, str], frozenset[AuthorityMode]
+] = MappingProxyType(
+    {
+        ("kanban.status-memory.v1", "kanban_status_memory_comment"): frozenset(
+            {
+                AuthorityMode.FOREGROUND_CURRENT_TURN,
+                AuthorityMode.EXISTING_DISPATCHER_WORKER,
+            }
+        ),
+        ("kanban.status-memory.v1", "list_comments"): frozenset(
+            {
+                AuthorityMode.FOREGROUND_CURRENT_TURN,
+                AuthorityMode.EXISTING_DISPATCHER_WORKER,
+                AuthorityMode.LOCAL_READ_BOUNDARY,
+            }
+        ),
+        ("kanban-intake.pending-soft-delete.v1", "pending_read"): frozenset(
+            {
+                AuthorityMode.FOREGROUND_CURRENT_TURN,
+                AuthorityMode.LOCAL_READ_BOUNDARY,
+            }
+        ),
+        ("kanban-intake.pending-soft-delete.v1", "pending_soft_delete"): frozenset(
+            {AuthorityMode.FOREGROUND_CURRENT_TURN}
+        ),
+        ("kanban-intake.pending-soft-delete.v1", "pending_restore"): frozenset(
+            {AuthorityMode.FOREGROUND_CURRENT_TURN}
+        ),
+    }
+)
+
+for _capability in _REGISTERED_CAPABILITIES.values():
+    validate_registered_capability(_capability)
+
+
+def registered_capability_catalog() -> Mapping[str, RegisteredCapability]:
+    return _REGISTERED_CAPABILITIES
+
+
+def evaluate_registered_capability(
+    capability_id: str,
+    operation: str,
+    effect: WorkflowEffect,
+    *,
+    schema_valid: bool,
+    authority_mode: AuthorityMode | None,
+    owner_ready: bool,
+    target_valid: bool,
+    restore_contract_valid: bool = True,
+    represented_live_or_external_boundary: bool = False,
+) -> CapabilityDecision:
+    if represented_live_or_external_boundary is True:
+        return CapabilityDecision.HARD_BLOCK
+    expected_effect = _REGISTERED_OPERATIONS.get((capability_id, operation))
+    if expected_effect is None or type(effect) is not WorkflowEffect or effect is not expected_effect:
+        return CapabilityDecision.DENY_UNREGISTERED_ACTION
+    flags = (
+        schema_valid,
+        owner_ready,
+        target_valid,
+        restore_contract_valid,
+        represented_live_or_external_boundary,
+    )
+    if any(type(value) is not bool for value in flags):
+        return CapabilityDecision.DENY_SCHEMA_INVALID
+    if not schema_valid:
+        return CapabilityDecision.DENY_SCHEMA_INVALID
+    if authority_mode is None:
+        return CapabilityDecision.DENY_AUTHORITY_MISSING
+    if type(authority_mode) is not AuthorityMode:
+        return CapabilityDecision.DENY_SCHEMA_INVALID
+    allowed_authorities = _REGISTERED_OPERATION_AUTHORITIES[(capability_id, operation)]
+    if authority_mode not in allowed_authorities:
+        return CapabilityDecision.DENY_AUTHORITY_MISSING
+    if not owner_ready:
+        return CapabilityDecision.DENY_OWNER_UNAVAILABLE
+    if not target_valid:
+        return CapabilityDecision.DENY_TARGET_MISMATCH
+    if effect in {WorkflowEffect.SOFT_DELETE, WorkflowEffect.RESTORE} and not restore_contract_valid:
+        return CapabilityDecision.DENY_SOFT_DELETE_NOT_RESTORABLE
+    return CapabilityDecision.ALLOW
 
 
 @dataclass(frozen=True, slots=True)

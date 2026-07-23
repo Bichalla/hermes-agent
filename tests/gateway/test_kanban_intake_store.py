@@ -1,4 +1,9 @@
+import sqlite3
+import threading
+from concurrent.futures import ThreadPoolExecutor
+
 from gateway.kanban_intake import (
+    ApprovalResult,
     CURRENT_POLICY_VERSION,
     KanbanCardProposal,
     KanbanIntakeConfig,
@@ -64,6 +69,32 @@ def test_default_one_pending_limit_rejects_second(tmp_path):
         assert "limit" in str(exc)
     else:
         raise AssertionError("second active pending proposal should be rejected by default")
+
+
+def test_concurrent_put_pending_serializes_capacity_check_and_insert(tmp_path):
+    c = cfg(tmp_path)
+    store = PendingKanbanStore(c.store_path)
+    start = threading.Barrier(2)
+
+    def attempt(suffix: str) -> str:
+        start.wait(timeout=2)
+        try:
+            store.put_pending(
+                proposal(title=f"Implement local guardrail scope {suffix}"),
+                binding(),
+                c,
+                now=100,
+            )
+        except ValueError as exc:
+            assert "limit" in str(exc)
+            return "limited"
+        return "inserted"
+
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        results = list(pool.map(attempt, ("A", "B")))
+
+    assert sorted(results) == ["inserted", "limited"]
+    assert store.get_active_for_source(binding(), now=101).count == 1
 
 
 def test_missing_user_id_rejected(tmp_path):
@@ -217,3 +248,209 @@ def test_bulk_invalidate_execute_updates_only_pending_rows(tmp_path):
     result = store.bulk_invalidate(dry_run=False, now=102)
     assert result["matched"] == 0
     assert result["updated"] == 0
+
+
+def _migrate_audit(c):
+    from hermes_cli import kanban_intake_migrate
+
+    assert c.store_path is not None
+    assert kanban_intake_migrate.main(
+        ["--db", str(c.store_path), "--dry-run", "false", "--json"]
+    ) == 0
+
+
+def _transition_rows(store, pending_id):
+    with sqlite3.connect(store.path) as conn:
+        return conn.execute(
+            "SELECT from_status, to_status, reason_code, invocation_key "
+            "FROM kanban_intake_transition_audit WHERE pending_id = ? ORDER BY id",
+            (pending_id,),
+        ).fetchall()
+
+
+def test_denial_and_policy_revalidation_transitions_audit_atomically(
+    tmp_path, capsys, monkeypatch
+):
+    c = cfg(tmp_path)
+    store = PendingKanbanStore(c.store_path)
+    denied = store.put_pending(proposal(title="Implement denial audit tests"), binding(thread="deny"), c, now=100)
+    stale = store.put_pending(proposal(title="Implement policy audit tests"), binding(thread="stale"), c, now=100)
+    with store.connect() as conn:
+        conn.execute(
+            "UPDATE kanban_intake_pending SET policy_version = ? WHERE pending_id = ?",
+            ("kanban-intake-policy/v2", stale.pending_id),
+        )
+        conn.commit()
+    _migrate_audit(c)
+    capsys.readouterr()
+    monkeypatch.setattr("gateway.kanban_intake.time.time", lambda: 101.0)
+
+    denied_result = handle_reply("취소", binding(thread="deny"), c, store)
+    stale_result = handle_reply("승인", binding(thread="stale"), c, store)
+
+    assert denied_result.handled is True
+    assert stale_result.handled is True
+    assert _transition_rows(store, denied.pending_id)[-1][:3] == (
+        "pending", "denied", "user_denied"
+    )
+    assert _transition_rows(store, stale.pending_id)[-1][:3] == (
+        "pending", "needs_revalidation", "policy_version_mismatch"
+    )
+
+
+def test_approval_claim_and_finalize_are_separate_audited_transitions(tmp_path, monkeypatch, capsys):
+    c = cfg(tmp_path)
+    store = PendingKanbanStore(c.store_path)
+    pending = store.put_pending(proposal(title="Implement approval transition tests"), binding(), c, now=100)
+    _migrate_audit(c)
+    capsys.readouterr()
+    monkeypatch.setattr("gateway.kanban_intake.time.time", lambda: 101.0)
+    monkeypatch.setattr(
+        "gateway.kanban_intake.execute_pending_approval",
+        lambda *_: ApprovalResult(True, "ok", task_id="t_test", verified=True, action="approve"),
+    )
+
+    result = handle_reply("승인", binding(), c, store)
+
+    assert result.verified is True
+    assert [row[:3] for row in _transition_rows(store, pending.pending_id)] == [
+        ("pending", "pending", "legacy_state_observed"),
+        ("pending", "executing", "approval_execution_claimed"),
+        ("executing", "executed", "approval_execution_succeeded"),
+    ]
+
+
+def _execution_fixture(tmp_path, capsys):
+    c = cfg(tmp_path)
+    store = PendingKanbanStore(c.store_path)
+    pending = store.put_pending(
+        proposal(title="Implement crash reconciliation tests"), binding(), c, now=100
+    )
+    _migrate_audit(c)
+    capsys.readouterr()
+    store.transition_status(
+        pending.pending_id,
+        expected_status="pending",
+        status="executing",
+        reason_code="approval_execution_claimed",
+        invocation_key=f"reply:v1:{pending.pending_id}:claim",
+        now=101,
+    )
+    board_path = tmp_path / "board.db"
+    from hermes_cli import kanban_db as kb
+
+    with sqlite3.connect(board_path) as conn:
+        conn.executescript(kb.SCHEMA_SQL)
+    return c, store, pending, board_path
+
+
+def test_retry_resumes_execution_after_crash_before_board_commit(
+    tmp_path, monkeypatch, capsys
+):
+    c, store, pending, board_path = _execution_fixture(tmp_path, capsys)
+    monkeypatch.setattr("gateway.kanban_intake.time.time", lambda: 300.0)
+    from hermes_cli import kanban_db as kb
+
+    def connect(*_args, **_kwargs):
+        conn = sqlite3.connect(board_path)
+        conn.row_factory = sqlite3.Row
+        return conn
+
+    monkeypatch.setattr(kb, "connect", connect)
+    monkeypatch.setattr(
+        "gateway.kanban_intake.execute_pending_approval",
+        lambda *_: ApprovalResult(
+            True, "resumed", task_id="t_resumed", verified=True, action="approve"
+        ),
+    )
+    result = handle_reply("승인", binding(), c, store)
+    assert result.verified is True
+    assert _transition_rows(store, pending.pending_id)[-1][:3] == (
+        "executing",
+        "executed",
+        "approval_execution_succeeded",
+    )
+
+
+def test_retry_reconciles_execution_after_crash_after_board_commit(
+    tmp_path, monkeypatch, capsys
+):
+    c, store, pending, board_path = _execution_fixture(tmp_path, capsys)
+    monkeypatch.setattr("gateway.kanban_intake.time.time", lambda: 300.0)
+    from gateway.kanban_intake import _safe_contract_body
+
+    with sqlite3.connect(board_path) as conn:
+        conn.execute(
+            "INSERT INTO tasks "
+            "(id, title, body, assignee, status, priority, created_by, created_at, "
+            "workspace_kind, tenant, idempotency_key, session_id) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            (
+                "t_committed",
+                pending.proposal.title,
+                _safe_contract_body(pending.proposal),
+                pending.proposal.assignee,
+                pending.proposal.proposed_status,
+                int(pending.proposal.priority),
+                "kanban-intake",
+                101,
+                "scratch",
+                pending.proposal.tenant,
+                pending.proposal.idempotency_key,
+                pending.binding.session_key,
+            ),
+        )
+    from hermes_cli import kanban_db as kb
+
+    def connect(*_args, **_kwargs):
+        conn = sqlite3.connect(board_path)
+        conn.row_factory = sqlite3.Row
+        return conn
+
+    monkeypatch.setattr(kb, "connect", connect)
+    monkeypatch.setattr(
+        "gateway.kanban_intake.execute_pending_approval",
+        lambda *_: (_ for _ in ()).throw(AssertionError("must not execute again")),
+    )
+    result = handle_reply("승인", binding(), c, store)
+    assert result.verified is True
+    assert result.task_id == "t_committed"
+    assert _transition_rows(store, pending.pending_id)[-1][:3] == (
+        "executing",
+        "executed",
+        "approval_execution_succeeded",
+    )
+
+
+def test_retention_purge_removes_due_row_and_matching_audits_but_not_early(tmp_path, capsys):
+    c = cfg(tmp_path)
+    store = PendingKanbanStore(c.store_path)
+    pending = store.put_pending(
+        proposal(title="Implement paired retention purge for Kanban intake"),
+        binding(),
+        c,
+        now=100,
+    )
+    _migrate_audit(c)
+    capsys.readouterr()
+    store.transition_status(
+        pending.pending_id,
+        expected_status="pending",
+        status="dismissed",
+        reason_code="cleanup_confirmed",
+        invocation_key="external:v1:retention",
+        now=101,
+    )
+
+    assert store.purge(now=pending.purge_after - 1) == 0
+    assert len(_transition_rows(store, pending.pending_id)) == 2
+    assert store.purge(now=pending.purge_after) == 1
+    with sqlite3.connect(store.path) as conn:
+        assert conn.execute(
+            "SELECT COUNT(*) FROM kanban_intake_pending WHERE pending_id = ?",
+            (pending.pending_id,),
+        ).fetchone()[0] == 0
+        assert conn.execute(
+            "SELECT COUNT(*) FROM kanban_intake_transition_audit WHERE pending_id = ?",
+            (pending.pending_id,),
+        ).fetchone()[0] == 0

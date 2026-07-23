@@ -29,6 +29,80 @@ from utils import env_var_enabled, is_truthy_value
 
 logger = logging.getLogger(__name__)
 
+
+def _pending_denial(action: str, decision: str) -> dict:
+    return {
+        "schema": "kanban-intake-pending-operation/v1",
+        "action": action,
+        "decision": decision,
+        "status": None,
+        "replayed": False,
+        "reason_code": None,
+    }
+
+
+def pending_read(store, binding, pending_id: str, *, now: float | None = None) -> dict:
+    try:
+        return store.registered_projection(pending_id, binding, now=now)
+    except RuntimeError:
+        return _pending_denial("pending_read", "deny_owner_unavailable")
+    except PermissionError:
+        return _pending_denial("pending_read", "deny_target_mismatch")
+    except (TypeError, ValueError):
+        return _pending_denial("pending_read", "deny_schema_invalid")
+
+
+def pending_soft_delete(
+    store,
+    binding,
+    pending_id: str,
+    *,
+    reason_code: str,
+    invocation_key: str,
+    now: float | None = None,
+) -> dict:
+    if reason_code not in {"user_dismissed", "superseded", "cleanup_confirmed"}:
+        return _pending_denial("pending_soft_delete", "deny_schema_invalid")
+    try:
+        return store.registered_soft_delete(
+            pending_id,
+            binding,
+            reason_code=reason_code,
+            invocation_key=invocation_key,
+            now=now,
+        )
+    except RuntimeError:
+        return _pending_denial("pending_soft_delete", "deny_owner_unavailable")
+    except PermissionError:
+        return _pending_denial("pending_soft_delete", "deny_target_mismatch")
+    except (TypeError, ValueError):
+        return _pending_denial(
+            "pending_soft_delete", "deny_soft_delete_not_restorable"
+        )
+
+
+def pending_restore(
+    store,
+    binding,
+    pending_id: str,
+    *,
+    invocation_key: str,
+    now: float | None = None,
+) -> dict:
+    try:
+        return store.registered_restore(
+            pending_id,
+            binding,
+            invocation_key=invocation_key,
+            now=now,
+        )
+    except RuntimeError:
+        return _pending_denial("pending_restore", "deny_owner_unavailable")
+    except PermissionError:
+        return _pending_denial("pending_restore", "deny_target_mismatch")
+    except (TypeError, ValueError):
+        return _pending_denial("pending_restore", "deny_soft_delete_not_restorable")
+
 # Freeze YOLO mode at module import time. Reading os.environ on every call
 # would allow any skill running inside the process to set this variable and
 # instantly bypass all approval checks — a prompt-injection escalation path.

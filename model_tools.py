@@ -388,9 +388,13 @@ def _compute_tool_definitions(
                 print(f"⚠️  Unknown toolset: {toolset_name}")
     else:
         # Default: start with everything
+        # Preserve the historical ``None == all toolsets`` contract while
+        # keeping this capability's model-facing schema explicitly opt-in.
         from toolsets import get_all_toolsets
+
         for ts_name in get_all_toolsets():
-            tools_to_include.update(resolve_toolset(ts_name))
+            if ts_name != "registered-workflow":
+                tools_to_include.update(resolve_toolset(ts_name))
 
     # Always apply disabled toolsets as a subtraction step at the end.
     # This ensures that even if a composite toolset (like hermes-cli)

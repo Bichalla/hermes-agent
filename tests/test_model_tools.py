@@ -11,12 +11,42 @@ from model_tools import (
     _AGENT_LOOP_TOOLS,
     _LEGACY_TOOLSET_MAP,
     TOOL_TO_TOOLSET_MAP,
+    _clear_tool_defs_cache,
+    get_tool_definitions,
 )
 
 
 # =========================================================================
 # handle_function_call
 # =========================================================================
+
+
+def test_default_toolset_expansion_excludes_registered_workflow_until_explicit_opt_in():
+    def names(definitions):
+        return {item.get("function", {}).get("name") for item in definitions}
+
+    with (
+        patch("tools.registered_local_workflow._feature_enabled", return_value=True),
+        patch("tools.registered_local_workflow._dependencies_ready", return_value=True),
+    ):
+        _clear_tool_defs_cache()
+        default_names = names(
+            get_tool_definitions(
+                None, quiet_mode=True, skip_tool_search_assembly=True
+            )
+        )
+        _clear_tool_defs_cache()
+        explicit_names = names(
+            get_tool_definitions(
+                ["registered-workflow"],
+                quiet_mode=True,
+                skip_tool_search_assembly=True,
+            )
+        )
+        _clear_tool_defs_cache()
+
+    assert "registered_local_workflow" not in default_names
+    assert "registered_local_workflow" in explicit_names
 
 class TestHandleFunctionCall:
     def test_agent_loop_tool_returns_error(self):

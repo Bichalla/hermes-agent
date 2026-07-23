@@ -29,6 +29,7 @@ through the board.
 from __future__ import annotations
 
 import json
+import hashlib
 import logging
 import os
 from typing import Any, Optional
@@ -826,6 +827,7 @@ def _handle_comment(args: dict, **kw) -> str:
     board = args.get("board")
     from tools.workflow_authority import (
         get_current_turn_user_authority,
+        matches_active_workflow_turn,
         opaque_workflow_action_id,
     )
 
@@ -835,14 +837,77 @@ def _handle_comment(args: dict, **kw) -> str:
         return tool_error(
             "kanban_comment: current-turn user authority or worker-task scope required"
         )
-    if authority is not None and not authority.allows("status_memory", str(tid)):
+    if authority is not None and (
+        not matches_active_workflow_turn(authority)
+        or not authority.source_event_fingerprint
+        or not authority.allows_operation_target(
+            "kanban_status_memory_comment", str(tid)
+        )
+    ):
         return tool_error(
             "kanban_comment: current user turn did not authorize this card target"
         )
     try:
         kb, conn = _connect(board=board)
         try:
-            cid = kb.add_comment(conn, tid, author=author, body=str(body))
+            normalized_board = (
+                kb._normalize_board_slug(str(board)) if board is not None
+                else kb.get_current_board()
+            ) or kb.DEFAULT_BOARD
+            if authority is not None and kb._status_memory_idempotency_state(conn) != "ready":
+                return tool_error(
+                    "kanban_comment: status-memory owner migration is not ready"
+                )
+            # The key is internal-only: never accept it from model args and
+            # never expose it in KANBAN_COMMENT_SCHEMA. It is derived from the
+            # trusted foreground authority or the dispatcher's run identity.
+            # Including the exact redacted payload scope makes only byte-for-
+            # byte semantic retries converge; a distinct note remains a new
+            # append even inside the same turn/run.
+            key_source: Optional[dict[str, Any]] = None
+            if authority is not None:
+                key_source = {
+                    "kind": "foreground",
+                    "source_event_fingerprint": authority.source_event_fingerprint,
+                }
+            else:
+                worker_task = os.environ.get("HERMES_KANBAN_TASK")
+                worker_run = os.environ.get("HERMES_KANBAN_RUN_ID")
+                if worker_task and worker_run:
+                    key_source = {
+                        "kind": "dispatcher_run",
+                        "worker_task": worker_task,
+                        "worker_run": worker_run,
+                    }
+            idempotency_key: Optional[str] = None
+            if key_source is not None:
+                canonical = json.dumps(
+                    {
+                        "v": 1,
+                        "capability": "kanban.status-memory.v1",
+                        "operation": "kanban_status_memory_comment",
+                        "source": key_source,
+                        "board": normalized_board,
+                        "task_id": str(tid),
+                        "body_sha256": hashlib.sha256(
+                            str(body).encode("utf-8")
+                        ).hexdigest(),
+                    },
+                    sort_keys=True,
+                    separators=(",", ":"),
+                    ensure_ascii=False,
+                ).encode("utf-8")
+                idempotency_key = (
+                    "kanban-status-memory:v1:" + hashlib.sha256(canonical).hexdigest()
+                )
+            cid = kb.add_comment(
+                conn,
+                tid,
+                author=author,
+                body=str(body),
+                board=normalized_board,
+                idempotency_key=idempotency_key,
+            )
             from agent.workflow_action_policy import WorkflowAction, classify_workflow_action
             from tools.approval import build_approval_decision_evidence
 
@@ -919,6 +984,7 @@ def _handle_create(args: dict, **kw) -> str:
         )
         from tools.workflow_authority import (
             get_current_turn_user_authority,
+            matches_active_workflow_turn,
             select_blocked_create_target_fingerprint,
         )
 
@@ -926,6 +992,8 @@ def _handle_create(args: dict, **kw) -> str:
         if (
             blocked_authority is None
             or not blocked_authority.user_action_fingerprint
+            or not blocked_authority.source_event_fingerprint
+            or not matches_active_workflow_turn(blocked_authority)
             or not blocked_authority.allows("explicit_blocked_card_create")
         ):
             return tool_error(
@@ -947,7 +1015,7 @@ def _handle_create(args: dict, **kw) -> str:
         )
         expected_key = build_blocked_card_idempotency_key_from_fingerprint(
             board=str(board or os.environ.get("HERMES_KANBAN_BOARD") or "current"),
-            user_action_fingerprint=blocked_authority.user_action_fingerprint,
+            user_action_fingerprint=blocked_authority.source_event_fingerprint,
             target_scope=target_scope,
         )
         if idempotency_key and idempotency_key != expected_key:

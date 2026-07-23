@@ -36,10 +36,14 @@ from agent.model_metadata import (
 )
 from tools.workflow_authority import (
     CurrentTurnUserAuthority,
+    bind_active_workflow_turn,
     bind_current_turn_user_authority,
     clear_current_turn_user_authority,
     fingerprint_user_action,
     infer_explicit_blocked_create_targets,
+    infer_coarse_estimate_authority,
+    infer_explicit_workflow_grants,
+    infer_explicit_workflow_operations,
     infer_explicit_workflow_scope,
 )
 
@@ -389,27 +393,58 @@ def build_turn_context(
             pass
 
     if _accepts_current_user_authority(agent):
+        from gateway.session_context import get_session_env
+
+        message_id = get_session_env("HERMES_SESSION_MESSAGE_ID", "").strip()
+        source_event_fingerprint = ""
+        if message_id:
+            source_event_fingerprint = fingerprint_user_action(
+                "source-event/v1\n"
+                + "\n".join(
+                    (
+                        get_session_env("HERMES_SESSION_PLATFORM", ""),
+                        get_session_env("HERMES_SESSION_CHAT_ID", ""),
+                        get_session_env("HERMES_SESSION_THREAD_ID", ""),
+                        get_session_env("HERMES_SESSION_USER_ID", ""),
+                        message_id,
+                    )
+                )
+            )
         allowed_action_classes, target_fingerprints = infer_explicit_workflow_scope(
             original_user_message
         )
-        bind_current_turn_user_authority(
-            CurrentTurnUserAuthority(
-                turn_id=turn_id,
-                source_role="user",
-                session_scope=str(agent.session_id or "session"),
-                platform_scope=str(getattr(agent, "platform", "") or "unknown"),
-                user_message_index=current_turn_user_idx,
-                user_action_fingerprint=fingerprint_user_action(
-                    original_user_message
-                ),
-                allowed_action_classes=allowed_action_classes,
-                target_fingerprints=target_fingerprints,
-                blocked_create_target_fingerprints=(
-                    infer_explicit_blocked_create_targets(original_user_message)
-                ),
-            )
+        operation_target_grants = infer_explicit_workflow_grants(
+            original_user_message
         )
-
+        authority = CurrentTurnUserAuthority(
+            turn_id=turn_id,
+            source_role="user",
+            session_scope=str(agent.session_id or "session"),
+            platform_scope=str(getattr(agent, "platform", "") or "unknown"),
+            user_message_index=current_turn_user_idx,
+            user_action_fingerprint=fingerprint_user_action(
+                original_user_message
+            ),
+            source_event_fingerprint=source_event_fingerprint,
+            allowed_action_classes=allowed_action_classes,
+            allowed_operations=infer_explicit_workflow_operations(
+                original_user_message
+            ),
+            operation_target_grants=operation_target_grants,
+            target_fingerprints=target_fingerprints,
+            blocked_create_target_fingerprints=(
+                infer_explicit_blocked_create_targets(original_user_message)
+            ),
+            coarse_estimate_authorized=infer_coarse_estimate_authority(
+                original_user_message
+            ),
+        )
+        bind_current_turn_user_authority(authority)
+        bind_active_workflow_turn(
+            authority.turn_id,
+            authority.platform_scope,
+            authority.session_scope,
+        )
     if not agent.quiet_mode:
         _print_preview = summarize_user_message_for_log(user_message)
         agent._safe_print(

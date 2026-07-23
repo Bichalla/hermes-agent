@@ -2039,6 +2039,16 @@ def _resolve_notification_flag_conflict(
 
 def _command_with_current_turn_fingerprint(command: str) -> str:
     """Inject hidden user-action provenance into a child command only."""
+    normalized_command = command.casefold()
+    owner_only_tokens = (
+        "review_ledger",
+        "review-ledger.sqlite3",
+        "run_registered_lifelog_recorder",
+        "run_registered_recorder.py",
+        "record_diet_intake.py",
+    )
+    if any(token in normalized_command for token in owner_only_tokens):
+        raise ValueError("registered owner route is unavailable to terminal commands")
     reserved_names = (
         "HERMES_CURRENT_USER_ACTION_FINGERPRINT",
         "HERMES_CURRENT_USER_REQUEST_TARGET_FINGERPRINT",
@@ -2060,11 +2070,7 @@ def _command_with_current_turn_fingerprint(command: str) -> str:
         and "--initial-status blocked" in normalized
         and authority.allows("explicit_blocked_card_create")
     )
-    registered_record = (
-        "run_registered_lifelog_recorder.py" in normalized
-        and authority.allows("trusted_local_record")
-    )
-    if not (blocked_create or registered_record):
+    if not blocked_create:
         return command
     assignments = [
         "HERMES_CURRENT_USER_ACTION_FINGERPRINT="

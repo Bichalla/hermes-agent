@@ -971,6 +971,145 @@ def test_comment_happy_path(worker_env):
         conn.close()
 
 
+def test_comment_schema_does_not_expose_internal_idempotency_key():
+    from tools.kanban_tools import KANBAN_COMMENT_SCHEMA
+
+    properties = KANBAN_COMMENT_SCHEMA["parameters"]["properties"]
+    assert "idempotency_key" not in properties
+
+
+def test_comment_foreground_exact_retry_returns_same_comment_id(
+    worker_env, monkeypatch
+):
+    from hermes_cli import kanban_db as kb
+    from tools import kanban_tools as kt
+    from tools.workflow_authority import (
+        CurrentTurnUserAuthority,
+        bind_active_workflow_turn,
+        bind_current_turn_user_authority,
+        clear_current_turn_user_authority,
+        fingerprint_user_action,
+        fingerprint_workflow_target,
+        reset_current_turn_user_authority,
+    )
+
+    monkeypatch.delenv("HERMES_KANBAN_TASK", raising=False)
+    with kb.connect() as conn:
+        kb.migrate_status_memory_idempotency(conn, dry_run=False)
+
+    authority = CurrentTurnUserAuthority(
+        turn_id="turn-comment-retry",
+        source_role="user",
+        session_scope="test-session",
+        platform_scope="synthetic",
+        user_message_index=0,
+        user_action_fingerprint=fingerprint_user_action(
+            "record the focused test result on this card"
+        ),
+        source_event_fingerprint=fingerprint_user_action("message-comment-retry"),
+        allowed_action_classes=frozenset({"status_memory"}),
+        allowed_operations=frozenset({"kanban_status_memory_comment"}),
+        operation_target_grants=frozenset(
+            {
+                (
+                    "kanban_status_memory_comment",
+                    fingerprint_workflow_target(worker_env),
+                )
+            }
+        ),
+        target_fingerprints=frozenset({fingerprint_workflow_target(worker_env)}),
+    )
+    bind_active_workflow_turn(
+        authority.turn_id, authority.platform_scope, authority.session_scope
+    )
+    token = bind_current_turn_user_authority(authority)
+    try:
+        args = {"task_id": worker_env, "body": "focused tests passed"}
+        first = json.loads(kt._handle_comment(dict(args)))
+    finally:
+        reset_current_turn_user_authority(token)
+        clear_current_turn_user_authority()
+
+    from dataclasses import replace
+
+    reconstructed = replace(authority, turn_id="turn-comment-reconstructed")
+    bind_active_workflow_turn(
+        reconstructed.turn_id,
+        reconstructed.platform_scope,
+        reconstructed.session_scope,
+    )
+    token = bind_current_turn_user_authority(reconstructed)
+    try:
+        second = json.loads(kt._handle_comment(dict(args)))
+    finally:
+        reset_current_turn_user_authority(token)
+        clear_current_turn_user_authority()
+
+    assert first["ok"] is True
+    assert second["comment_id"] == first["comment_id"]
+    with kb.connect() as conn:
+        assert len(kb.list_comments(conn, worker_env)) == 1
+
+
+def test_comment_dispatcher_run_exact_retry_preserves_cross_task_handoff(
+    worker_env, monkeypatch
+):
+    from hermes_cli import kanban_db as kb
+    from tools import kanban_tools as kt
+
+    with kb.connect() as conn:
+        run = kb.latest_run(conn, worker_env)
+        assert run is not None
+        foreign_task = kb.create_task(conn, title="handoff target", assignee="peer")
+        kb.migrate_status_memory_idempotency(conn, dry_run=False)
+    monkeypatch.setenv("HERMES_KANBAN_RUN_ID", str(run.id))
+
+    args = {
+        "task_id": foreign_task,
+        "body": "handoff: focused verification is green",
+    }
+    first = json.loads(kt._handle_comment(dict(args)))
+    second = json.loads(kt._handle_comment(dict(args)))
+
+    assert first["ok"] is True
+    assert second["comment_id"] == first["comment_id"]
+    with kb.connect() as conn:
+        comments = kb.list_comments(conn, foreign_task)
+    assert len(comments) == 1
+    assert comments[0].author == "test-worker"
+
+
+def test_comment_dispatcher_run_keeps_distinct_handoff_bodies(
+    worker_env, monkeypatch
+):
+    from hermes_cli import kanban_db as kb
+    from tools import kanban_tools as kt
+
+    with kb.connect() as conn:
+        run = kb.latest_run(conn, worker_env)
+        assert run is not None
+        foreign_task = kb.create_task(conn, title="distinct handoff target", assignee="peer")
+        kb.migrate_status_memory_idempotency(conn, dry_run=False)
+    monkeypatch.setenv("HERMES_KANBAN_RUN_ID", str(run.id))
+
+    first = json.loads(
+        kt._handle_comment({"task_id": foreign_task, "body": "handoff: test A passed"})
+    )
+    second = json.loads(
+        kt._handle_comment({"task_id": foreign_task, "body": "handoff: test B passed"})
+    )
+
+    assert first["ok"] is True
+    assert second["ok"] is True
+    assert second["comment_id"] != first["comment_id"]
+    with kb.connect() as conn:
+        comments = kb.list_comments(conn, foreign_task)
+    assert [comment.body for comment in comments] == [
+        "handoff: test A passed",
+        "handoff: test B passed",
+    ]
+
+
 def test_comment_rejects_empty_body(worker_env):
     from tools import kanban_tools as kt
     out = kt._handle_comment({"task_id": worker_env, "body": "   "})
@@ -1037,21 +1176,30 @@ def test_create_blocked_auto_idempotency_and_evidence(worker_env):
     from hermes_cli import kanban_db as kb
     from tools.workflow_authority import (
         CurrentTurnUserAuthority,
+        bind_active_workflow_turn,
         bind_current_turn_user_authority,
+        clear_current_turn_user_authority,
         fingerprint_user_action,
         reset_current_turn_user_authority,
     )
 
     def authority(message: str, turn_id: str) -> CurrentTurnUserAuthority:
-        return CurrentTurnUserAuthority(
+        value = CurrentTurnUserAuthority(
             turn_id=turn_id,
             source_role="user",
             session_scope="test",
             platform_scope="synthetic",
             user_message_index=0,
             user_action_fingerprint=fingerprint_user_action(message),
+            source_event_fingerprint=fingerprint_user_action(
+                f"source-event:{turn_id}"
+            ),
             allowed_action_classes=frozenset({"explicit_blocked_card_create"}),
         )
+        bind_active_workflow_turn(
+            value.turn_id, value.platform_scope, value.session_scope
+        )
+        return value
 
     args = {
         "title": "Review blocked approval card",
@@ -1068,6 +1216,7 @@ def test_create_blocked_auto_idempotency_and_evidence(worker_env):
         )
     finally:
         reset_current_turn_user_authority(token)
+        clear_current_turn_user_authority()
 
     token = bind_current_turn_user_authority(
         authority("create a different review card", "opaque-turn-b")
@@ -1076,6 +1225,7 @@ def test_create_blocked_auto_idempotency_and_evidence(worker_env):
         different_request_same_title = json.loads(kt._handle_create(dict(args)))
     finally:
         reset_current_turn_user_authority(token)
+        clear_current_turn_user_authority()
 
     assert first["ok"] is True
     assert retry_with_rephrased_title["task_id"] == first["task_id"]
@@ -1098,7 +1248,9 @@ def test_same_turn_blocked_creates_use_distinct_authorized_target_discriminators
     from tools import kanban_tools as kt
     from tools.workflow_authority import (
         CurrentTurnUserAuthority,
+        bind_active_workflow_turn,
         bind_current_turn_user_authority,
+        clear_current_turn_user_authority,
         fingerprint_user_action,
         fingerprint_workflow_target,
         reset_current_turn_user_authority,
@@ -1111,6 +1263,7 @@ def test_same_turn_blocked_creates_use_distinct_authorized_target_discriminators
         platform_scope="synthetic",
         user_message_index=0,
         user_action_fingerprint=fingerprint_user_action("create cards A and B"),
+        source_event_fingerprint=fingerprint_user_action("source-event:multi-create"),
         allowed_action_classes=frozenset({"explicit_blocked_card_create"}),
         blocked_create_target_fingerprints=frozenset(
             {
@@ -1118,6 +1271,9 @@ def test_same_turn_blocked_creates_use_distinct_authorized_target_discriminators
                 fingerprint_workflow_target("Card B"),
             }
         ),
+    )
+    bind_active_workflow_turn(
+        authority.turn_id, authority.platform_scope, authority.session_scope
     )
     token = bind_current_turn_user_authority(authority)
     try:
@@ -1138,6 +1294,7 @@ def test_same_turn_blocked_creates_use_distinct_authorized_target_discriminators
         )
     finally:
         reset_current_turn_user_authority(token)
+        clear_current_turn_user_authority()
 
     assert first_retry["task_id"] == first["task_id"]
     assert second["task_id"] != first["task_id"]
@@ -2279,10 +2436,14 @@ def test_create_subscribes_gateway_session(monkeypatch, worker_env):
     to its own kanban_create result, and the response surfaces the
     ``subscribed`` flag so the orchestrator can react."""
     from tools import kanban_tools as kt
-    monkeypatch.setenv("HERMES_SESSION_PLATFORM", "telegram")
-    monkeypatch.setenv("HERMES_SESSION_CHAT_ID", "chat-42")
-    monkeypatch.setenv("HERMES_SESSION_THREAD_ID", "thread-7")
-    monkeypatch.setenv("HERMES_SESSION_USER_ID", "user-9")
+    from gateway.session_context import clear_session_vars, set_session_vars
+
+    tokens = set_session_vars(
+        platform="telegram",
+        chat_id="chat-42",
+        thread_id="thread-7",
+        user_id="user-9",
+    )
 
     out = kt._handle_create({
         "title": "auto-sub gateway",
@@ -2300,6 +2461,7 @@ def test_create_subscribes_gateway_session(monkeypatch, worker_env):
     assert s["chat_id"] == "chat-42"
     assert s["thread_id"] == "thread-7"
     assert s["user_id"] == "user-9"
+    clear_session_vars(tokens)
 
 
 def test_create_subscribes_tui_session_via_session_key(monkeypatch, worker_env):

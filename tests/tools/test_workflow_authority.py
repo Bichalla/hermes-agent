@@ -3,19 +3,25 @@
 from __future__ import annotations
 
 import concurrent.futures
+import threading
 
 import pytest
 
 from tools.thread_context import propagate_context_to_thread
 from tools.workflow_authority import (
     CurrentTurnUserAuthority,
+    bind_active_workflow_turn,
     bind_current_turn_user_authority,
     clear_current_turn_user_authority,
     fingerprint_user_action,
     fingerprint_workflow_target,
     get_current_turn_user_authority,
     infer_explicit_blocked_create_targets,
+    infer_coarse_estimate_authority,
+    infer_explicit_workflow_grants,
+    infer_explicit_workflow_operations,
     infer_explicit_workflow_scope,
+    matches_active_workflow_turn,
     opaque_workflow_action_id,
     reset_current_turn_user_authority,
     select_blocked_create_target_fingerprint,
@@ -63,9 +69,14 @@ def test_only_user_role_can_construct_authority():
 def test_bind_and_clear_authority():
     authority = _authority()
     bind_current_turn_user_authority(authority)
+    bind_active_workflow_turn(
+        authority.turn_id, authority.platform_scope, authority.session_scope
+    )
     assert get_current_turn_user_authority() is authority
+    assert matches_active_workflow_turn(authority) is True
     clear_current_turn_user_authority()
     assert get_current_turn_user_authority() is None
+    assert matches_active_workflow_turn(authority) is False
 
 
 def test_authority_propagates_through_audited_tool_thread_wrapper():
@@ -84,6 +95,28 @@ def test_bare_background_thread_starts_without_foreground_authority():
     assert observed is None
 
 
+def test_propagated_detached_thread_is_revoked_when_parent_turn_clears():
+    authority = _authority()
+    bind_current_turn_user_authority(authority)
+    bind_active_workflow_turn(
+        authority.turn_id, authority.platform_scope, authority.session_scope
+    )
+    entered = threading.Event()
+    release = threading.Event()
+
+    def observe_after_parent_exit():
+        entered.set()
+        assert release.wait(timeout=5)
+        return matches_active_workflow_turn(authority)
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=1) as executor:
+        future = executor.submit(propagate_context_to_thread(observe_after_parent_exit))
+        assert entered.wait(timeout=5)
+        clear_current_turn_user_authority()
+        release.set()
+        assert future.result(timeout=5) is False
+
+
 def test_user_action_fingerprint_is_stable_raw_free_and_message_sensitive():
     first = fingerprint_user_action("  Create   blocked card ")
     assert first == fingerprint_user_action("create blocked card")
@@ -92,11 +125,15 @@ def test_user_action_fingerprint_is_stable_raw_free_and_message_sensitive():
     assert len(first) == 64
 
 
-def test_opaque_action_id_never_uses_resource_identifier():
+def test_opaque_action_id_never_uses_turn_session_or_resource_identifier():
     authority = _authority()
-    assert opaque_workflow_action_id(authority) == authority.turn_id
+    first = opaque_workflow_action_id(authority)
     generated = opaque_workflow_action_id(None)
+    assert first.startswith("opaque-action-")
     assert generated.startswith("opaque-action-")
+    assert first != generated
+    assert authority.turn_id not in first
+    assert authority.session_scope not in first
     assert "t_deadbeef" not in generated
 
 
@@ -121,6 +158,90 @@ def test_scope_inference_is_action_and_explicit_card_target_specific():
     assert unrelated_targets == frozenset()
 
 
+@pytest.mark.parametrize(
+    "message,operation",
+    [
+        ("kp_0123456789abcdef 후보를 soft delete 해줘", "pending_soft_delete"),
+        ("kp_0123456789abcdef 후보 삭제", "pending_soft_delete"),
+        ("kp_0123456789abcdef 복원해줘", "pending_restore"),
+        ("undo kp_0123456789abcdef", "pending_restore"),
+        ("kp_0123456789abcdef 후보 조회", "pending_read"),
+    ],
+)
+def test_pending_scope_inference_binds_exact_operation_and_target(message, operation):
+    classes, targets = infer_explicit_workflow_scope(message)
+    assert classes == frozenset({"registered_soft_delete"})
+    assert targets == frozenset(
+        {fingerprint_workflow_target("kp_0123456789abcdef")}
+    )
+    assert infer_explicit_workflow_operations(message) == frozenset({operation})
+    assert infer_explicit_workflow_grants(message) == frozenset(
+        {(operation, fingerprint_workflow_target("kp_0123456789abcdef"))}
+    )
+
+
+def test_ambiguous_or_targetless_pending_language_mints_no_operation():
+    assert infer_explicit_workflow_operations("후보 삭제해줘") == frozenset()
+    assert infer_explicit_workflow_operations(
+        "kp_0123456789abcdef 삭제했다가 복원해줘"
+    ) == frozenset()
+    assert infer_explicit_workflow_grants(
+        "kp_0123456789abcdef 삭제하지 마"
+    ) == frozenset()
+    assert infer_explicit_workflow_grants(
+        "kp_0123456789abcdef와 kp_ffffffffffffffff 삭제"
+    ) == frozenset()
+
+
+@pytest.mark.parametrize(
+    "message",
+    [
+        "Never dismiss kp_0123456789abcdef",
+        "Explain how to restore kp_0123456789abcdef",
+        "Should I record this meal?",
+        "I dismissed kp_0123456789abcdef yesterday",
+        "식사 안 했어. 기록해줘",
+        "Record that I did not eat this meal",
+        "kp_0123456789abcdef 삭제 안 해줘",
+        "t_deadbeef와 t_cafebabe 카드에 댓글을 기록해줘",
+    ],
+)
+def test_non_commands_and_multi_target_text_mint_no_grants(message):
+    classes, _targets = infer_explicit_workflow_scope(message)
+    assert classes == frozenset()
+    assert infer_explicit_workflow_grants(message) == frozenset()
+
+
+def test_phase1_diet_and_medication_text_mint_no_registered_grants():
+    assert infer_explicit_workflow_grants("점심 식사 기록해줘") == frozenset()
+    assert infer_explicit_workflow_grants("식사 기록하지 마") == frozenset()
+    assert infer_explicit_workflow_grants("약 복약 기록해줘") == frozenset()
+    # Legacy parsing helper is inert because no Phase 1 operation consumes it.
+    assert infer_coarse_estimate_authority("영양 추정해") is True
+    assert infer_coarse_estimate_authority("영양 추정하지 마") is False
+
+
+@pytest.mark.parametrize(
+    "message",
+    [
+        "t_deadbeef 카드에 검증 요약 업데이트해줘",
+        "t_deadbeef 카드에 진행 상황 기록해줘",
+        "t_deadbeef 카드에 아티팩트 링크 첨부해줘",
+        "add the PR URL to t_deadbeef as a status update",
+        "write a handoff note on t_deadbeef",
+    ],
+)
+def test_status_memory_vocabulary_mints_exact_comment_grant(message):
+    assert infer_explicit_workflow_grants(message) == frozenset(
+        {
+            (
+                "kanban_status_memory_comment",
+                fingerprint_workflow_target("t_deadbeef"),
+            )
+        }
+    )
+
+
 def test_authority_requires_matching_class_and_target():
     authority = CurrentTurnUserAuthority(
         turn_id="opaque-scoped-turn",
@@ -137,6 +258,66 @@ def test_authority_requires_matching_class_and_target():
     assert authority.allows("status_memory", "t_deadbeef") is True
     assert authority.allows("status_memory", "t_other123") is False
     assert authority.allows("explicit_blocked_card_create") is False
+
+
+def test_pending_authority_requires_matching_operation_and_target():
+    authority = CurrentTurnUserAuthority(
+        turn_id="opaque-pending-turn",
+        source_role="user",
+        session_scope="test",
+        platform_scope="discord",
+        user_message_index=0,
+        user_action_fingerprint=fingerprint_user_action("dismiss pending"),
+        allowed_action_classes=frozenset({"registered_soft_delete"}),
+        allowed_operations=frozenset({"pending_soft_delete"}),
+        operation_target_grants=frozenset(
+            {
+                (
+                    "pending_soft_delete",
+                    fingerprint_workflow_target("kp_0123456789abcdef"),
+                )
+            }
+        ),
+        target_fingerprints=frozenset(
+            {fingerprint_workflow_target("kp_0123456789abcdef")}
+        ),
+    )
+    assert authority.allows(
+        "registered_soft_delete",
+        "kp_0123456789abcdef",
+        operation="pending_soft_delete",
+    )
+    assert not authority.allows(
+        "registered_soft_delete",
+        "kp_0123456789abcdef",
+        operation="pending_restore",
+    )
+    assert not authority.allows(
+        "registered_soft_delete",
+        "kp_ffffffffffffffff",
+        operation="pending_soft_delete",
+    )
+    assert authority.allows_operation_target(
+        "pending_soft_delete", "kp_0123456789abcdef"
+    )
+    assert not authority.allows_operation_target(
+        "pending_soft_delete", "kp_ffffffffffffffff"
+    )
+    assert not authority.allows_operation_target(
+        "pending_restore", "kp_0123456789abcdef"
+    )
+
+
+def test_unknown_authority_operation_is_rejected():
+    with pytest.raises(ValueError, match="allowed_operations"):
+        CurrentTurnUserAuthority(
+            turn_id="opaque-pending-turn",
+            source_role="user",
+            session_scope="test",
+            platform_scope="discord",
+            user_message_index=0,
+            allowed_operations=frozenset({"hard_delete"}),
+        )
 
 
 def test_blocked_create_target_selection_is_rephrase_stable_and_multi_target_specific():

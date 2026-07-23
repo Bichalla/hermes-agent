@@ -7,6 +7,7 @@ import os
 import sqlite3
 import subprocess
 import sys
+import threading
 import time
 import types
 import unittest.mock
@@ -51,6 +52,33 @@ def test_init_db_is_idempotent(kanban_home):
         tasks = kb.list_tasks(conn)
     assert len(tasks) == 1
     assert tasks[0].title == "persisted"
+
+
+def test_concurrent_create_task_idempotency_has_one_execution_owner(kanban_home):
+    barrier = threading.Barrier(2)
+
+    def create_once() -> str:
+        conn = kb.connect()
+        try:
+            barrier.wait(timeout=5)
+            return kb.create_task(
+                conn,
+                title="Implement atomic idempotency owner",
+                idempotency_key="pending-approval:v1:atomic-owner",
+            )
+        finally:
+            conn.close()
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=2) as pool:
+        task_ids = list(pool.map(lambda _index: create_once(), range(2)))
+
+    assert len(set(task_ids)) == 1
+    with kb.connect() as conn:
+        count = conn.execute(
+            "SELECT COUNT(*) FROM tasks WHERE idempotency_key=?",
+            ("pending-approval:v1:atomic-owner",),
+        ).fetchone()[0]
+    assert count == 1
 
 
 def test_init_creates_expected_tables(kanban_home):
@@ -1610,6 +1638,125 @@ def test_empty_comment_rejected(kanban_home):
         t = kb.create_task(conn, title="x")
         with pytest.raises(ValueError, match="body is required"):
             kb.add_comment(conn, t, "user", "")
+
+
+def test_ordinary_connect_does_not_auto_migrate_status_memory_capability(
+    kanban_home,
+):
+    with kb.connect() as conn:
+        table = conn.execute(
+            "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?",
+            (kb.STATUS_MEMORY_IDEMPOTENCY_TABLE,),
+        ).fetchone()
+
+    assert table is None
+
+
+def test_unmigrated_comment_idempotency_key_preserves_legacy_append_semantics(
+    kanban_home,
+):
+    with kb.connect() as conn:
+        task_id = kb.create_task(conn, title="legacy comments")
+        first = kb.add_comment(
+            conn,
+            task_id,
+            "worker",
+            "same status note",
+            board="default",
+            idempotency_key="comment:v1:legacy-retry",
+        )
+        second = kb.add_comment(
+            conn,
+            task_id,
+            "worker",
+            "same status note",
+            board="default",
+            idempotency_key="comment:v1:legacy-retry",
+        )
+
+        assert first != second
+        assert len(kb.list_comments(conn, task_id)) == 2
+
+
+def test_migrated_comment_exact_replay_returns_same_comment_id(kanban_home):
+    with kb.connect() as conn:
+        task_id = kb.create_task(conn, title="retry safe comments")
+        report = kb.migrate_status_memory_idempotency(conn, dry_run=False)
+        assert report["changed"] is True
+
+        first = kb.add_comment(
+            conn,
+            task_id,
+            "worker",
+            "verified focused tests",
+            board="default",
+            idempotency_key="comment:v1:exact-retry",
+        )
+        second = kb.add_comment(
+            conn,
+            task_id,
+            "worker",
+            "verified focused tests",
+            board="default",
+            idempotency_key="comment:v1:exact-retry",
+        )
+
+        assert second == first
+        assert [comment.id for comment in kb.list_comments(conn, task_id)] == [first]
+        commented = [
+            event for event in kb.list_events(conn, task_id)
+            if event.kind == "commented"
+        ]
+        assert len(commented) == 1
+
+
+@pytest.mark.parametrize(
+    ("changed_field", "changed_value"),
+    [
+        ("board", "other-board"),
+        ("task_id", "other-task"),
+        ("author", "other-worker"),
+        ("body", "materially different note"),
+    ],
+)
+def test_migrated_comment_same_key_conflicts_on_scope_or_body_digest(
+    kanban_home, changed_field, changed_value
+):
+    with kb.connect() as conn:
+        task_id = kb.create_task(conn, title="original")
+        other_task_id = kb.create_task(conn, title="other")
+        kb.migrate_status_memory_idempotency(conn, dry_run=False)
+        key = "comment:v1:scope-conflict"
+        kb.add_comment(
+            conn,
+            task_id,
+            "worker",
+            "original note",
+            board="default",
+            idempotency_key=key,
+        )
+        values = {
+            "board": "default",
+            "task_id": task_id,
+            "author": "worker",
+            "body": "original note",
+        }
+        values[changed_field] = (
+            other_task_id if changed_field == "task_id" else changed_value
+        )
+
+        with pytest.raises(kb.StatusMemoryIdempotencyConflict):
+            kb.add_comment(
+                conn,
+                values["task_id"],
+                values["author"],
+                values["body"],
+                board=values["board"],
+                idempotency_key=key,
+            )
+
+        assert len(kb.list_comments(conn, task_id)) == 1
+        assert len(kb.list_comments(conn, other_task_id)) == 0
 
 
 def test_events_capture_lifecycle(kanban_home):

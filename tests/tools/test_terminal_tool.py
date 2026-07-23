@@ -11,6 +11,23 @@ def teardown_function():
     terminal_tool._reset_cached_sudo_passwords()
 
 
+def test_terminal_rejects_registered_owner_aliases_and_import_paths():
+    commands = (
+        "python -m review_ledger.cli record-result",
+        "python -c 'import review_ledger.controller'",
+        "python scripts/run_registered_lifelog_recorder.py diet_intake.v1",
+        "cp scripts/record_diet_intake.py /tmp/x.py && python /tmp/x.py",
+        "sqlite3 ~/.hermes/ops/state/review-ledger/review-ledger.sqlite3",
+    )
+    for command in commands:
+        try:
+            terminal_tool._command_with_current_turn_fingerprint(command)
+        except ValueError as exc:
+            assert "registered owner route" in str(exc)
+        else:
+            raise AssertionError(f"owner route must be denied: {command}")
+
+
 def test_searching_for_sudo_does_not_trigger_rewrite(monkeypatch):
     monkeypatch.delenv("SUDO_PASSWORD", raising=False)
     monkeypatch.delenv("HERMES_INTERACTIVE", raising=False)
@@ -120,6 +137,23 @@ def test_terminal_rejects_model_supplied_workflow_authority_environment():
             )
 
 
+def test_terminal_hard_denies_registered_lifelog_wrapper():
+    import pytest
+
+    command = "python scripts/run_registered_lifelog_recorder.py payload.json"
+    with pytest.raises(ValueError, match="registered owner route"):
+        terminal_tool._command_with_current_turn_fingerprint(command)
+
+
+def test_terminal_hard_denies_review_ledger_controller():
+    import pytest
+
+    with pytest.raises(ValueError, match="registered owner route"):
+        terminal_tool._command_with_current_turn_fingerprint(
+            "python scripts/review_ledger_controller.py start-or-reconcile"
+        )
+
+
 def test_printf_literal_sudo_does_not_trigger_rewrite(monkeypatch):
     monkeypatch.delenv("SUDO_PASSWORD", raising=False)
     monkeypatch.delenv("HERMES_INTERACTIVE", raising=False)
@@ -213,17 +247,22 @@ def test_registered_sudo_callback_is_used_without_interactive_env(monkeypatch):
 
 
 def test_cached_sudo_password_isolated_by_session_key(monkeypatch):
+    from gateway.session_context import clear_session_vars, set_session_vars
+
     monkeypatch.delenv("SUDO_PASSWORD", raising=False)
     monkeypatch.delenv("HERMES_INTERACTIVE", raising=False)
 
-    monkeypatch.setenv("HERMES_SESSION_KEY", "session-a")
+    first = set_session_vars(session_key="session-a")
     terminal_tool._set_cached_sudo_password("alpha-pass")
+    clear_session_vars(first)
 
-    monkeypatch.setenv("HERMES_SESSION_KEY", "session-b")
+    second = set_session_vars(session_key="session-b")
     assert terminal_tool._get_cached_sudo_password() == ""
+    clear_session_vars(second)
 
-    monkeypatch.setenv("HERMES_SESSION_KEY", "session-a")
+    third = set_session_vars(session_key="session-a")
     assert terminal_tool._get_cached_sudo_password() == "alpha-pass"
+    clear_session_vars(third)
 
 
 def test_passwordless_sudo_skips_interactive_prompt_and_rewrite(monkeypatch):

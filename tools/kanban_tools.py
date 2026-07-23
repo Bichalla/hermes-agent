@@ -1143,7 +1143,22 @@ def _handle_registered_blocked_create(args: dict, **kw) -> str:
             "kanban_create_blocked: unsupported field(s): "
             + ", ".join(sorted(str(name) for name in unknown))
         )
-    return _handle_create({**args, "initial_status": "blocked"}, **kw)
+    canonical_args = dict(args)
+    from tools.workflow_authority import get_current_turn_user_authority
+
+    authority = get_current_turn_user_authority()
+    if authority is not None and authority.blocked_create_generated_title:
+        canonical_args["title"] = authority.blocked_create_generated_title
+    elif (
+        authority is not None
+        and authority.allows("explicit_blocked_card_create")
+        and len(authority.blocked_create_target_fingerprints) <= 1
+    ):
+        return tool_error(
+            "kanban_create_blocked: trusted title generation unavailable"
+        )
+    canonical_args.setdefault("assignee", "honbul")
+    return _handle_create({**canonical_args, "initial_status": "blocked"}, **kw)
 
 
 def _maybe_auto_subscribe(conn: Any, task_id: str) -> bool:
@@ -1760,14 +1775,23 @@ KANBAN_CREATE_BLOCKED_SCHEMA = {
     "parameters": {
         "type": "object",
         "properties": {
-            "title": {"type": "string", "description": "User-authorized card title."},
-            "assignee": {"type": "string", "description": "Profile owner for the blocked card."},
+            "title": {
+                "type": "string",
+                "description": (
+                    "Optional model suggestion. The handler replaces it with the "
+                    "trusted title generated from the accepted user turn."
+                ),
+            },
+            "assignee": {
+                "type": "string",
+                "description": "Optional profile owner; defaults to honbul.",
+            },
             "body": {"type": "string", "description": "Optional opening context."},
             "tenant": {"type": "string", "description": "Optional tenant namespace."},
             "priority": {"type": "integer", "description": "Optional priority tiebreaker."},
             "board": _board_schema_prop(),
         },
-        "required": ["title", "assignee"],
+        "required": [],
         "additionalProperties": False,
     },
 }

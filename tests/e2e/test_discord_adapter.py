@@ -125,7 +125,8 @@ async def test_discord_ingress_reaches_registered_blocked_create_no_live(
         count = conn.execute("SELECT COUNT(*) FROM tasks").fetchone()[0]
     assert count == 1
     assert task is not None
-    assert task.title == "Writing Plan first improvement"
+    assert task.title == "Plan Kanban follow-up work"
+    assert task.title != "Writing Plan first improvement"
     assert task.status == "blocked"
 
 

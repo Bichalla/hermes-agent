@@ -40,6 +40,7 @@ from tools.workflow_authority import (
     bind_current_turn_user_authority,
     clear_current_turn_user_authority,
     fingerprint_user_action,
+    infer_blocked_create_generated_title,
     infer_explicit_blocked_create_targets,
     infer_coarse_estimate_authority,
     infer_explicit_workflow_grants,
@@ -434,6 +435,9 @@ def build_turn_context(
             target_fingerprints=target_fingerprints,
             blocked_create_target_fingerprints=(
                 infer_explicit_blocked_create_targets(original_user_message)
+            ),
+            blocked_create_generated_title=infer_blocked_create_generated_title(
+                original_user_message
             ),
             coarse_estimate_authorized=infer_coarse_estimate_authority(
                 original_user_message

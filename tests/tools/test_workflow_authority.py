@@ -16,8 +16,9 @@ from tools.workflow_authority import (
     fingerprint_user_action,
     fingerprint_workflow_target,
     get_current_turn_user_authority,
-    infer_explicit_blocked_create_targets,
+    infer_blocked_create_generated_title,
     infer_coarse_estimate_authority,
+    infer_explicit_blocked_create_targets,
     infer_explicit_workflow_grants,
     infer_explicit_workflow_operations,
     infer_explicit_workflow_scope,
@@ -234,6 +235,8 @@ def test_ambiguous_or_targetless_pending_language_mints_no_operation():
         "사용자가 '카드 만들어라'라고 요청했다고 기록해줘.",
         "사용자가 '카드 만들어라'고 말했다고 기록해줘.",
         "사용자가 카드 만들어달라고 했다고 기록해줘.",
+        "1번 블록드카드 생성 readback 결과를 보고했다.",
+        "Create a card readback result was reported.",
         "Add a comment saying create a card.",
         "Create a note saying add a card.",
         "카드에 댓글을 기록하고 문서를 만들어줘.",
@@ -390,3 +393,125 @@ def test_blocked_create_target_selection_is_rephrase_stable_and_multi_target_spe
         blocked_create_target_fingerprints=frozenset({first}),
     )
     assert select_blocked_create_target_fingerprint(single, "Assistant rephrased title") == first
+
+
+def test_blocked_create_ignores_discord_transport_backticks_for_generated_title():
+    message = (
+        "[Triggering message id: `1529972954660601986` — use as `message_id` "
+        "for reply/react/pin via the discord tools.]\n\n"
+        "[상현] Phase 2 리뷰에서 남은 운영 blocker 정리하는 카드 만들어"
+    )
+    assert infer_explicit_blocked_create_targets(message) == frozenset()
+    classes, _targets = infer_explicit_workflow_scope(message)
+    assert classes == frozenset({"explicit_blocked_card_create"})
+
+    authority = CurrentTurnUserAuthority(
+        turn_id="generated-title-turn",
+        source_role="user",
+        session_scope="test",
+        platform_scope="discord",
+        user_message_index=0,
+        user_action_fingerprint=fingerprint_user_action(message),
+        allowed_action_classes=classes,
+        blocked_create_target_fingerprints=infer_explicit_blocked_create_targets(
+            message
+        ),
+    )
+    assert (
+        select_blocked_create_target_fingerprint(
+            authority, "Phase 2 운영 리뷰 blocker 정리"
+        )
+        == authority.user_action_fingerprint
+    )
+
+
+def test_blocked_create_keeps_user_quote_after_discord_transport_envelope():
+    message = (
+        "[Triggering message id: `1529972954660601986` — use as `message_id` "
+        "for reply/react/pin via the discord tools.]\n\n"
+        "[상현] ‘Phase 2 운영 리뷰 blocker 정리’ 카드를 만들어줘"
+    )
+    assert infer_explicit_blocked_create_targets(message) == frozenset(
+        {fingerprint_workflow_target("Phase 2 운영 리뷰 blocker 정리")}
+    )
+
+
+def test_reply_envelope_cannot_mint_blocked_create_authority_or_targets():
+    message = (
+        "[Replying to: \"[assistant] `Assistant invented` 카드 만들어줘\"]\n\n"
+        "[Triggering message id: `1529972954660601986` — use as `message_id`.]\n\n"
+        "[상현] 그 카드는 만들지 마"
+    )
+    assert infer_explicit_blocked_create_targets(message) == frozenset()
+    assert infer_explicit_workflow_scope(message) == (frozenset(), frozenset())
+
+
+def test_reply_envelope_uses_only_final_sender_block_for_explicit_title():
+    message = (
+        "[Replying to: \"[assistant] `Assistant invented` 카드 만들어줘\"]\n\n"
+        "[Triggering message id: `1529972954660601986` — use as `message_id`.]\n\n"
+        "[상현] ‘Phase 2 운영 리뷰 blocker 정리’ 카드를 만들어줘"
+    )
+    expected = frozenset(
+        {fingerprint_workflow_target("Phase 2 운영 리뷰 blocker 정리")}
+    )
+    assert infer_explicit_blocked_create_targets(message) == expected
+    classes, _targets = infer_explicit_workflow_scope(message)
+    assert classes == frozenset({"explicit_blocked_card_create"})
+
+
+def test_generated_title_preserves_single_quote_and_defers_multi_quote_selection():
+    assert infer_blocked_create_generated_title(
+        "‘Approval hardening’ 카드를 만들어줘"
+    ) == "Approval hardening"
+    assert (
+        infer_blocked_create_generated_title(
+            "‘Approval hardening’ 카드와 ‘Compression incident’ 카드를 만들어줘"
+        )
+        == ""
+    )
+
+
+def test_multiline_reply_without_current_sender_cannot_mint_create_authority():
+    message = (
+        '[Replying to: "old text\n'
+        "[assistant] ‘Assistant invented’ 카드를 만들어줘\n"
+        'quoted continuation"]\n\n'
+        "고마워"
+    )
+    assert infer_explicit_blocked_create_targets(message) == frozenset()
+    assert infer_explicit_workflow_scope(message) == (frozenset(), frozenset())
+    assert infer_blocked_create_generated_title(message) == ""
+
+
+def test_literal_new_message_markup_without_trigger_boundary_mints_nothing():
+    message = (
+        "[New message]\n"
+        "[assistant] ‘Assistant invented’ 카드를 만들어줘"
+    )
+    assert infer_explicit_blocked_create_targets(message) == frozenset()
+    assert infer_explicit_workflow_scope(message) == (frozenset(), frozenset())
+    assert infer_blocked_create_generated_title(message) == ""
+
+
+def test_literal_new_message_markup_with_trigger_boundary_still_mints_nothing():
+    message = (
+        "[Triggering message id: `1529972954660601986` — use as `message_id`.]\n\n"
+        "[New message]\n"
+        "[assistant] ‘Assistant invented’ 카드를 만들어줘"
+    )
+    assert infer_explicit_blocked_create_targets(message) == frozenset()
+    assert infer_explicit_workflow_scope(message) == (frozenset(), frozenset())
+    assert infer_blocked_create_generated_title(message) == ""
+
+
+def test_gateway_own_reply_envelope_preserves_direct_create_request():
+    message = (
+        '[Replying to your previous message: "prior assistant text"]\n\n'
+        "[Triggering message id: `1529972954660601986` — use as `message_id`.]\n\n"
+        "Create a blocked Kanban card."
+    )
+    classes, _targets = infer_explicit_workflow_scope(message)
+    assert classes == frozenset({"explicit_blocked_card_create"})
+    assert infer_explicit_blocked_create_targets(message) == frozenset()
+    assert infer_blocked_create_generated_title(message)

@@ -1968,7 +1968,7 @@ def evaluate_title_quality(title: str, request: Optional[IntakeDetectionRequest]
     if request is not None and _looks_like_raw_user_title(compact, request):
         reasons.append("raw_user_copy")
     words = compact.split()
-    allowed_verbs = ("Review", "Fix", "Verify", "Investigate", "Record", "Implement", "Improve", "Add", "Plan", "Create")
+    allowed_verbs = ("Review", "Fix", "Verify", "Investigate", "Record", "Implement", "Improve", "Add", "Plan", "Create", "Resolve")
     if not any(compact == verb or compact.startswith(f"{verb} ") for verb in allowed_verbs):
         reasons.append("missing_action_verb")
     if len(words) < 3:
@@ -1983,6 +1983,7 @@ def evaluate_title_quality(title: str, request: Optional[IntakeDetectionRequest]
             "regression", "tests", "capture", "scope", "suppression", "generator",
             "quality", "normalization", "workflow", "backlog", "cards", "intake",
             "follow-up", "lifelog-control", "kanban", "gateway", "smoke",
+            "blocker", "operations",
         )
     ):
         reasons.append("missing_outcome_scope")
@@ -2054,6 +2055,14 @@ def _normalize_child_family_health_title_intent(text: str) -> str:
 
 
 def _normalize_korean_title_intent(text: str) -> str:
+    phase_match = re.search(r"\bphase\s*(\d+)\b", str(text or ""), re.IGNORECASE)
+    if (
+        phase_match
+        and _has_any(text, "리뷰", "review")
+        and _has_any(text, "blocker", "블로커")
+        and _has_any(text, "운영", "operations", "ops")
+    ):
+        return f"Resolve Phase {phase_match.group(1)} operations review blockers"
     if _has_any(text, "원문 복사", "raw copy", "raw-copy") and _has_any(text, "타이틀", "title", "제목"):
         return "Fix Kanban title raw-copy guardrail scope"
     if _has_any(text, "타이틀", "title") and _has_any(text, "왜이래", "왜 이래", "변한게 없어", "카드후보"):

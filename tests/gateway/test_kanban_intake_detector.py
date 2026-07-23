@@ -257,6 +257,22 @@ def test_title_generator_rejects_discord_sender_prefixed_raw_title():
     assert "리뷰까지 서브에이전트" not in title
 
 
+def test_title_generator_normalizes_phase_operations_review_blockers():
+    request = IntakeDetectionRequest(
+        platform="discord",
+        session_key="s1",
+        source_ref="message-1",
+        user_summary="Phase 2 리뷰에서 남은 운영 blocker 정리하는 카드 만들어",
+        assistant_summary="",
+        default_board="lifelog-control",
+        default_tenant="",
+    )
+
+    assert explicit_title_from_request(request) == (
+        "Resolve Phase 2 operations review blockers"
+    )
+
+
 @pytest.mark.parametrize("user_summary", [
     "이 작업은 카드로 남겨줘: Kanban intake threshold hardening writing plan 리뷰 후 구현",
     "JÖKL 마케팅 패킷 생성기 다음 스프린트 작업을 정리하고 테스트/커밋까지 해야 해",

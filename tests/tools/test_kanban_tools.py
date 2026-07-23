@@ -1233,6 +1233,134 @@ def test_registered_blocked_create_schema_and_handler_are_closed(
     assert "unsupported field" in result["error"]
 
 
+def test_registered_blocked_create_uses_trusted_generated_title_and_defaults(
+    worker_env, monkeypatch
+):
+    from hermes_cli import kanban_db as kb
+    from tools import kanban_tools as kt
+    from tools import registered_local_workflow as registered
+    import tools.workflow_authority as workflow_authority
+    from tools.workflow_authority import (
+        CurrentTurnUserAuthority,
+        bind_active_workflow_turn,
+        bind_current_turn_user_authority,
+        fingerprint_user_action,
+        fingerprint_workflow_target,
+        reset_current_turn_user_authority,
+    )
+
+    monkeypatch.setattr(registered, "_feature_enabled", lambda: True)
+    monkeypatch.setattr(
+        workflow_authority,
+        "matches_current_workflow_session",
+        lambda _authority: True,
+    )
+    authority = CurrentTurnUserAuthority(
+        turn_id="trusted-generated-title-turn",
+        source_role="user",
+        session_scope="test",
+        platform_scope="discord",
+        user_message_index=0,
+        user_action_fingerprint=fingerprint_user_action("create phase 2 blocker card"),
+        source_event_fingerprint=fingerprint_user_action("source-event:phase-2"),
+        allowed_action_classes=frozenset({"explicit_blocked_card_create"}),
+        blocked_create_generated_title="Resolve Phase 2 operations review blockers",
+    )
+    bind_active_workflow_turn(
+        authority.turn_id, authority.platform_scope, authority.session_scope
+    )
+    token = bind_current_turn_user_authority(authority)
+    try:
+        result = json.loads(
+            kt._handle_registered_blocked_create(
+                {"title": "Untrusted model suggestion"}
+            )
+        )
+    finally:
+        reset_current_turn_user_authority(token)
+
+    assert result["ok"] is True
+    assert result["status"] == "blocked"
+    with kb.connect_closing() as conn:
+        task = kb.get_task(conn, result["task_id"])
+    assert task is not None
+    assert task.title == "Resolve Phase 2 operations review blockers"
+    assert task.assignee == "honbul"
+    with kb.connect_closing() as conn:
+        task_count_before_denial = conn.execute(
+            "SELECT COUNT(*) FROM tasks"
+        ).fetchone()[0]
+
+    unavailable = CurrentTurnUserAuthority(
+        turn_id="title-generation-unavailable-turn",
+        source_role="user",
+        session_scope="test",
+        platform_scope="discord",
+        user_message_index=0,
+        user_action_fingerprint=fingerprint_user_action("create another card"),
+        source_event_fingerprint=fingerprint_user_action("source-event:unavailable"),
+        allowed_action_classes=frozenset({"explicit_blocked_card_create"}),
+    )
+    bind_active_workflow_turn(
+        unavailable.turn_id, unavailable.platform_scope, unavailable.session_scope
+    )
+    token = bind_current_turn_user_authority(unavailable)
+    try:
+        denied = json.loads(
+            kt._handle_registered_blocked_create(
+                {"title": "Model fallback must not be written"}
+            )
+        )
+    finally:
+        reset_current_turn_user_authority(token)
+
+    assert denied.get("ok") is not True
+    assert "trusted title generation unavailable" in denied["error"]
+    with kb.connect_closing() as conn:
+        task_count_after_denial = conn.execute(
+            "SELECT COUNT(*) FROM tasks"
+        ).fetchone()[0]
+    assert task_count_after_denial == task_count_before_denial
+
+    quoted_unavailable = CurrentTurnUserAuthority(
+        turn_id="quoted-title-generation-unavailable-turn",
+        source_role="user",
+        session_scope="test",
+        platform_scope="discord",
+        user_message_index=0,
+        user_action_fingerprint=fingerprint_user_action("create quoted card"),
+        source_event_fingerprint=fingerprint_user_action(
+            "source-event:quoted-unavailable"
+        ),
+        allowed_action_classes=frozenset({"explicit_blocked_card_create"}),
+        blocked_create_target_fingerprints=frozenset(
+            {fingerprint_workflow_target("Approval hardening")}
+        ),
+    )
+    bind_active_workflow_turn(
+        quoted_unavailable.turn_id,
+        quoted_unavailable.platform_scope,
+        quoted_unavailable.session_scope,
+    )
+    token = bind_current_turn_user_authority(quoted_unavailable)
+    try:
+        quoted_denied = json.loads(
+            kt._handle_registered_blocked_create(
+                {"title": "Approval hardening"}
+            )
+        )
+    finally:
+        reset_current_turn_user_authority(token)
+
+    assert quoted_denied.get("ok") is not True
+    assert "trusted title generation unavailable" in quoted_denied["error"]
+    with kb.connect_closing() as conn:
+        assert (
+            conn.execute("SELECT COUNT(*) FROM tasks").fetchone()[0]
+            == task_count_before_denial
+        )
+
+
 def test_create_blocked_auto_idempotency_and_evidence(worker_env, monkeypatch):
     from tools import kanban_tools as kt
     from hermes_cli import kanban_db as kb
@@ -1317,6 +1445,7 @@ def test_same_turn_blocked_creates_use_distinct_authorized_target_discriminators
     worker_env, monkeypatch
 ):
     from tools import kanban_tools as kt
+    from tools import registered_local_workflow as registered
     import tools.workflow_authority as workflow_authority
     from tools.workflow_authority import (
         CurrentTurnUserAuthority,
@@ -1333,6 +1462,7 @@ def test_same_turn_blocked_creates_use_distinct_authorized_target_discriminators
         "matches_current_workflow_session",
         lambda _authority: True,
     )
+    monkeypatch.setattr(registered, "_feature_enabled", lambda: True)
 
     authority = CurrentTurnUserAuthority(
         turn_id="opaque-same-turn-multi-create",
@@ -1356,18 +1486,18 @@ def test_same_turn_blocked_creates_use_distinct_authorized_target_discriminators
     token = bind_current_turn_user_authority(authority)
     try:
         first = json.loads(
-            kt._handle_create(
-                {"title": "Card A", "assignee": "peer", "initial_status": "blocked"}
+            kt._handle_registered_blocked_create(
+                {"title": "Card A", "assignee": "peer"}
             )
         )
         first_retry = json.loads(
-            kt._handle_create(
-                {"title": "Card A", "assignee": "peer", "initial_status": "blocked"}
+            kt._handle_registered_blocked_create(
+                {"title": "Card A", "assignee": "peer"}
             )
         )
         second = json.loads(
-            kt._handle_create(
-                {"title": "Card B", "assignee": "peer", "initial_status": "blocked"}
+            kt._handle_registered_blocked_create(
+                {"title": "Card B", "assignee": "peer"}
             )
         )
     finally:

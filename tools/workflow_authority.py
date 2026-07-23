@@ -20,8 +20,18 @@ _FINGERPRINT_RE = re.compile(r"^[a-f0-9]{64}$")
 _TASK_ID_RE = re.compile(r"(?<![a-z0-9])t_[a-z0-9]{6,64}(?![a-z0-9])", re.IGNORECASE)
 _PENDING_ID_RE = re.compile(r"(?<![a-f0-9])kp_[a-f0-9]{16}(?![a-f0-9])")
 _QUOTED_TARGET_RE = re.compile(
-    r'''(?:"([^"]{1,200})"|'([^']{1,200})'|`([^`]{1,200})`|“([^”]{1,200})”)'''
+    r'''(?:"([^"]{1,200})"|'([^']{1,200})'|`([^`]{1,200})`|“([^”]{1,200})”|‘([^’]{1,200})’)'''
 )
+_NEW_MESSAGE_MARKER_RE = re.compile(r"(?:^|\n)\[New message\]\s*\n", re.IGNORECASE)
+_REPLY_ENVELOPE_PREFIX_RE = re.compile(
+    r'^\[Replying to(?: your previous message)?:.*?"\]\s*',
+    re.IGNORECASE | re.DOTALL,
+)
+_TRIGGER_METADATA_PREFIX_RE = re.compile(
+    r"^\[Triggering message id:.*?\]\s*", re.IGNORECASE | re.DOTALL
+)
+_SENDER_PREFIX_RE = re.compile(r"^\[[^\]\n]{1,80}\]\s*")
+_SENDER_BLOCK_RE = re.compile(r"(?m)^\[([^\]\n]{1,80})\]\s+")
 _ALLOWED_ACTION_CLASSES = frozenset(
     {
         "status_memory",
@@ -100,25 +110,90 @@ def fingerprint_workflow_target(target: str) -> str:
     return hashlib.sha256(normalized.encode("utf-8")).hexdigest()
 
 
+def _foreground_user_text_for_target_inference(user_message: str) -> str:
+    """Return only the current user body from a known gateway envelope."""
+    user_message = _REPLY_ENVELOPE_PREFIX_RE.sub("", user_message, count=1)
+    trigger_match = _TRIGGER_METADATA_PREFIX_RE.match(user_message)
+    has_trigger_boundary = trigger_match is not None
+    if trigger_match is not None:
+        user_message = user_message[trigger_match.end() :]
+
+    if _NEW_MESSAGE_MARKER_RE.search(user_message):
+        return ""
+
+    if has_trigger_boundary and user_message.lstrip().casefold().startswith(
+        ("[context around", "[recent channel messages")
+    ):
+        return ""
+
+    sender_matches = tuple(_SENDER_BLOCK_RE.finditer(user_message))
+    if sender_matches:
+        first = sender_matches[0]
+        if first.start() != 0 or len(sender_matches) != 1:
+            return ""
+    return _SENDER_PREFIX_RE.sub("", user_message, count=1).strip()
+
+
 def infer_explicit_blocked_create_targets(user_message: str) -> frozenset[str]:
     """Return raw-free fingerprints for explicitly quoted create targets."""
     if not isinstance(user_message, str):
         return frozenset()
     targets: set[str] = set()
-    for match in _QUOTED_TARGET_RE.finditer(user_message):
+    user_text = _foreground_user_text_for_target_inference(user_message)
+    for match in _QUOTED_TARGET_RE.finditer(user_text):
         value = next((group for group in match.groups() if group), "")
         if value.strip():
             targets.add(fingerprint_workflow_target(value))
     return frozenset(targets)
 
 
+def infer_blocked_create_generated_title(user_message: str) -> str:
+    """Generate one trusted card title from the foreground user-authored text."""
+    if not isinstance(user_message, str):
+        return ""
+    user_text = _foreground_user_text_for_target_inference(user_message)
+    normalized = unicodedata.normalize("NFKC", user_text).strip().casefold()
+    if not _is_direct_blocked_create_command(normalized):
+        return ""
+
+    quoted = []
+    for match in _QUOTED_TARGET_RE.finditer(user_text):
+        value = next((group for group in match.groups() if group), "").strip()
+        if value:
+            quoted.append(value)
+    if len(quoted) == 1:
+        return quoted[0]
+    if len(quoted) > 1:
+        return ""
+
+    try:
+        from gateway.kanban_intake import (
+            IntakeDetectionRequest,
+            explicit_title_from_request,
+        )
+
+        request = IntakeDetectionRequest(
+            platform="foreground",
+            session_key="current-turn",
+            source_ref="current-turn",
+            user_summary=user_text,
+            assistant_summary="",
+            default_board="",
+            default_tenant="",
+        )
+        return explicit_title_from_request(request, "")
+    except Exception:
+        return ""
+
+
 def infer_explicit_workflow_scope(
     user_message: str,
 ) -> tuple[frozenset[str], frozenset[str]]:
     """Infer only narrow explicit workflow grants; ambiguity yields no grant."""
-    normalized = unicodedata.normalize("NFKC", user_message).strip().casefold()
+    user_text = _foreground_user_text_for_target_inference(user_message)
+    normalized = unicodedata.normalize("NFKC", user_text).strip().casefold()
     classes: set[str] = set()
-    grants = infer_explicit_workflow_grants(user_message)
+    grants = infer_explicit_workflow_grants(user_text)
     grant_operations = {operation for operation, _target in grants}
     if "kanban_status_memory_comment" in grant_operations:
         classes.add("status_memory")
@@ -235,7 +310,9 @@ def _is_direct_blocked_create_command(normalized: str) -> bool:
     )
     english_card_object = re.compile(
         r"^(?:please\s+)?(?:create|make|add)\s+"
-        r"(?:(?:a|an|the|one|new|blocked|kanban)\s+)*card\b"
+        r"(?:(?:a|an|the|one|new|blocked|kanban)\s+)*card"
+        r"(?:\s+(?:called|titled)\s+(?:\"[^\"]{1,200}\"|'[^']{1,200}'|“[^”]{1,200}”|‘[^’]{1,200}’))?"
+        r"(?:\s+please)?$"
     )
     korean_card_object = re.compile(
         r"카드(?:를|은|는|도|로)?"
@@ -243,7 +320,7 @@ def _is_direct_blocked_create_command(normalized: str) -> bool:
         r"(?:만들어|만들어라|만들어줘|만들어주세요|생성해|생성해라|생성해줘|생성해주세요)$"
     )
     for clause in clauses:
-        if english_card_object.match(clause):
+        if english_card_object.fullmatch(clause):
             return True
         if korean_card_object.search(clause):
             return True
@@ -260,7 +337,8 @@ def infer_explicit_workflow_grants(
     """
     if not isinstance(user_message, str):
         return frozenset()
-    normalized = unicodedata.normalize("NFKC", user_message).strip().casefold()
+    user_text = _foreground_user_text_for_target_inference(user_message)
+    normalized = unicodedata.normalize("NFKC", user_text).strip().casefold()
     if not _is_affirmative_command(normalized):
         return frozenset()
     grants: set[tuple[str, str]] = set()
@@ -381,6 +459,7 @@ class CurrentTurnUserAuthority:
     operation_target_grants: frozenset[tuple[str, str]] = frozenset()
     target_fingerprints: frozenset[str] = frozenset()
     blocked_create_target_fingerprints: frozenset[str] = frozenset()
+    blocked_create_generated_title: str = ""
     coarse_estimate_authorized: bool = False
 
     def __post_init__(self) -> None:
@@ -421,6 +500,11 @@ class CurrentTurnUserAuthority:
             raise ValueError(
                 "blocked_create_target_fingerprints must contain SHA-256 tokens"
             )
+        if self.blocked_create_generated_title and (
+            len(self.blocked_create_generated_title) > 200
+            or any(ord(ch) < 32 for ch in self.blocked_create_generated_title)
+        ):
+            raise ValueError("blocked_create_generated_title must be a safe title")
 
     def allows(
         self,

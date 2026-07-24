@@ -37,6 +37,7 @@ _ALLOWED_ACTION_CLASSES = frozenset(
         "status_memory",
         "explicit_blocked_card_create",
         "registered_soft_delete",
+        "trusted_local_record",
     }
 )
 _ALLOWED_OPERATIONS = frozenset(
@@ -45,6 +46,7 @@ _ALLOWED_OPERATIONS = frozenset(
         "pending_soft_delete",
         "pending_restore",
         "kanban_status_memory_comment",
+        "diet_intake_record",
     }
 )
 
@@ -209,6 +211,8 @@ def infer_explicit_workflow_scope(
     grant_operations = {operation for operation, _target in grants}
     if "kanban_status_memory_comment" in grant_operations:
         classes.add("status_memory")
+    if "diet_intake_record" in grant_operations:
+        classes.add("trusted_local_record")
     if _is_direct_blocked_create_command(normalized):
         classes.add("explicit_blocked_card_create")
 
@@ -217,11 +221,13 @@ def infer_explicit_workflow_scope(
         operation.startswith("pending_") for operation in grant_operations
     ):
         classes.add("registered_soft_delete")
-    targets = frozenset(
+    targets = {
         fingerprint_workflow_target(match.group(0))
         for match in (*tuple(_TASK_ID_RE.finditer(normalized)), *pending_ids)
-    )
-    return frozenset(classes), targets
+    }
+    if "diet_intake_record" in grant_operations:
+        targets.add(fingerprint_workflow_target("person_park_sanghyun:diet"))
+    return frozenset(classes), frozenset(targets)
 
 
 def infer_explicit_workflow_operations(user_message: str) -> frozenset[str]:
@@ -401,6 +407,123 @@ def _is_direct_blocked_create_command(normalized: str) -> bool:
     return False
 
 
+def _is_confirmed_diet_intake(normalized: str) -> bool:
+    """Recognize a direct self diet fact without turning plans/questions into writes."""
+    if not normalized or _has_negation(normalized):
+        return False
+    if any(
+        token in normalized
+        for token in (
+            "먹을 예정",
+            "마실 예정",
+            "먹을 거",
+            "마실 거",
+            "먹을까",
+            "마실까",
+            "먹으려고",
+            "마시려고",
+            "먹을게",
+            "마실게",
+            "먹어도",
+            "마셔도",
+            "못 먹",
+            "못 마",
+            "먹지 않았",
+            "마시지 않았",
+            "굶었",
+            "금식",
+            "should i",
+            "can i eat",
+            "plan to eat",
+            "will eat",
+            "추천",
+            "계획",
+            "뭐 먹",
+            "무엇을 먹",
+            "recommend",
+            "meal plan",
+        )
+    ):
+        return False
+    if "?" in normalized:
+        return False
+    named_other = any(
+        token in normalized
+        for token in (
+            "해수",
+            "수지",
+            "엄마",
+            "아빠",
+            "어머니",
+            "아버지",
+            "아내",
+            "남편",
+            "아이",
+            "아기",
+            "친구",
+            "동료",
+            "그는 ",
+            "그녀는 ",
+            "my child",
+            "my wife",
+            "my husband",
+            "my friend",
+        )
+    )
+    explicit_self = any(
+        token in normalized
+        for token in ("나는 ", "내가 ", "나는", "내가", "i ate", "i drank", "my intake")
+    )
+    if named_other and not explicit_self:
+        return False
+    explicit_record = any(
+        token in normalized for token in ("기록해", "기록해줘", "record")
+    ) and any(
+        token in normalized
+        for token in (
+            "식사",
+            "아침",
+            "점심",
+            "저녁",
+            "간식",
+            "diet",
+            "lunch",
+            "breakfast",
+            "dinner",
+            "intake",
+        )
+    )
+    consumed = any(
+        token in normalized
+        for token in (
+            "먹었",
+            "먹음",
+            "마셨",
+            "마심",
+            "섭취했",
+            "섭취함",
+            "i ate",
+            "i drank",
+        )
+    )
+    meal_match = re.match(
+        r"^(?:오늘\s*)?(?:아침|점심|저녁|간식)(?:에는|은|으로|:)?\s+(?P<details>.+)$",
+        normalized,
+    )
+    meal_prefix = False
+    if meal_match is not None:
+        details = meal_match.group("details")
+        meal_prefix = bool(
+            "/" in details
+            or "," in details
+            or re.search(
+                r"\d+(?:\.\d+)?\s*(?:g|kg|ml|l|개|팩|컵|인분|알|조각|봉|병)\b",
+                details,
+            )
+        )
+    return explicit_record or consumed or meal_prefix
+
+
 def infer_explicit_workflow_grants(
     user_message: str,
 ) -> frozenset[tuple[str, str]]:
@@ -413,9 +536,16 @@ def infer_explicit_workflow_grants(
         return frozenset()
     user_text = _foreground_user_text_for_target_inference(user_message)
     normalized = unicodedata.normalize("NFKC", user_text).strip().casefold()
-    if not _is_affirmative_command(normalized):
-        return frozenset()
     grants: set[tuple[str, str]] = set()
+    if _is_confirmed_diet_intake(normalized):
+        grants.add(
+            (
+                "diet_intake_record",
+                fingerprint_workflow_target("person_park_sanghyun:diet"),
+            )
+        )
+    if not _is_affirmative_command(normalized):
+        return frozenset(grants)
 
     task_ids = tuple(match.group(0) for match in _TASK_ID_RE.finditer(normalized))
     status_memory_kind = any(

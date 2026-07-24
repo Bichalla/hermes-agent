@@ -1,8 +1,13 @@
-"""Service-gated pending-only registered local workflow tool tests."""
+"""Service-gated registered local workflow tool tests."""
 
 from __future__ import annotations
 
 import json
+import os
+import shutil
+import subprocess
+import sys
+from pathlib import Path
 
 import pytest
 
@@ -28,6 +33,11 @@ def _clear_context():
 
 
 def _authority(*, target: str, operation: str):
+    action_class = (
+        "trusted_local_record"
+        if operation == "diet_intake_record"
+        else "registered_soft_delete"
+    )
     authority = CurrentTurnUserAuthority(
         turn_id="turn-do-not-disclose",
         source_role="user",
@@ -36,7 +46,7 @@ def _authority(*, target: str, operation: str):
         user_message_index=0,
         user_action_fingerprint=fingerprint_user_action("confirmed current action"),
         source_event_fingerprint=fingerprint_user_action("source event message-1"),
-        allowed_action_classes=frozenset({"registered_soft_delete"}),
+        allowed_action_classes=frozenset({action_class}),
         allowed_operations=frozenset({operation}),
         operation_target_grants=frozenset(
             {(operation, fingerprint_workflow_target(target))}
@@ -63,13 +73,19 @@ def _set_gateway_context(
     )
 
 
-def test_schema_exposes_pending_only_and_no_authority_path_db_or_command_fields():
+def test_schema_exposes_closed_pending_and_diet_actions_without_paths_or_payloads():
     from tools.registered_local_workflow import REGISTERED_LOCAL_WORKFLOW_SCHEMA
 
     params = REGISTERED_LOCAL_WORKFLOW_SCHEMA["parameters"]
     assert params["additionalProperties"] is False
-    assert set(params["properties"]) == {"action", "pending_id", "reason_code"}
+    assert set(params["properties"]) == {
+        "action",
+        "pending_id",
+        "reason_code",
+        "payload_name",
+    }
     assert params["properties"]["action"]["enum"] == [
+        "diet_intake_record",
         "pending_read",
         "pending_restore",
         "pending_soft_delete",
@@ -83,9 +99,233 @@ def test_schema_exposes_pending_only_and_no_authority_path_db_or_command_fields(
         "command",
         "script",
         "sql",
-        "payload",
+        "payload_path",
     ):
         assert forbidden not in exposed_keys
+
+
+def test_diet_record_requires_exact_authority_and_returns_closed_owner_evidence(monkeypatch):
+    import tools.registered_local_workflow as tool
+
+    target = "person_park_sanghyun:diet"
+    tokens = _set_gateway_context()
+    bind_current_turn_user_authority(
+        _authority(target=target, operation="diet_intake_record")
+    )
+    monkeypatch.setattr(tool, "_feature_enabled", lambda: True)
+    monkeypatch.setattr(tool, "_dependencies_ready", lambda _action: True)
+    monkeypatch.setattr(tool, "_diet_payload_matches_session", lambda _name: True)
+    monkeypatch.setattr(
+        tool,
+        "_diet_owner_action",
+        lambda **_kwargs: {
+            "schema": "registered-recorder-result/v1",
+            "recorder_id": "diet_intake.v1",
+            "validation_status": "validator_and_readback_passed",
+            "idempotency_result": "inserted",
+            "event_ids": ["diet_v1_deadbeefdeadbeef"],
+            "dry_run": False,
+        },
+    )
+    result = tool.registered_local_workflow(
+        action="diet_intake_record", payload_name="2026-07-24-breakfast.json"
+    )
+    assert result["decision"] == "allow"
+    assert result["write_count"] == 1
+    assert result["validation_status"] == "validator_and_readback_passed"
+    assert result["idempotency_result"] == "inserted"
+    assert result["event_ids"] == ["diet_v1_deadbeefdeadbeef"]
+    clear_session_vars(tokens)
+
+
+@pytest.mark.parametrize(
+    "payload_name",
+    ["../escape.json", "/tmp/escape.json", "nested/file.json", "meal.txt", ""],
+)
+def test_diet_record_rejects_non_basename_payloads_before_owner(monkeypatch, payload_name):
+    import tools.registered_local_workflow as tool
+
+    monkeypatch.setattr(
+        tool,
+        "_diet_owner_action",
+        lambda **_kwargs: pytest.fail("owner called"),
+    )
+    result = tool.registered_local_workflow(
+        action="diet_intake_record", payload_name=payload_name
+    )
+    assert result["decision"] == "deny_schema_invalid"
+    assert result["write_count"] == 0
+
+
+def test_diet_owner_invokes_fixed_dispatcher_dry_run_then_live(monkeypatch, tmp_path):
+    import tools.registered_local_workflow as tool
+
+    root = tmp_path / "lifelog"
+    payload_root = root / ".runtime-inputs" / "diet-intake"
+    payload_root.mkdir(parents=True)
+    payload = payload_root / "meal.json"
+    payload.write_text("{}", encoding="utf-8")
+    payload.chmod(0o600)
+    dispatcher = root / "scripts" / "run_registered_recorder.py"
+    dispatcher.parent.mkdir()
+    dispatcher.write_text("# synthetic dispatcher\n", encoding="utf-8")
+    calls = []
+
+    def fake_run(argv, **kwargs):
+        calls.append((argv, kwargs))
+        dry_run = argv[argv.index("--dry-run") + 1] == "true"
+        result = {
+            "schema": "registered-recorder-result/v1",
+            "recorder_id": "diet_intake.v1",
+            "exit_status": 0,
+            "validation_status": (
+                "payload_validated" if dry_run else "validator_and_readback_passed"
+            ),
+            "idempotency_result": (
+                "not_applicable_dry_run" if dry_run else "inserted"
+            ),
+            "event_ids": ["diet_v1_deadbeefdeadbeef"],
+            "dry_run": dry_run,
+        }
+        return type(
+            "Completed",
+            (),
+            {"returncode": 0, "stdout": json.dumps(result), "stderr": ""},
+        )()
+
+    monkeypatch.setattr(tool, "_LIFELOG_ROOT", root)
+    monkeypatch.setattr(tool.subprocess, "run", fake_run)
+    result = tool._diet_owner_action(payload_name="meal.json")
+    assert result["validation_status"] == "validator_and_readback_passed"
+    assert [call[0][call[0].index("--dry-run") + 1] for call in calls] == [
+        "true",
+        "false",
+    ]
+    assert all(call[1]["cwd"] == root for call in calls)
+    assert all(call[1]["shell"] is False for call in calls)
+    assert all(call[1]["env"] == {"PATH": os.environ.get("PATH", "")} for call in calls)
+
+
+def test_diet_payload_must_bind_to_current_gateway_source(monkeypatch, tmp_path):
+    import tools.registered_local_workflow as tool
+
+    root = tmp_path / "lifelog"
+    payload_root = root / ".runtime-inputs" / "diet-intake"
+    payload_root.mkdir(parents=True)
+    payload = payload_root / "meal.json"
+    payload.write_text(
+        json.dumps(
+            {
+                "source": {
+                    "platform": "discord",
+                    "channel_id": "channel-1",
+                    "thread_id": "thread-1",
+                    "message_id": "message-1",
+                }
+            }
+        ),
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(tool, "_LIFELOG_ROOT", root)
+    tokens = _set_gateway_context()
+    assert tool._diet_payload_matches_session("meal.json") is True
+    payload.write_text(
+        json.dumps(
+            {
+                "source": {
+                    "platform": "discord",
+                    "channel_id": "channel-1",
+                    "thread_id": "thread-1",
+                    "message_id": "old-message",
+                }
+            }
+        ),
+        encoding="utf-8",
+    )
+    assert tool._diet_payload_matches_session("meal.json") is False
+    clear_session_vars(tokens)
+
+
+def test_diet_owner_real_dispatcher_writes_temp_db_and_replays(monkeypatch, tmp_path):
+    import tools.registered_local_workflow as tool
+
+    canonical = Path.home() / ".hermes" / "ops" / "state" / "lifelog"
+    root = tmp_path / "lifelog"
+    (root / "config").mkdir(parents=True)
+    (root / "scripts").mkdir()
+    shutil.copy2(canonical / "config" / "recorder-registry.json", root / "config")
+    for name in ("run_registered_recorder.py", "record_diet_intake.py"):
+        shutil.copy2(canonical / "scripts" / name, root / "scripts" / name)
+    validator = canonical / "scripts" / "validate_lifelog.py"
+    (root / "scripts" / "validate_lifelog.py").write_text(
+        "import runpy\n"
+        f"runpy.run_path({str(validator)!r}, run_name='__main__')\n",
+        encoding="utf-8",
+    )
+    subprocess.run(
+        [
+            sys.executable,
+            str(canonical / "scripts" / "lifelog_migrate.py"),
+            "--db",
+            str(root / "lifelog.db"),
+        ],
+        cwd=canonical,
+        check=True,
+        text=True,
+        capture_output=True,
+    )
+    payload_root = root / ".runtime-inputs" / "diet-intake"
+    payload_root.mkdir(parents=True, mode=0o700)
+    payload = payload_root / "meal.json"
+    payload.write_text(
+        json.dumps(
+            {
+                "schema_version": "diet_intake/v1",
+                "intent": "confirmed_intake",
+                "occurred_at": "2026-07-24T09:00:00+09:00",
+                "timezone": "Asia/Seoul",
+                "person_id": "person_park_sanghyun",
+                "meal_label": "breakfast",
+                "title": "Synthetic registered breakfast",
+                "items": [{"name": "synthetic meal", "quantity_text": "1 serving"}],
+                "nutrition_estimate": {},
+                "tags": ["diet", "breakfast", "confirmed_intake"],
+                "source": {
+                    "platform": "discord",
+                    "channel_id": "channel-1",
+                    "thread_id": "thread-1",
+                    "message_id": "message-1",
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+    payload.chmod(0o600)
+    monkeypatch.setattr(tool, "_LIFELOG_ROOT", root)
+    monkeypatch.setattr(tool, "_feature_enabled", lambda: True)
+    tokens = _set_gateway_context()
+    bind_current_turn_user_authority(
+        _authority(
+            target="person_park_sanghyun:diet",
+            operation="diet_intake_record",
+        )
+    )
+
+    first = tool.registered_local_workflow(
+        action="diet_intake_record", payload_name="meal.json"
+    )
+    second = tool.registered_local_workflow(
+        action="diet_intake_record", payload_name="meal.json"
+    )
+
+    assert first["decision"] == "allow"
+    assert first["validation_status"] == "validator_and_readback_passed"
+    assert first["idempotency_result"] == "inserted"
+    assert first["write_count"] == 1
+    assert second["idempotency_result"] == "existing"
+    assert second["write_count"] == 0
+    assert first["event_ids"] == second["event_ids"]
+    clear_session_vars(tokens)
 
 
 @pytest.mark.parametrize(

@@ -248,11 +248,37 @@ def test_non_commands_and_multi_target_text_mint_no_grants(message):
     assert infer_explicit_workflow_grants(message) == frozenset()
 
 
-def test_phase1_diet_and_medication_text_mint_no_registered_grants():
-    assert infer_explicit_workflow_grants("점심 식사 기록해줘") == frozenset()
+@pytest.mark.parametrize(
+    "message",
+    [
+        "점심 식사 기록해줘",
+        "오늘 아침 고단백 두유 / 바이오 그릭 요거트 / 첵스 컵 40g",
+        "고단백 두유 2팩 먹었고 맛밤도 1개 먹음",
+        "Record my lunch intake",
+    ],
+)
+def test_confirmed_diet_text_mints_exact_self_diet_grant(message):
+    target = fingerprint_workflow_target("person_park_sanghyun:diet")
+    classes, targets = infer_explicit_workflow_scope(message)
+    assert classes == frozenset({"trusted_local_record"})
+    assert targets == frozenset({target})
+    assert infer_explicit_workflow_grants(message) == frozenset(
+        {("diet_intake_record", target)}
+    )
+
+
+def test_diet_negation_plans_questions_and_medication_mint_no_diet_grant():
     assert infer_explicit_workflow_grants("식사 기록하지 마") == frozenset()
+    assert infer_explicit_workflow_grants("점심에 두유 먹을 예정") == frozenset()
+    assert infer_explicit_workflow_grants("오늘 아침 메뉴 추천해줘") == frozenset()
+    assert infer_explicit_workflow_grants("해수가 아침에 두유 먹었어") == frozenset()
+    assert infer_explicit_workflow_grants("엄마가 두유 먹었어") == frozenset()
+    assert infer_explicit_workflow_grants("아침 두유 먹을 거야") == frozenset()
+    assert infer_explicit_workflow_grants("아침 두유 먹을까") == frozenset()
+    assert infer_explicit_workflow_grants("오늘 아침 못 먹었어") == frozenset()
+    assert infer_explicit_workflow_grants("오늘 아침 운동했어") == frozenset()
+    assert infer_explicit_workflow_grants("두유 먹어도 돼?") == frozenset()
     assert infer_explicit_workflow_grants("약 복약 기록해줘") == frozenset()
-    # Legacy parsing helper is inert because no Phase 1 operation consumes it.
     assert infer_coarse_estimate_authority("영양 추정해") is True
     assert infer_coarse_estimate_authority("영양 추정하지 마") is False
 

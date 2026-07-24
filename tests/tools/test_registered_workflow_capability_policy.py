@@ -21,6 +21,7 @@ def test_initial_catalog_is_closed_and_versioned():
     assert set(catalog) == {
         "kanban.status-memory.v1",
         "kanban-intake.pending-soft-delete.v1",
+        "lifelog.diet-intake.v1",
     }
     assert catalog["kanban-intake.pending-soft-delete.v1"].effects == frozenset(
         {WorkflowEffect.READ, WorkflowEffect.SOFT_DELETE, WorkflowEffect.RESTORE}
@@ -68,6 +69,27 @@ def test_status_memory_uses_wired_operation_name_and_exact_authority_modes():
         WorkflowEffect.CREATE,
         schema_valid=True,
         authority_mode=AuthorityMode.LOCAL_READ_BOUNDARY,
+        owner_ready=True,
+        target_valid=True,
+    ) is CapabilityDecision.DENY_AUTHORITY_MISSING
+
+
+def test_diet_intake_registered_operation_is_foreground_create_only():
+    assert evaluate_registered_capability(
+        "lifelog.diet-intake.v1",
+        "diet_intake_record",
+        WorkflowEffect.CREATE,
+        schema_valid=True,
+        authority_mode=AuthorityMode.FOREGROUND_CURRENT_TURN,
+        owner_ready=True,
+        target_valid=True,
+    ) is CapabilityDecision.ALLOW
+    assert evaluate_registered_capability(
+        "lifelog.diet-intake.v1",
+        "diet_intake_record",
+        WorkflowEffect.CREATE,
+        schema_valid=True,
+        authority_mode=AuthorityMode.EXISTING_DISPATCHER_WORKER,
         owner_ready=True,
         target_valid=True,
     ) is CapabilityDecision.DENY_AUTHORITY_MISSING
@@ -144,7 +166,6 @@ def test_unknown_or_cross_effect_operation_denies_unregistered():
 @pytest.mark.parametrize(
     "capability_id,operation",
     [
-        ("lifelog.confirmed-record.v1", "lifelog_diet_confirmed_create"),
         ("review-ledger.history.v1", "start-or-reconcile"),
     ],
 )

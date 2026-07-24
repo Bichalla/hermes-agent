@@ -21,6 +21,7 @@ def test_initial_catalog_is_closed_and_versioned():
     assert set(catalog) == {
         "kanban.status-memory.v1",
         "kanban-intake.pending-soft-delete.v1",
+        "lifelog.childcare-event.v1",
         "lifelog.diet-intake.v1",
     }
     assert catalog["kanban-intake.pending-soft-delete.v1"].effects == frozenset(
@@ -87,6 +88,27 @@ def test_diet_intake_registered_operation_is_foreground_create_only():
     assert evaluate_registered_capability(
         "lifelog.diet-intake.v1",
         "diet_intake_record",
+        WorkflowEffect.CREATE,
+        schema_valid=True,
+        authority_mode=AuthorityMode.EXISTING_DISPATCHER_WORKER,
+        owner_ready=True,
+        target_valid=True,
+    ) is CapabilityDecision.DENY_AUTHORITY_MISSING
+
+
+def test_childcare_event_registered_operation_is_foreground_create_only():
+    assert evaluate_registered_capability(
+        "lifelog.childcare-event.v1",
+        "childcare_event_record",
+        WorkflowEffect.CREATE,
+        schema_valid=True,
+        authority_mode=AuthorityMode.FOREGROUND_CURRENT_TURN,
+        owner_ready=True,
+        target_valid=True,
+    ) is CapabilityDecision.ALLOW
+    assert evaluate_registered_capability(
+        "lifelog.childcare-event.v1",
+        "childcare_event_record",
         WorkflowEffect.CREATE,
         schema_valid=True,
         authority_mode=AuthorityMode.EXISTING_DISPATCHER_WORKER,

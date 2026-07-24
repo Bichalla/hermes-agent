@@ -268,6 +268,51 @@ def test_confirmed_diet_text_mints_exact_self_diet_grant(message):
     )
 
 
+@pytest.mark.parametrize(
+    "message,kinds",
+    [
+        ("해수 오늘 발열과 복약 기록해줘", {"fever", "medication"}),
+        ("오늘 해수 병원 진료 내용 Lifelog에 기록해", {"clinical"}),
+        ("해수 체온 추적 전부 기록해주세요", {"fever"}),
+        ("Record Haesoo's confirmed fever and medication timeline", {"fever", "medication"}),
+    ],
+)
+def test_confirmed_childcare_text_mints_exact_haesoo_grant(message, kinds):
+    targets = frozenset(
+        fingerprint_workflow_target(f"person_park_haesoo:childcare:{kind}") for kind in kinds
+    )
+    classes, inferred_targets = infer_explicit_workflow_scope(message)
+    assert classes == frozenset({"trusted_local_record"})
+    assert inferred_targets == targets
+    assert infer_explicit_workflow_grants(message) == frozenset(
+        ("childcare_event_record", target) for target in targets
+    )
+
+
+@pytest.mark.parametrize(
+    "message",
+    [
+        "해수 기록은 하지 마", "해수 열 기록할까?", "해수가 내일 열나면 기록해줘",
+        "의사가 해수 기록해달라고 말했다", "수지 발열 기록해줘",
+    ],
+)
+def test_childcare_negation_question_future_report_and_other_person_mint_no_grant(message):
+    assert infer_explicit_workflow_grants(message) == frozenset()
+
+
+@pytest.mark.parametrize(
+    "message",
+    [
+        "해수 기록이 아니라 수지 발열 기록해줘",
+        "해수 발열 기록해줘. 사실은 수지 이야기야",
+        "Record Haesoo's medication timeline, but she took no medication",
+        "Record Haesoo's fever, however this is about Suji",
+    ],
+)
+def test_childcare_mixed_subject_contrast_and_contradiction_mint_no_grant(message):
+    assert infer_explicit_workflow_grants(message) == frozenset()
+
+
 def test_diet_negation_plans_questions_and_medication_mint_no_diet_grant():
     assert infer_explicit_workflow_grants("식사 기록하지 마") == frozenset()
     assert infer_explicit_workflow_grants("점심에 두유 먹을 예정") == frozenset()

@@ -80,6 +80,7 @@ _ADAPTER_IDS = frozenset(
     {
         "kanban-status-memory",
         "kanban-intake-pending",
+        "lifelog-childcare-recorder",
         "lifelog-diet-recorder",
     }
 )
@@ -183,6 +184,17 @@ _REGISTERED_CAPABILITIES: Mapping[str, RegisteredCapability] = MappingProxyType(
             readback_required=True,
             soft_delete_restore_required=False,
         ),
+        "lifelog.childcare-event.v1": RegisteredCapability(
+            capability_id="lifelog.childcare-event.v1",
+            effects=frozenset({WorkflowEffect.CREATE}),
+            authority_modes=frozenset({AuthorityMode.FOREGROUND_CURRENT_TURN}),
+            adapter_id="lifelog-childcare-recorder",
+            input_schema_id="lifelog-childcare-event/v1",
+            result_schema_id="registered-recorder-result/v1",
+            idempotency=IdempotencyMode.DETERMINISTIC_REPLAY,
+            readback_required=True,
+            soft_delete_restore_required=False,
+        ),
     }
 )
 
@@ -195,6 +207,7 @@ _REGISTERED_OPERATIONS: Mapping[tuple[str, str], WorkflowEffect] = MappingProxyT
         ("kanban-intake.pending-soft-delete.v1", "pending_soft_delete"): WorkflowEffect.SOFT_DELETE,
         ("kanban-intake.pending-soft-delete.v1", "pending_restore"): WorkflowEffect.RESTORE,
         ("lifelog.diet-intake.v1", "diet_intake_record"): WorkflowEffect.CREATE,
+        ("lifelog.childcare-event.v1", "childcare_event_record"): WorkflowEffect.CREATE,
     }
 )
 _REGISTERED_OPERATION_AUTHORITIES: Mapping[
@@ -227,6 +240,9 @@ _REGISTERED_OPERATION_AUTHORITIES: Mapping[
             {AuthorityMode.FOREGROUND_CURRENT_TURN}
         ),
         ("lifelog.diet-intake.v1", "diet_intake_record"): frozenset(
+            {AuthorityMode.FOREGROUND_CURRENT_TURN}
+        ),
+        ("lifelog.childcare-event.v1", "childcare_event_record"): frozenset(
             {AuthorityMode.FOREGROUND_CURRENT_TURN}
         ),
     }

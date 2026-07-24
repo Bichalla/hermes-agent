@@ -46,6 +46,7 @@ _ALLOWED_OPERATIONS = frozenset(
         "pending_soft_delete",
         "pending_restore",
         "kanban_status_memory_comment",
+        "childcare_event_record",
         "diet_intake_record",
     }
 )
@@ -213,6 +214,8 @@ def infer_explicit_workflow_scope(
         classes.add("status_memory")
     if "diet_intake_record" in grant_operations:
         classes.add("trusted_local_record")
+    if "childcare_event_record" in grant_operations:
+        classes.add("trusted_local_record")
     if _is_direct_blocked_create_command(normalized):
         classes.add("explicit_blocked_card_create")
 
@@ -227,6 +230,12 @@ def infer_explicit_workflow_scope(
     }
     if "diet_intake_record" in grant_operations:
         targets.add(fingerprint_workflow_target("person_park_sanghyun:diet"))
+    if "childcare_event_record" in grant_operations:
+        targets.update(
+            target
+            for operation, target in grants
+            if operation == "childcare_event_record"
+        )
     return frozenset(classes), frozenset(targets)
 
 
@@ -525,6 +534,57 @@ def _is_confirmed_diet_intake(normalized: str) -> bool:
     return explicit_record or consumed or meal_prefix
 
 
+def _confirmed_childcare_fact_targets(normalized: str) -> frozenset[str]:
+    forbidden = (
+        "아니라", "사실은", " but ", "however", "no medication", "did not",
+        "didn't", "없었", "안 먹", "않았",
+    )
+    other_subjects = (
+        "수지", "suji", "상현", "sanghyun", "엄마", "아빠", "mother", "father", "wife",
+    )
+    if (
+        not normalized
+        or _has_negation(normalized)
+        or any(token in normalized for token in _NON_COMMAND_TOKENS)
+        or any(token in normalized for token in _REPORTED_SPEECH_TOKENS)
+        or any(token in normalized for token in forbidden)
+        or any(token in normalized for token in other_subjects)
+        or any(token in normalized for token in ("내일", "예정", "계획", "할 경우", "if haesoo", "tomorrow"))
+    ):
+        return frozenset()
+    clauses = tuple(
+        clause.strip() for clause in re.split(r"[.!?。！？\n]+", normalized) if clause.strip()
+    )
+    command_clauses = tuple(
+        clause
+        for clause in clauses
+        if any(token in clause for token in ("해수", "haesoo"))
+        and (
+            re.search(
+                r"기록(?:도|은|을|를|이|가)?\s*(?:해|해주세요|해줘|남겨|등록)", clause
+            ) is not None
+            or clause.startswith("record ")
+        )
+    )
+    if len(command_clauses) != 1:
+        return frozenset()
+    clause = command_clauses[0]
+    targets: set[str] = set()
+    if any(token in clause for token in ("발열", "체온", "열", "fever", "temperature")):
+        targets.add("person_park_haesoo:childcare:fever")
+    if any(token in clause for token in ("복약", "투약", "약", "medication")):
+        targets.add("person_park_haesoo:childcare:medication")
+    if any(
+        token in clause
+        for token in (
+            "진료", "병원", "의사", "처방", "구내염", "수족구",
+            "clinic", "doctor", "prescription", "diagnosis",
+        )
+    ):
+        targets.add("person_park_haesoo:childcare:clinical")
+    return frozenset(targets)
+
+
 def infer_explicit_workflow_grants(
     user_message: str,
 ) -> frozenset[tuple[str, str]]:
@@ -538,6 +598,13 @@ def infer_explicit_workflow_grants(
     user_text = _foreground_user_text_for_target_inference(user_message)
     normalized = unicodedata.normalize("NFKC", user_text).strip().casefold()
     grants: set[tuple[str, str]] = set()
+    for target in _confirmed_childcare_fact_targets(normalized):
+        grants.add(
+            (
+                "childcare_event_record",
+                fingerprint_workflow_target(target),
+            )
+        )
     if _is_confirmed_diet_intake(normalized):
         grants.add(
             (

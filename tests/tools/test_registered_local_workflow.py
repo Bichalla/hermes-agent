@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import shutil
@@ -35,7 +36,7 @@ def _clear_context():
 def _authority(*, target: str, operation: str):
     action_class = (
         "trusted_local_record"
-        if operation == "diet_intake_record"
+        if operation in {"diet_intake_record", "childcare_event_record"}
         else "registered_soft_delete"
     )
     authority = CurrentTurnUserAuthority(
@@ -73,7 +74,7 @@ def _set_gateway_context(
     )
 
 
-def test_schema_exposes_closed_pending_and_diet_actions_without_paths_or_payloads():
+def test_schema_exposes_closed_pending_and_lifelog_actions_without_paths_or_payloads():
     from tools.registered_local_workflow import REGISTERED_LOCAL_WORKFLOW_SCHEMA
 
     params = REGISTERED_LOCAL_WORKFLOW_SCHEMA["parameters"]
@@ -85,6 +86,7 @@ def test_schema_exposes_closed_pending_and_diet_actions_without_paths_or_payload
         "payload_name",
     }
     assert params["properties"]["action"]["enum"] == [
+        "childcare_event_record",
         "diet_intake_record",
         "pending_read",
         "pending_restore",
@@ -102,6 +104,69 @@ def test_schema_exposes_closed_pending_and_diet_actions_without_paths_or_payload
         "payload_path",
     ):
         assert forbidden not in exposed_keys
+
+
+def test_childcare_record_requires_exact_authority_and_returns_closed_owner_evidence(monkeypatch):
+    import tools.registered_local_workflow as tool
+
+    target = "person_park_haesoo:childcare:fever"
+    tokens = _set_gateway_context()
+    bind_current_turn_user_authority(
+        _authority(target=target, operation="childcare_event_record")
+    )
+    monkeypatch.setattr(tool, "_feature_enabled", lambda: True)
+    monkeypatch.setattr(tool, "_dependencies_ready", lambda _action: True)
+    monkeypatch.setattr(
+        tool,
+        "_childcare_payload_binding",
+        lambda _name: tool.ChildcarePayloadBinding(
+            path=Path("/synthetic/fever.json"),
+            digest="a" * 64,
+            target=target,
+            receipt_key="b" * 64,
+            payload_bytes=b"{}",
+        ),
+    )
+    monkeypatch.setattr(
+        tool,
+        "_childcare_owner_action",
+        lambda **_kwargs: {
+            "schema": "registered-recorder-result/v1",
+            "recorder_id": "childcare_event.v1",
+            "validation_status": "validator_and_readback_passed",
+            "idempotency_result": "inserted",
+            "event_ids": ["evt_childcare_v1_deadbeefdeadbeef"],
+            "dry_run": False,
+        },
+    )
+    result = tool.registered_local_workflow(
+        action="childcare_event_record", payload_name="2026-07-24-fever.json"
+    )
+    assert result["decision"] == "allow"
+    assert result["write_count"] == 1
+    assert result["validation_status"] == "validator_and_readback_passed"
+    assert result["idempotency_result"] == "inserted"
+    assert result["event_ids"] == ["evt_childcare_v1_deadbeefdeadbeef"]
+    clear_session_vars(tokens)
+
+
+@pytest.mark.parametrize(
+    "payload_name",
+    ["../escape.json", "/tmp/escape.json", "nested/file.json", "event.txt", ""],
+)
+def test_childcare_record_rejects_non_basename_payloads_before_owner(monkeypatch, payload_name):
+    import tools.registered_local_workflow as tool
+
+    monkeypatch.setattr(
+        tool,
+        "_childcare_owner_action",
+        lambda **_kwargs: pytest.fail("owner called"),
+    )
+    result = tool.registered_local_workflow(
+        action="childcare_event_record", payload_name=payload_name
+    )
+    assert result["decision"] == "deny_schema_invalid"
+    assert result["write_count"] == 0
 
 
 def test_diet_record_requires_exact_authority_and_returns_closed_owner_evidence(monkeypatch):
@@ -155,6 +220,246 @@ def test_diet_record_rejects_non_basename_payloads_before_owner(monkeypatch, pay
     )
     assert result["decision"] == "deny_schema_invalid"
     assert result["write_count"] == 0
+
+
+def test_childcare_owner_invokes_fixed_dispatcher_dry_run_then_live(monkeypatch, tmp_path):
+    import tools.registered_local_workflow as tool
+
+    root = tmp_path / "lifelog"
+    payload_root = root / ".runtime-inputs" / "childcare-event"
+    payload_root.mkdir(parents=True)
+    payload = payload_root / "event.json"
+    payload.write_text("{}", encoding="utf-8")
+    payload.chmod(0o600)
+    dispatcher = root / "scripts" / "run_registered_recorder.py"
+    dispatcher.parent.mkdir()
+    dispatcher.write_text("# synthetic dispatcher\n", encoding="utf-8")
+    calls = []
+
+    def fake_run(argv, **kwargs):
+        calls.append((argv, kwargs))
+        dry_run = argv[argv.index("--dry-run") + 1] == "true"
+        result = {
+            "schema": "registered-recorder-result/v1",
+            "recorder_id": "childcare_event.v1",
+            "exit_status": 0,
+            "validation_status": (
+                "payload_validated" if dry_run else "validator_and_readback_passed"
+            ),
+            "idempotency_result": (
+                "not_applicable_dry_run" if dry_run else "inserted"
+            ),
+            "event_ids": ["evt_childcare_v1_deadbeefdeadbeef"],
+            "dry_run": dry_run,
+        }
+        return type(
+            "Completed",
+            (),
+            {"returncode": 0, "stdout": json.dumps(result), "stderr": ""},
+        )()
+
+    monkeypatch.setattr(tool, "_LIFELOG_ROOT", root)
+    monkeypatch.setattr(tool.subprocess, "run", fake_run)
+    binding = tool.ChildcarePayloadBinding(
+        path=payload,
+        digest=hashlib.sha256(payload.read_bytes()).hexdigest(),
+        target="person_park_haesoo:childcare:fever",
+        receipt_key="c" * 64,
+        payload_bytes=payload.read_bytes(),
+    )
+    result = tool._childcare_owner_action(binding=binding)
+    assert result["validation_status"] == "validator_and_readback_passed"
+    assert [call[0][call[0].index("--dry-run") + 1] for call in calls] == [
+        "true",
+        "false",
+    ]
+    assert all("childcare_event.v1" in call[0] for call in calls)
+    assert all(call[1]["cwd"] == root for call in calls)
+    assert all(call[1]["shell"] is False for call in calls)
+    assert all(call[1]["env"] == {"PATH": os.environ.get("PATH", "")} for call in calls)
+
+
+def test_childcare_payload_must_bind_to_current_gateway_source(monkeypatch, tmp_path):
+    import tools.registered_local_workflow as tool
+
+    root = tmp_path / "lifelog"
+    payload_root = root / ".runtime-inputs" / "childcare-event"
+    payload_root.mkdir(parents=True)
+    payload = payload_root / "event.json"
+    document = {
+        "category": "health",
+        "subcategory": "fever_followup",
+        "child_person_id": "person_park_haesoo",
+        "metrics": {"temperature_c": 38.6},
+        "source": {
+            "platform": "discord",
+            "channel_id": "channel-1",
+            "thread_id": "thread-1",
+            "message_id": "message-1",
+        }
+    }
+    payload.write_text(json.dumps(document), encoding="utf-8")
+    monkeypatch.setattr(tool, "_LIFELOG_ROOT", root)
+    tokens = _set_gateway_context()
+    binding = tool._childcare_payload_binding("event.json")
+    assert binding is not None
+    assert binding.target == "person_park_haesoo:childcare:fever"
+    document["source"]["message_id"] = "old-message"
+    payload.write_text(json.dumps(document), encoding="utf-8")
+    assert tool._childcare_payload_binding("event.json") is None
+    clear_session_vars(tokens)
+
+
+def test_childcare_semantic_scope_mismatch_denies_before_owner(monkeypatch, tmp_path):
+    import tools.registered_local_workflow as tool
+
+    root = tmp_path / "lifelog"
+    payload_root = root / ".runtime-inputs" / "childcare-event"
+    payload_root.mkdir(parents=True)
+    payload = payload_root / "medication.json"
+    payload.write_text(
+        json.dumps(
+            {
+                "category": "medication",
+                "subcategory": "medication_intake",
+                "child_person_id": "person_park_haesoo",
+                "source": {
+                    "platform": "discord",
+                    "channel_id": "channel-1",
+                    "thread_id": "thread-1",
+                    "message_id": "message-1",
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(tool, "_LIFELOG_ROOT", root)
+    monkeypatch.setattr(tool, "_feature_enabled", lambda: True)
+    monkeypatch.setattr(tool, "_dependencies_ready", lambda _action: True)
+    monkeypatch.setattr(
+        tool,
+        "_childcare_owner_action",
+        lambda **_kwargs: pytest.fail("owner called for semantic mismatch"),
+    )
+    tokens = _set_gateway_context()
+    bind_current_turn_user_authority(
+        _authority(
+            target="person_park_haesoo:childcare:fever",
+            operation="childcare_event_record",
+        )
+    )
+    result = tool.registered_local_workflow(
+        action="childcare_event_record", payload_name="medication.json"
+    )
+    assert result["decision"] == "deny_authority_missing"
+    assert result["write_count"] == 0
+    clear_session_vars(tokens)
+
+
+def test_childcare_same_source_fact_rejects_payload_digest_variation(monkeypatch, tmp_path):
+    import tools.registered_local_workflow as tool
+
+    root = tmp_path / "lifelog"
+    payload_root = root / ".runtime-inputs" / "childcare-event"
+    payload_root.mkdir(parents=True)
+    dispatcher = root / "scripts" / "run_registered_recorder.py"
+    dispatcher.parent.mkdir()
+    dispatcher.write_text("# synthetic dispatcher\n", encoding="utf-8")
+    payload = payload_root / "event.json"
+    payload.write_bytes(b'{"version":1}')
+    calls = []
+
+    def fake_invoke(**kwargs):
+        calls.append(kwargs["dry_run"])
+        return {
+            "schema": "registered-recorder-result/v1",
+            "recorder_id": "childcare_event.v1",
+            "exit_status": 0,
+            "validation_status": (
+                "payload_validated"
+                if kwargs["dry_run"]
+                else "validator_and_readback_passed"
+            ),
+            "idempotency_result": (
+                "not_applicable_dry_run" if kwargs["dry_run"] else "inserted"
+            ),
+            "event_ids": ["evt_childcare_v1_deadbeefdeadbeef"],
+            "dry_run": kwargs["dry_run"],
+        }
+
+    monkeypatch.setattr(tool, "_LIFELOG_ROOT", root)
+    monkeypatch.setattr(tool, "_invoke_childcare_dispatcher", fake_invoke)
+    first_bytes = payload.read_bytes()
+    first = tool.ChildcarePayloadBinding(
+        path=payload,
+        digest=hashlib.sha256(first_bytes).hexdigest(),
+        target="person_park_haesoo:childcare:fever",
+        receipt_key="d" * 64,
+        payload_bytes=first_bytes,
+    )
+    tool._childcare_owner_action(binding=first)
+    payload.write_bytes(b'{"version":2}')
+    second_bytes = payload.read_bytes()
+    second = tool.ChildcarePayloadBinding(
+        path=payload,
+        digest=hashlib.sha256(second_bytes).hexdigest(),
+        target=first.target,
+        receipt_key=first.receipt_key,
+        payload_bytes=second_bytes,
+    )
+    with pytest.raises(RuntimeError, match="receipt conflict"):
+        tool._childcare_owner_action(binding=second)
+    assert calls == [True, False]
+
+
+def test_childcare_original_payload_mutation_after_dry_run_cannot_change_live_bytes(
+    monkeypatch, tmp_path
+):
+    import tools.registered_local_workflow as tool
+
+    root = tmp_path / "lifelog"
+    payload_root = root / ".runtime-inputs" / "childcare-event"
+    payload_root.mkdir(parents=True)
+    dispatcher = root / "scripts" / "run_registered_recorder.py"
+    dispatcher.parent.mkdir()
+    dispatcher.write_text("# synthetic dispatcher\n", encoding="utf-8")
+    payload = payload_root / "event.json"
+    original = b'{"temperature_c":38.6}'
+    payload.write_bytes(original)
+    observed_live = []
+
+    def fake_invoke(**kwargs):
+        if kwargs["dry_run"]:
+            payload.write_bytes(b'{"temperature_c":99.9}')
+        else:
+            observed_live.append(kwargs["payload"].read_bytes())
+        return {
+            "schema": "registered-recorder-result/v1",
+            "recorder_id": "childcare_event.v1",
+            "exit_status": 0,
+            "validation_status": (
+                "payload_validated"
+                if kwargs["dry_run"]
+                else "validator_and_readback_passed"
+            ),
+            "idempotency_result": (
+                "not_applicable_dry_run" if kwargs["dry_run"] else "inserted"
+            ),
+            "event_ids": ["evt_childcare_v1_deadbeefdeadbeef"],
+            "dry_run": kwargs["dry_run"],
+        }
+
+    monkeypatch.setattr(tool, "_LIFELOG_ROOT", root)
+    monkeypatch.setattr(tool, "_invoke_childcare_dispatcher", fake_invoke)
+    binding = tool.ChildcarePayloadBinding(
+        path=payload,
+        digest=hashlib.sha256(original).hexdigest(),
+        target="person_park_haesoo:childcare:fever",
+        receipt_key="e" * 64,
+        payload_bytes=original,
+    )
+    tool._childcare_owner_action(binding=binding)
+    assert observed_live == [original]
 
 
 def test_diet_owner_invokes_fixed_dispatcher_dry_run_then_live(monkeypatch, tmp_path):
@@ -243,6 +548,87 @@ def test_diet_payload_must_bind_to_current_gateway_source(monkeypatch, tmp_path)
         encoding="utf-8",
     )
     assert tool._diet_payload_matches_session("meal.json") is False
+    clear_session_vars(tokens)
+
+
+def test_childcare_owner_real_dispatcher_writes_temp_db_and_replays(monkeypatch, tmp_path):
+    import tools.registered_local_workflow as tool
+
+    canonical = Path.home() / ".hermes" / "ops" / "state" / "lifelog"
+    root = tmp_path / "lifelog"
+    (root / "config").mkdir(parents=True)
+    (root / "scripts").mkdir()
+    shutil.copy2(canonical / "config" / "recorder-registry.json", root / "config")
+    for name in ("run_registered_recorder.py", "record_childcare_event.py"):
+        shutil.copy2(canonical / "scripts" / name, root / "scripts" / name)
+    validator = canonical / "scripts" / "validate_lifelog.py"
+    (root / "scripts" / "validate_lifelog.py").write_text(
+        "import runpy\n"
+        f"runpy.run_path({str(validator)!r}, run_name='__main__')\n",
+        encoding="utf-8",
+    )
+    subprocess.run(
+        [
+            sys.executable,
+            str(canonical / "scripts" / "lifelog_migrate.py"),
+            "--db",
+            str(root / "lifelog.db"),
+        ],
+        cwd=canonical,
+        check=True,
+        text=True,
+        capture_output=True,
+    )
+    payload_root = root / ".runtime-inputs" / "childcare-event"
+    payload_root.mkdir(parents=True, mode=0o700)
+    payload = payload_root / "event.json"
+    payload.write_text(
+        json.dumps(
+            {
+                "occurred_at": "2026-07-24T17:00:00+09:00",
+                "category": "health",
+                "subcategory": "fever_followup",
+                "child_person_id": "person_park_haesoo",
+                "caregiver_person_id": "person_park_sanghyun",
+                "metrics": {"temperature_c": 38.6},
+                "source": {
+                    "platform": "discord",
+                    "guild_id": "guild-1",
+                    "channel_id": "channel-1",
+                    "thread_id": "thread-1",
+                    "message_id": "message-1",
+                },
+                "title": "Synthetic Haesoo fever follow-up",
+                "notes": "Confirmed caregiver observation.",
+            }
+        ),
+        encoding="utf-8",
+    )
+    payload.chmod(0o600)
+    monkeypatch.setattr(tool, "_LIFELOG_ROOT", root)
+    monkeypatch.setattr(tool, "_feature_enabled", lambda: True)
+    tokens = _set_gateway_context()
+    bind_current_turn_user_authority(
+        _authority(
+            target="person_park_haesoo:childcare:fever",
+            operation="childcare_event_record",
+        )
+    )
+
+    first = tool.registered_local_workflow(
+        action="childcare_event_record", payload_name="event.json"
+    )
+    second = tool.registered_local_workflow(
+        action="childcare_event_record", payload_name="event.json"
+    )
+
+    assert first["decision"] == "allow"
+    assert first["validation_status"] == "validator_and_readback_passed"
+    assert first["idempotency_result"] == "inserted"
+    assert first["write_count"] == 1
+    assert second["idempotency_result"] == "existing"
+    assert second["write_count"] == 0
+    assert first["event_ids"] == second["event_ids"]
     clear_session_vars(tokens)
 
 

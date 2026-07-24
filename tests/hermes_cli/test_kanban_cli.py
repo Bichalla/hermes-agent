@@ -84,6 +84,92 @@ def test_run_slash_no_args_shows_usage(kanban_home):
     assert "create" in out.lower() or "subcommand" in out.lower() or "action" in out.lower()
 
 
+def test_codex_status_is_read_only_and_migrate_is_explicit(tmp_path, monkeypatch):
+    home = tmp_path / ".hermes"
+    home.mkdir()
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    monkeypatch.setattr(Path, "home", lambda: tmp_path)
+    kb.create_board("lifelog-control")
+    db_path = kb.kanban_db_path(board="lifelog-control")
+    db_path.unlink()
+    kb._INITIALIZED_PATHS.discard(str(db_path.resolve()))
+
+    status = json.loads(
+        kc.run_slash("codex status --board lifelog-control --json")
+    )
+    assert status["db_exists"] is False
+    assert status["migrated"] is False
+    assert not db_path.exists()
+
+    migrated = json.loads(
+        kc.run_slash("codex migrate --board lifelog-control --json")
+    )
+    assert migrated["db_exists"] is True
+    assert migrated["migrated"] is True
+    status = json.loads(
+        kc.run_slash("codex status --board lifelog-control --json")
+    )
+    assert status["migrated"] is True
+
+
+def test_codex_approve_resolves_project_and_replays_without_growth(
+    tmp_path, monkeypatch
+):
+    from hermes_cli import projects_db as pdb
+
+    home = tmp_path / ".hermes"
+    home.mkdir()
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    monkeypatch.setattr(Path, "home", lambda: tmp_path)
+    kb.create_board("lifelog-control")
+    repo = (tmp_path / "project-repo").resolve()
+    repo.mkdir()
+    with pdb.connect_closing() as project_conn:
+        project_id = pdb.create_project(
+            project_conn,
+            name="Managed Project",
+            slug="managed-project",
+            primary_path=str(repo),
+            board_slug="lifelog-control",
+        )
+    with kb.connect(board="lifelog-control") as conn:
+        task_id = kb.create_task(
+            conn,
+            title="Implement managed CLI approval",
+            body="Use the immutable approved instructions.",
+            initial_status="blocked",
+            project_id=project_id,
+            board="lifelog-control",
+        )
+
+    kc.run_slash("codex migrate --board lifelog-control --json")
+    first = json.loads(
+        kc.run_slash(
+            f"codex approve --board lifelog-control --task-id {task_id} --json"
+        )
+    )
+    second = json.loads(
+        kc.run_slash(
+            f"codex approve --board lifelog-control --task-id {task_id} --json"
+        )
+    )
+    assert first == second
+    assert first["task_id"] == task_id
+    assert first["project_id"] == project_id
+    assert first["repository_root"] == str(repo)
+    assert first["worktree_path"] == str(repo / ".worktrees" / task_id)
+    assert len(first["spec_sha256"]) == 64
+    with kb.connect(board="lifelog-control") as conn:
+        assert conn.execute(
+            "SELECT COUNT(*) FROM kanban_execution_specs WHERE task_id=?", (task_id,)
+        ).fetchone()[0] == 1
+        assert conn.execute(
+            "SELECT COUNT(*) FROM task_events WHERE task_id=? "
+            "AND kind='managed_execution_approved'",
+            (task_id,),
+        ).fetchone()[0] == 1
+
+
 def test_run_slash_intake_pending_read_only_does_not_init_board_or_intake_db(tmp_path, monkeypatch):
     home = tmp_path / ".hermes"
     home.mkdir()

@@ -16,10 +16,12 @@ from __future__ import annotations
 
 import argparse
 import contextlib
+import hashlib
 import json
 import os
 import re
 import shlex
+import sqlite3
 import sys
 import time
 from pathlib import Path
@@ -670,6 +672,21 @@ def build_parser(parent_subparsers: argparse._SubParsersAction) -> argparse.Argu
     p_daemon.add_argument("--force", action="store_true",
                           help=argparse.SUPPRESS)
 
+    # --- codex managed-execution capability (explicit, default-OFF) ---
+    p_codex = sub.add_parser(
+        "codex",
+        help="Inspect, migrate, or approve the one-shot Codex pilot capability",
+    )
+    codex_sub = p_codex.add_subparsers(dest="codex_action")
+    for name in ("status", "migrate"):
+        p = codex_sub.add_parser(name)
+        p.add_argument("--board", default=argparse.SUPPRESS)
+        p.add_argument("--json", action="store_true")
+    p_codex_approve = codex_sub.add_parser("approve")
+    p_codex_approve.add_argument("--board", default=argparse.SUPPRESS)
+    p_codex_approve.add_argument("--task-id", required=True)
+    p_codex_approve.add_argument("--json", action="store_true")
+
     # --- watch ---
     p_watch = sub.add_parser(
         "watch",
@@ -887,6 +904,73 @@ def build_parser(parent_subparsers: argparse._SubParsersAction) -> argparse.Argu
     return kanban_parser
 
 
+def _dispatch_codex(args: argparse.Namespace) -> int:
+    from hermes_cli import projects_db
+    from hermes_cli.kanban_execution import PILOT_BOARD
+
+    board = kb._normalize_board_slug(getattr(args, "board", PILOT_BOARD))
+    if board != PILOT_BOARD:
+        raise ValueError("managed execution is limited to the pilot board")
+    action = getattr(args, "codex_action", None)
+    db_path = kb.kanban_db_path(board=board)
+
+    if action == "status":
+        if db_path.exists():
+            connection = sqlite3.connect(f"{db_path.as_uri()}?mode=ro", uri=True)
+            connection.row_factory = sqlite3.Row
+            try:
+                payload = kb.managed_execution_schema_status(connection)
+            finally:
+                connection.close()
+        else:
+            payload = {
+                "schema": kb.MANAGED_EXECUTION_SCHEMA,
+                "migrated": False,
+                "table": False,
+                "immutable_update_trigger": False,
+                "immutable_delete_trigger": False,
+            }
+        payload = {"board": board, "db_exists": db_path.exists(), **payload}
+    elif action == "migrate":
+        kb.init_db(board=board)
+        with contextlib.closing(kb.connect(board=board)) as connection:
+            payload = kb.migrate_managed_execution_schema(connection)
+        payload = {"board": board, "db_exists": True, **payload}
+    elif action == "approve":
+        task_id = str(args.task_id)
+        with contextlib.closing(kb.connect(board=board)) as connection:
+            task = connection.execute(
+                "SELECT project_id FROM tasks WHERE id=?", (task_id,)
+            ).fetchone()
+            if task is None or not task["project_id"]:
+                raise ValueError("managed execution approval requires a project")
+            with projects_db.connect_closing() as project_connection:
+                project = projects_db.get_project(
+                    project_connection, task["project_id"]
+                )
+            if project is None or not project.primary_path:
+                raise ValueError("managed execution project has no primary path")
+            if project.board_slug not in {None, board}:
+                raise ValueError("managed execution project board mismatch")
+            spec = kb.approve_managed_execution(
+                connection,
+                board=board,
+                task_id=task_id,
+                repository_root=project.primary_path,
+            )
+        canonical = spec.to_canonical_bytes()
+        payload = json.loads(canonical.decode("utf-8"))
+        payload["spec_sha256"] = hashlib.sha256(canonical).hexdigest()
+    else:
+        raise ValueError("codex requires status, migrate, or approve")
+
+    if getattr(args, "json", False):
+        print(json.dumps(payload, indent=2, ensure_ascii=False, sort_keys=True))
+    else:
+        print(json.dumps(payload, ensure_ascii=False, sort_keys=True))
+    return 0
+
+
 # ---------------------------------------------------------------------------
 # Command dispatch
 # ---------------------------------------------------------------------------
@@ -925,6 +1009,15 @@ def kanban_command(args: argparse.Namespace) -> int:
     if action == "intake-pending":
         try:
             return int(_cmd_intake_pending(args) or 0)
+        except (ValueError, RuntimeError) as exc:
+            print(f"kanban: {exc}", file=sys.stderr)
+            return 1
+
+    # Managed Codex capability status must not initialize a missing board DB;
+    # migration and approval own their writes explicitly.
+    if action == "codex":
+        try:
+            return int(_dispatch_codex(args) or 0)
         except (ValueError, RuntimeError) as exc:
             print(f"kanban: {exc}", file=sys.stderr)
             return 1

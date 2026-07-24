@@ -13,6 +13,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import os
+import shutil
 import sqlite3
 import time
 from pathlib import Path
@@ -23,6 +24,130 @@ from agent.i18n import t
 # Match the logger run.py uses (logging.getLogger(__name__) where __name__ ==
 # "gateway.run") so extracted log records keep their original logger name.
 logger = logging.getLogger("gateway.run")
+
+_CODEX_DIRECT_PILOT_BOARD = "lifelog-control"
+
+
+class _RecoveryOnlyCodexBackend:
+    """Launch-incapable view of the Codex adapter for controller recovery."""
+
+    launch_capable = False
+
+    def __init__(self, backend: Any):
+        self._backend = backend
+        self.kind = backend.kind
+
+    def prepare(self, _spec, _worktree):
+        raise RuntimeError("recovery backend cannot launch")
+
+    def release(self, _handle):
+        raise RuntimeError("recovery backend cannot launch")
+
+    def observe(self, handle):
+        from hermes_cli.kanban_execution import (
+            ExecutionObservation,
+            ExecutionState,
+            TerminationState,
+        )
+
+        observation = self._backend.observe(handle)
+        if observation.state is not ExecutionState.RUNNING:
+            return observation
+        termination = self._backend.terminate(handle)
+        if termination.state is TerminationState.IDENTITY_MISMATCH:
+            return ExecutionObservation(ExecutionState.IDENTITY_MISMATCH, None)
+        # The core performs its own required termination/readback next. EXITED
+        # routes both DEAD and SURVIVOR through that closed reconciliation path.
+        return ExecutionObservation(ExecutionState.EXITED, -1)
+
+    def terminate(self, handle):
+        return self._backend.terminate(handle)
+
+
+class _UnavailableRecoveryBackend:
+    """Force the core uncertainty path when recovery tooling is unavailable."""
+
+    kind = "codex-direct/v1"
+    launch_capable = False
+
+    def prepare(self, _spec, _worktree):
+        raise RuntimeError("recovery backend cannot launch")
+
+    def release(self, _handle):
+        raise RuntimeError("recovery backend cannot launch")
+
+    def observe(self, _handle):
+        raise RuntimeError("recovery observation unavailable")
+
+    def terminate(self, _handle):
+        raise RuntimeError("recovery termination unavailable")
+
+
+def _compose_codex_backend_registry(
+    config: Any,
+    board: str,
+    *,
+    connection: Any,
+    managed_schema_ready: bool = True,
+    backend_factory: Optional[Callable[[], Any]] = None,
+    startup_recovery: bool = False,
+) -> "Optional[dict[str, Any]]":
+    """Build the sole pilot registry without owning lifecycle transitions.
+
+    Launch composition requires exact built-in ``True``, the fixed pilot board,
+    and an already-migrated managed schema. During startup, a persisted active
+    run may instead receive a launch-incapable recovery view even while config
+    is OFF. Missing or malformed configuration is always OFF.
+    """
+    if board != _CODEX_DIRECT_PILOT_BOARD or not managed_schema_ready:
+        return None
+
+    enabled = False
+    if type(config) is dict:
+        kanban_config = config.get("kanban")
+        if type(kanban_config) is dict:
+            codex_direct = kanban_config.get("codex_direct")
+            if type(codex_direct) is dict:
+                value = codex_direct.get("enabled")
+                enabled = type(value) is bool and value is True
+
+    recovery_required = False
+    if startup_recovery and connection is not None:
+        try:
+            recovery_required = connection.execute(
+                "SELECT 1 FROM kanban_execution_specs s "
+                "JOIN tasks t ON t.id=s.task_id "
+                "JOIN task_runs r ON r.id=("
+                "SELECT id FROM task_runs WHERE task_id=s.task_id "
+                "ORDER BY id DESC LIMIT 1) "
+                "WHERE r.ended_at IS NULL AND t.status='running' LIMIT 1"
+            ).fetchone() is not None
+        except (TypeError, AttributeError):
+            recovery_required = False
+
+    if not enabled and not recovery_required:
+        return None
+
+    if backend_factory is None:
+
+        def backend_factory():
+            from hermes_cli.kanban_codex_backend import CodexDirectExecutionBackend
+
+            executable = shutil.which("codex")
+            if not executable:
+                raise RuntimeError("Codex executable unavailable")
+            return CodexDirectExecutionBackend(Path(executable).resolve(strict=True))
+
+    try:
+        backend = backend_factory()
+    except Exception:
+        logger.warning("kanban dispatcher: Codex direct backend unavailable")
+        if not recovery_required:
+            return None
+        backend = _UnavailableRecoveryBackend()
+    if recovery_required:
+        backend = _RecoveryOnlyCodexBackend(backend)
+    return {backend.kind: backend}
 
 
 def _resolve_auto_decompose_settings(
@@ -947,6 +1072,7 @@ class GatewayKanbanWatchersMixin:
         disabled_corrupt_boards: dict[
             str, tuple[tuple[str, int | None, int | None], float]
         ] = {}
+        startup_recovery_pending_boards = {_CODEX_DIRECT_PILOT_BOARD}
 
         def _board_db_fingerprint(slug: str) -> tuple[str, int | None, int | None]:
             path = _kb.kanban_db_path(slug)
@@ -1007,13 +1133,22 @@ class GatewayKanbanWatchersMixin:
                 disabled_corrupt_boards.pop(slug, None)
             try:
                 conn = _kb.connect(board=slug)
+                startup_recovery = slug in startup_recovery_pending_boards
+                schema_status = _kb.managed_execution_schema_status(conn)
+                backend_registry = _compose_codex_backend_registry(
+                    cfg,
+                    slug,
+                    connection=conn,
+                    managed_schema_ready=schema_status["migrated"] is True,
+                    startup_recovery=startup_recovery,
+                )
                 # `connect()` runs the schema + idempotent migration on
                 # first open per process; the previous explicit
                 # `init_db()` call here busted the per-process cache and
                 # re-ran the migration on a second connection, racing
                 # the first. See the matching comment in
                 # `_kanban_notifier_watcher` and issue #21378.
-                return _kb.dispatch_once(
+                result = _kb.dispatch_once(
                     conn,
                     board=slug,
                     max_spawn=max_spawn,
@@ -1022,7 +1157,11 @@ class GatewayKanbanWatchersMixin:
                     stale_timeout_seconds=stale_timeout_seconds,
                     default_assignee=default_assignee,
                     max_in_progress_per_profile=max_in_progress_per_profile,
+                    backend_registry=backend_registry,
                 )
+                if startup_recovery and not getattr(result, "skipped_locked", False):
+                    startup_recovery_pending_boards.discard(slug)
+                return result
             except sqlite3.DatabaseError as exc:
                 if _is_corrupt_board_db_error(exc):
                     disabled_corrupt_boards[slug] = (fingerprint, time.monotonic())

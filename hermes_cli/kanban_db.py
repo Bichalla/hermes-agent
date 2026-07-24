@@ -87,8 +87,20 @@ import time
 from contextvars import ContextVar, Token
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Iterable, Optional
+from typing import Any, Iterable, Mapping, Optional
 
+from hermes_cli.kanban_execution import (
+    APPROVED_SPEC_SCHEMA,
+    PILOT_ASSIGNEE,
+    PILOT_BACKEND,
+    PILOT_BOARD,
+    PILOT_TIMEOUT_SECONDS,
+    ApprovedExecutionSpec,
+    ExecutionBackend,
+    ExecutionHandle,
+    ExecutionState,
+    TerminationState,
+)
 from hermes_cli.sqlite_util import add_column_if_missing as _add_column_if_missing
 from toolsets import get_toolset_names
 
@@ -136,6 +148,50 @@ VALID_WORKSPACE_KINDS = {"scratch", "worktree", "dir"}
 KNOWN_TOOLSET_NAMES = frozenset(name.casefold() for name in get_toolset_names())
 _IS_WINDOWS = sys.platform == "win32"
 KANBAN_ATTACHMENT_MAX_BYTES = 25 * 1024 * 1024
+
+MANAGED_EXECUTION_SCHEMA = "kanban-managed-execution-schema/v1"
+MANAGED_EXECUTION_SPEC_TABLE = "kanban_execution_specs"
+_MANAGED_INSERT_TRIGGER = "kanban_execution_specs_immutable_insert"
+_MANAGED_UPDATE_TRIGGER = "kanban_execution_specs_immutable_update"
+_MANAGED_DELETE_TRIGGER = "kanban_execution_specs_immutable_delete"
+
+_MANAGED_EXECUTION_DDL = f"""
+CREATE TABLE IF NOT EXISTS {MANAGED_EXECUTION_SPEC_TABLE} (
+    task_id       TEXT PRIMARY KEY REFERENCES tasks(id) ON DELETE RESTRICT,
+    schema        TEXT NOT NULL CHECK (schema = '{APPROVED_SPEC_SCHEMA}'),
+    backend       TEXT NOT NULL CHECK (backend = '{PILOT_BACKEND}'),
+    spec_bytes    BLOB NOT NULL,
+    spec_sha256   TEXT NOT NULL UNIQUE CHECK (length(spec_sha256) = 64),
+    approved_at   INTEGER NOT NULL
+);
+CREATE TRIGGER IF NOT EXISTS {_MANAGED_INSERT_TRIGGER}
+BEFORE INSERT ON {MANAGED_EXECUTION_SPEC_TABLE}
+WHEN EXISTS (
+    SELECT 1 FROM {MANAGED_EXECUTION_SPEC_TABLE}
+    WHERE task_id = NEW.task_id OR spec_sha256 = NEW.spec_sha256
+)
+BEGIN
+    SELECT RAISE(ABORT, 'managed execution specs are immutable');
+END;
+CREATE TRIGGER IF NOT EXISTS {_MANAGED_UPDATE_TRIGGER}
+BEFORE UPDATE ON {MANAGED_EXECUTION_SPEC_TABLE}
+BEGIN
+    SELECT RAISE(ABORT, 'managed execution specs are immutable');
+END;
+CREATE TRIGGER IF NOT EXISTS {_MANAGED_DELETE_TRIGGER}
+BEFORE DELETE ON {MANAGED_EXECUTION_SPEC_TABLE}
+BEGIN
+    SELECT RAISE(ABORT, 'managed execution specs are immutable');
+END;
+"""
+
+
+class ManagedExecutionCapabilityError(RuntimeError):
+    """The explicit managed-execution schema is absent or malformed."""
+
+
+class ManagedExecutionConflict(ValueError):
+    """An approval replay differs from the immutable stored projection."""
 
 # This capability is intentionally NOT part of ``SCHEMA_SQL`` or the ordinary
 # additive migration pass. Existing boards keep append-only comment semantics
@@ -1873,6 +1929,350 @@ def init_db(
     return path
 
 
+def _normalized_schema_sql(value: object) -> str:
+    return " ".join(str(value or "").split())
+
+
+def managed_execution_schema_status(conn: sqlite3.Connection) -> dict[str, Any]:
+    """Exactly read back the optional managed-execution schema without DDL."""
+    names = (
+        MANAGED_EXECUTION_SPEC_TABLE,
+        _MANAGED_INSERT_TRIGGER,
+        _MANAGED_UPDATE_TRIGGER,
+        _MANAGED_DELETE_TRIGGER,
+    )
+    rows = conn.execute(
+        "SELECT type, name, sql FROM sqlite_master "
+        "WHERE name IN (?, ?, ?, ?)",
+        names,
+    ).fetchall()
+    objects = {row["name"]: row for row in rows}
+    table = (
+        MANAGED_EXECUTION_SPEC_TABLE in objects
+        and objects[MANAGED_EXECUTION_SPEC_TABLE]["type"] == "table"
+    )
+    insert_trigger = (
+        _MANAGED_INSERT_TRIGGER in objects
+        and objects[_MANAGED_INSERT_TRIGGER]["type"] == "trigger"
+    )
+    update_trigger = (
+        _MANAGED_UPDATE_TRIGGER in objects
+        and objects[_MANAGED_UPDATE_TRIGGER]["type"] == "trigger"
+    )
+    delete_trigger = (
+        _MANAGED_DELETE_TRIGGER in objects
+        and objects[_MANAGED_DELETE_TRIGGER]["type"] == "trigger"
+    )
+
+    expected_table_sql = f"""CREATE TABLE {MANAGED_EXECUTION_SPEC_TABLE} (
+        task_id TEXT PRIMARY KEY REFERENCES tasks(id) ON DELETE RESTRICT,
+        schema TEXT NOT NULL CHECK (schema = '{APPROVED_SPEC_SCHEMA}'),
+        backend TEXT NOT NULL CHECK (backend = '{PILOT_BACKEND}'),
+        spec_bytes BLOB NOT NULL,
+        spec_sha256 TEXT NOT NULL UNIQUE CHECK (length(spec_sha256) = 64),
+        approved_at INTEGER NOT NULL
+    )"""
+    expected_trigger_sql = {
+        _MANAGED_INSERT_TRIGGER: f"""CREATE TRIGGER {_MANAGED_INSERT_TRIGGER}
+            BEFORE INSERT ON {MANAGED_EXECUTION_SPEC_TABLE}
+            WHEN EXISTS (
+                SELECT 1 FROM {MANAGED_EXECUTION_SPEC_TABLE}
+                WHERE task_id = NEW.task_id OR spec_sha256 = NEW.spec_sha256
+            )
+            BEGIN
+                SELECT RAISE(ABORT, 'managed execution specs are immutable');
+            END""",
+        _MANAGED_UPDATE_TRIGGER: f"""CREATE TRIGGER {_MANAGED_UPDATE_TRIGGER}
+            BEFORE UPDATE ON {MANAGED_EXECUTION_SPEC_TABLE}
+            BEGIN
+                SELECT RAISE(ABORT, 'managed execution specs are immutable');
+            END""",
+        _MANAGED_DELETE_TRIGGER: f"""CREATE TRIGGER {_MANAGED_DELETE_TRIGGER}
+            BEFORE DELETE ON {MANAGED_EXECUTION_SPEC_TABLE}
+            BEGIN
+                SELECT RAISE(ABORT, 'managed execution specs are immutable');
+            END""",
+    }
+    definitions_match = table and _normalized_schema_sql(
+        objects[MANAGED_EXECUTION_SPEC_TABLE]["sql"]
+    ) == _normalized_schema_sql(expected_table_sql)
+    for trigger_name, expected_sql in expected_trigger_sql.items():
+        definitions_match = bool(
+            definitions_match
+            and trigger_name in objects
+            and _normalized_schema_sql(objects[trigger_name]["sql"])
+            == _normalized_schema_sql(expected_sql)
+        )
+
+    expected_columns = (
+        ("task_id", "TEXT", 0, None, 1),
+        ("schema", "TEXT", 1, None, 0),
+        ("backend", "TEXT", 1, None, 0),
+        ("spec_bytes", "BLOB", 1, None, 0),
+        ("spec_sha256", "TEXT", 1, None, 0),
+        ("approved_at", "INTEGER", 1, None, 0),
+    )
+    columns: tuple[tuple[object, ...], ...] = ()
+    foreign_keys: tuple[tuple[object, ...], ...] = ()
+    unique_columns: set[tuple[str, ...]] = set()
+    if table:
+        columns = tuple(
+            (
+                row["name"],
+                str(row["type"]).upper(),
+                int(row["notnull"]),
+                row["dflt_value"],
+                int(row["pk"]),
+            )
+            for row in conn.execute(
+                f"PRAGMA table_info({MANAGED_EXECUTION_SPEC_TABLE})"
+            ).fetchall()
+        )
+        foreign_keys = tuple(
+            (
+                row["table"],
+                row["from"],
+                row["to"],
+                row["on_update"],
+                row["on_delete"],
+                row["match"],
+            )
+            for row in conn.execute(
+                f"PRAGMA foreign_key_list({MANAGED_EXECUTION_SPEC_TABLE})"
+            ).fetchall()
+        )
+        for index_row in conn.execute(
+            f"PRAGMA index_list({MANAGED_EXECUTION_SPEC_TABLE})"
+        ).fetchall():
+            if not int(index_row["unique"]):
+                continue
+            unique_columns.add(
+                tuple(
+                    row["name"]
+                    for row in conn.execute(
+                        f"PRAGMA index_info({index_row['name']})"
+                    ).fetchall()
+                )
+            )
+    structure_matches = bool(
+        columns == expected_columns
+        and foreign_keys == (("tasks", "task_id", "id", "NO ACTION", "RESTRICT", "NONE"),)
+        and ("spec_sha256",) in unique_columns
+    )
+    return {
+        "schema": MANAGED_EXECUTION_SCHEMA,
+        "migrated": bool(
+            table
+            and insert_trigger
+            and update_trigger
+            and delete_trigger
+            and definitions_match
+            and structure_matches
+        ),
+        "table": table,
+        "immutable_insert_trigger": insert_trigger,
+        "immutable_update_trigger": update_trigger,
+        "immutable_delete_trigger": delete_trigger,
+    }
+
+
+def migrate_managed_execution_schema(conn: sqlite3.Connection) -> dict[str, Any]:
+    """Explicitly install and exactly read back the optional managed schema."""
+    conn.executescript(_MANAGED_EXECUTION_DDL)
+    status = managed_execution_schema_status(conn)
+    if not status["migrated"]:
+        raise ManagedExecutionCapabilityError(
+            "managed execution schema migration did not pass readback"
+        )
+    return status
+
+
+def _managed_schema_ready(conn: sqlite3.Connection) -> bool:
+    row = conn.execute(
+        "SELECT 1 FROM sqlite_master WHERE type='table' AND name=?",
+        (MANAGED_EXECUTION_SPEC_TABLE,),
+    ).fetchone()
+    return row is not None
+
+
+def _require_managed_schema(conn: sqlite3.Connection) -> None:
+    if not managed_execution_schema_status(conn)["migrated"]:
+        raise ManagedExecutionCapabilityError(
+            "managed execution schema is not migrated"
+        )
+
+
+def _canonical_repository_root(repository_root: Path | str) -> Path:
+    text = str(repository_root)
+    path = Path(text)
+    if not path.is_absolute() or text != str(path):
+        raise ValueError("invalid managed execution approval")
+    try:
+        resolved = path.resolve(strict=False)
+    except (OSError, RuntimeError, ValueError):
+        raise ValueError("invalid managed execution approval") from None
+    if path != resolved:
+        raise ValueError("invalid managed execution approval")
+    return path
+
+
+def _approved_spec_from_projection(
+    row: sqlite3.Row,
+    *,
+    board: str,
+    repository_root: Path,
+) -> ApprovedExecutionSpec:
+    task_id = row["id"]
+    expected_worktree = repository_root / ".worktrees" / task_id
+    if row["workspace_kind"] != "worktree":
+        raise ValueError("managed execution requires workspace_kind=worktree")
+    if not row["project_id"]:
+        raise ValueError("managed execution requires a project")
+    if row["workspace_path"] != str(expected_worktree):
+        raise ValueError("managed execution worktree projection mismatch")
+    if not row["branch_name"]:
+        raise ValueError("managed execution requires a deterministic branch")
+    if not row["body"]:
+        raise ValueError("managed execution requires task instructions")
+    return ApprovedExecutionSpec(
+        assignee=PILOT_ASSIGNEE,
+        backend=PILOT_BACKEND,
+        board=board,
+        branch_name=row["branch_name"],
+        instructions=row["body"],
+        max_runtime_seconds=PILOT_TIMEOUT_SECONDS,
+        project_id=row["project_id"],
+        repository_root=str(repository_root),
+        schema=APPROVED_SPEC_SCHEMA,
+        task_id=task_id,
+        title=row["title"],
+        worktree_path=str(expected_worktree),
+    )
+
+
+def _managed_spec_from_row(row: sqlite3.Row) -> ApprovedExecutionSpec:
+    raw_value = row["spec_bytes"]
+    raw = bytes(raw_value) if isinstance(raw_value, (bytes, bytearray, memoryview)) else b""
+    digest = hashlib.sha256(raw).hexdigest()
+    if digest != row["spec_sha256"]:
+        raise ManagedExecutionCapabilityError("managed execution spec digest mismatch")
+    try:
+        spec = ApprovedExecutionSpec.from_canonical_bytes(raw)
+    except ValueError:
+        raise ManagedExecutionCapabilityError(
+            "managed execution spec bytes are invalid"
+        ) from None
+    if spec.task_id != row["task_id"] or spec.backend != row["backend"]:
+        raise ManagedExecutionCapabilityError("managed execution spec row mismatch")
+    return spec
+
+
+def get_managed_execution_spec(
+    conn: sqlite3.Connection, task_id: str
+) -> Optional[ApprovedExecutionSpec]:
+    """Return one verified immutable approved spec, or ``None`` when absent."""
+    if not _managed_schema_ready(conn):
+        return None
+    row = conn.execute(
+        f"SELECT task_id, backend, spec_bytes, spec_sha256 "
+        f"FROM {MANAGED_EXECUTION_SPEC_TABLE} WHERE task_id=?",
+        (task_id,),
+    ).fetchone()
+    return _managed_spec_from_row(row) if row is not None else None
+
+
+def _is_managed_task(conn: sqlite3.Connection, task_id: str) -> bool:
+    if not _managed_schema_ready(conn):
+        return False
+    return conn.execute(
+        f"SELECT 1 FROM {MANAGED_EXECUTION_SPEC_TABLE} WHERE task_id=?",
+        (task_id,),
+    ).fetchone() is not None
+
+
+def approve_managed_execution(
+    conn: sqlite3.Connection,
+    *,
+    board: str,
+    task_id: str,
+    repository_root: Path | str,
+) -> ApprovedExecutionSpec:
+    """Atomically approve one exact blocked project-backed task projection."""
+    _require_managed_schema(conn)
+    repo = _canonical_repository_root(repository_root)
+    with write_txn(conn):
+        task_row = conn.execute(
+            "SELECT * FROM tasks WHERE id=?", (task_id,)
+        ).fetchone()
+        if task_row is None:
+            raise ValueError("managed execution task does not exist")
+        candidate = _approved_spec_from_projection(
+            task_row, board=board, repository_root=repo
+        )
+        candidate_bytes = candidate.to_canonical_bytes()
+        candidate_digest = hashlib.sha256(candidate_bytes).hexdigest()
+        existing = conn.execute(
+            f"SELECT task_id, backend, spec_bytes, spec_sha256 "
+            f"FROM {MANAGED_EXECUTION_SPEC_TABLE} WHERE task_id=?",
+            (task_id,),
+        ).fetchone()
+        if existing is not None:
+            stored = _managed_spec_from_row(existing)
+            if stored != candidate or existing["spec_sha256"] != candidate_digest:
+                raise ManagedExecutionConflict(
+                    "managed execution approval conflicts with stored spec"
+                )
+            return stored
+
+        if task_row["status"] != "blocked":
+            raise ValueError("managed execution approval requires a blocked task")
+        prior_runs = conn.execute(
+            "SELECT COUNT(*) FROM task_runs WHERE task_id=?", (task_id,)
+        ).fetchone()[0]
+        links = conn.execute(
+            "SELECT COUNT(*) FROM task_links WHERE parent_id=? OR child_id=?",
+            (task_id, task_id),
+        ).fetchone()[0]
+        if prior_runs:
+            raise ValueError("managed execution approval requires no prior attempt")
+        if links:
+            raise ValueError("managed execution approval requires an unlinked task")
+
+        approved_at = int(time.time())
+        conn.execute(
+            f"INSERT INTO {MANAGED_EXECUTION_SPEC_TABLE} "
+            "(task_id, schema, backend, spec_bytes, spec_sha256, approved_at) "
+            "VALUES (?, ?, ?, ?, ?, ?)",
+            (
+                task_id,
+                APPROVED_SPEC_SCHEMA,
+                PILOT_BACKEND,
+                sqlite3.Binary(candidate_bytes),
+                candidate_digest,
+                approved_at,
+            ),
+        )
+        _append_event(
+            conn,
+            task_id,
+            "managed_execution_approved",
+            {
+                "backend": PILOT_BACKEND,
+                "schema": APPROVED_SPEC_SCHEMA,
+                "spec_sha256": candidate_digest,
+            },
+        )
+        cur = conn.execute(
+            "UPDATE tasks SET status='ready', assignee=?, max_runtime_seconds=?, "
+            "claim_lock=NULL, claim_expires=NULL, worker_pid=NULL "
+            "WHERE id=? AND status='blocked'",
+            (PILOT_ASSIGNEE, PILOT_TIMEOUT_SECONDS, task_id),
+        )
+        if cur.rowcount != 1:
+            raise ManagedExecutionConflict("managed execution approval lost task CAS")
+    return candidate
+
+
 def _migrate_add_optional_columns(conn: sqlite3.Connection) -> None:
     """Add columns that were introduced after v1 release to legacy DBs.
 
@@ -3558,6 +3958,8 @@ def recompute_ready(
         ).fetchall()
         for row in todo_rows:
             task_id = row["id"]
+            if _is_managed_task(conn, task_id):
+                continue
             cur_status = row["status"]
             if cur_status == "blocked" and _has_sticky_block(conn, task_id):
                 # Worker / operator asked for human review — do not
@@ -3614,12 +4016,16 @@ def claim_task(
     *,
     ttl_seconds: Optional[int] = None,
     claimer: Optional[str] = None,
+    _allow_managed: bool = False,
 ) -> Optional[Task]:
     """Atomically transition ``ready -> running``.
 
     Returns the claimed ``Task`` on success, ``None`` if the task was
-    already claimed (or is not in ``ready`` status).
+    already claimed (or is not in ``ready`` status). Approved managed tasks
+    are structurally reserved for :func:`_claim_managed_task`.
     """
+    if not _allow_managed and _is_managed_task(conn, task_id):
+        return None
     now = int(time.time())
     lock = claimer or _claimer_id()
     expires = now + _resolve_claim_ttl_seconds(ttl_seconds)
@@ -3730,6 +4136,23 @@ def claim_task(
     return claimed
 
 
+def _claim_managed_task(
+    conn: sqlite3.Connection,
+    task_id: str,
+    *,
+    ttl_seconds: Optional[int] = None,
+) -> Optional[Task]:
+    """Claim one approved task through the separate one-shot path."""
+    if not _is_managed_task(conn, task_id):
+        return None
+    return claim_task(
+        conn,
+        task_id,
+        ttl_seconds=ttl_seconds,
+        _allow_managed=True,
+    )
+
+
 def claim_review_task(
     conn: sqlite3.Connection,
     task_id: str,
@@ -3749,6 +4172,8 @@ def claim_review_task(
     Creates a new run entry so the review agent's lifecycle is tracked
     independently from the original worker run.
     """
+    if _is_managed_task(conn, task_id):
+        return None
     now = int(time.time())
     lock = claimer or _claimer_id()
     expires = now + _resolve_claim_ttl_seconds(ttl_seconds)
@@ -3877,6 +4302,8 @@ def release_stale_claims(
         (now,),
     ).fetchall()
     for row in stale:
+        if _is_managed_task(conn, row["id"]):
+            continue
         lock = row["claim_lock"] or ""
         host_local = lock.startswith(host_prefix)
         hb = row["last_heartbeat_at"]
@@ -4000,6 +4427,8 @@ def reclaim_task(
     Returns True if a reclaim happened, False if the task isn't in a
     reclaimable state (not running, or doesn't exist).
     """
+    if _is_managed_task(conn, task_id):
+        return False
     row = conn.execute(
         "SELECT status, claim_lock, worker_pid FROM tasks WHERE id = ?",
         (task_id,),
@@ -5235,6 +5664,8 @@ def promote_task(
     ``(False, reason)`` if refused. ``dry_run=True`` validates the
     promotion would succeed without mutating state.
     """
+    if _is_managed_task(conn, task_id):
+        return False, "managed execution is one-shot and requires human review"
     row = conn.execute(
         "SELECT status FROM tasks WHERE id = ?", (task_id,)
     ).fetchone()
@@ -5296,6 +5727,8 @@ def unblock_task(conn: sqlite3.Connection, task_id: str) -> bool:
     runs invariant (``current_run_id IS NULL`` ⇔ run row in terminal
     state) holds for the rest of this function's lifetime.
     """
+    if _is_managed_task(conn, task_id):
+        return False
     now = int(time.time())
     with write_txn(conn):
         stale = conn.execute(
@@ -6206,6 +6639,12 @@ class DispatchResult:
     DB writes this tick — the lock holder is making progress on the same
     board. This is the steady-state signal that a single-writer guard is
     actively preventing two dispatchers from racing on ``kanban.db``."""
+    managed_started: list[str] = field(default_factory=list)
+    """Approved one-shot attempts prepared, durably read back, and released."""
+    managed_reconciled: list[str] = field(default_factory=list)
+    """Managed attempts moved to sticky human review after observation."""
+    managed_safety_stopped: list[str] = field(default_factory=list)
+    """Managed attempts closed for timeout, recovery, or identity uncertainty."""
 
 
 # Bounded registry of recently-reaped worker child exits, populated by the
@@ -6577,6 +7016,8 @@ def enforce_max_runtime(
         "  AND t.worker_pid IS NOT NULL"
     ).fetchall()
     for row in rows:
+        if _is_managed_task(conn, row["id"]):
+            continue
         lock = row["claim_lock"] or ""
         if not lock.startswith(host_prefix):
             continue
@@ -6710,6 +7151,8 @@ def detect_stale_running(
     ).fetchall()
 
     for row in rows:
+        if _is_managed_task(conn, row["id"]):
+            continue
         # Skip if no started_at (shouldn't happen for running, but be safe).
         if row["active_started_at"] is None:
             continue
@@ -6921,6 +7364,8 @@ def detect_crashed_workers(conn: sqlite3.Connection) -> list[str]:
         ).fetchall()
         host_prefix = f"{_claimer_id().split(':', 1)[0]}:"
         for row in rows:
+            if _is_managed_task(conn, row["id"]):
+                continue
             # Only check liveness for claims owned by this host.
             lock = row["claim_lock"] or ""
             if not lock.startswith(host_prefix):
@@ -7201,6 +7646,8 @@ def _record_task_failure(
     ``max_retries`` override against the violation streak itself. The
     failure is still counted into ``consecutive_failures``.
     """
+    if _is_managed_task(conn, task_id):
+        return False
     if failure_limit is None:
         failure_limit = DEFAULT_FAILURE_LIMIT
     blocked = False
@@ -7419,6 +7866,8 @@ def check_respawn_guard(conn: sqlite3.Connection, task_id: str) -> Optional[str]
     reset the task to ``ready`` only after verifying the lock is
     genuinely dead (no live PID on this host).
     """
+    if _is_managed_task(conn, task_id):
+        return "managed_execution"
     row = conn.execute(
         "SELECT last_failure_error FROM tasks WHERE id = ?",
         (task_id,),
@@ -7521,7 +7970,7 @@ def has_spawnable_ready(conn: sqlite3.Connection) -> bool:
     the warning still fires in degraded environments.
     """
     rows = conn.execute(
-        "SELECT DISTINCT assignee FROM tasks "
+        "SELECT id, assignee FROM tasks "
         "WHERE status = 'ready' AND assignee IS NOT NULL "
         "    AND claim_lock IS NULL"
     ).fetchall()
@@ -7531,8 +7980,10 @@ def has_spawnable_ready(conn: sqlite3.Connection) -> bool:
         from hermes_cli.profiles import profile_exists  # local import: avoids cycle
     except Exception:
         # Can't introspect — assume spawnable, preserve legacy behavior.
-        return True
+        return any(not _is_managed_task(conn, row["id"]) for row in rows)
     for row in rows:
+        if _is_managed_task(conn, row["id"]):
+            continue
         if profile_exists(row["assignee"]):
             return True
     return False
@@ -7547,7 +7998,7 @@ def has_spawnable_review(conn: sqlite3.Connection) -> bool:
     should have spawned a review agent.
     """
     rows = conn.execute(
-        "SELECT DISTINCT assignee FROM tasks "
+        "SELECT id, assignee FROM tasks "
         "WHERE status = 'review' AND assignee IS NOT NULL "
         "    AND claim_lock IS NULL"
     ).fetchall()
@@ -7556,11 +8007,619 @@ def has_spawnable_review(conn: sqlite3.Connection) -> bool:
     try:
         from hermes_cli.profiles import profile_exists  # local import: avoids cycle
     except Exception:
-        return True
+        return any(not _is_managed_task(conn, row["id"]) for row in rows)
     for row in rows:
+        if _is_managed_task(conn, row["id"]):
+            continue
         if profile_exists(row["assignee"]):
             return True
     return False
+
+
+def _managed_handle_metadata(
+    handle: ExecutionHandle,
+    *,
+    spec_sha256: str,
+    phase: str,
+) -> dict[str, Any]:
+    return {
+        "backend": handle.backend,
+        "kernel_start_time": handle.kernel_start_time,
+        "pgid": handle.pgid,
+        "phase": phase,
+        "pid": handle.pid,
+        "spec_sha256": spec_sha256,
+    }
+
+
+def _managed_handle_from_metadata(metadata: object) -> tuple[ExecutionHandle, str, str]:
+    if type(metadata) is not dict or set(metadata) != {"managed_execution"}:
+        raise ManagedExecutionCapabilityError("managed execution handle metadata is invalid")
+    managed = metadata["managed_execution"]
+    expected = {
+        "backend",
+        "kernel_start_time",
+        "pgid",
+        "phase",
+        "pid",
+        "spec_sha256",
+    }
+    if type(managed) is not dict or set(managed) != expected:
+        raise ManagedExecutionCapabilityError("managed execution handle metadata is invalid")
+    phase = managed["phase"]
+    digest = managed["spec_sha256"]
+    if phase not in {"prepared", "release-sent"}:
+        raise ManagedExecutionCapabilityError("managed execution phase is invalid")
+    if type(digest) is not str or len(digest) != 64:
+        raise ManagedExecutionCapabilityError("managed execution spec digest is invalid")
+    try:
+        handle = ExecutionHandle(
+            backend=managed["backend"],
+            pid=managed["pid"],
+            pgid=managed["pgid"],
+            kernel_start_time=managed["kernel_start_time"],
+        )
+    except ValueError:
+        raise ManagedExecutionCapabilityError(
+            "managed execution handle metadata is invalid"
+        ) from None
+    return handle, phase, digest
+
+
+def _persist_managed_handle(
+    conn: sqlite3.Connection,
+    task_id: str,
+    handle: ExecutionHandle,
+    *,
+    spec_sha256: str,
+    phase: str,
+) -> ExecutionHandle:
+    """Persist and exactly read back the complete prepared process identity."""
+    payload = {
+        "managed_execution": _managed_handle_metadata(
+            handle, spec_sha256=spec_sha256, phase=phase
+        )
+    }
+    encoded = json.dumps(payload, ensure_ascii=False, sort_keys=True)
+    with write_txn(conn):
+        row = conn.execute(
+            "SELECT current_run_id FROM tasks WHERE id=? AND status='running'",
+            (task_id,),
+        ).fetchone()
+        if row is None or row["current_run_id"] is None:
+            raise ManagedExecutionConflict("managed execution has no active run")
+        run_id = int(row["current_run_id"])
+        cur = conn.execute(
+            "UPDATE task_runs SET metadata=?, worker_pid=? "
+            "WHERE id=? AND task_id=? AND ended_at IS NULL",
+            (encoded, handle.pid, run_id, task_id),
+        )
+        if cur.rowcount != 1:
+            raise ManagedExecutionConflict("managed execution handle persist lost run CAS")
+        cur = conn.execute(
+            "UPDATE tasks SET worker_pid=? "
+            "WHERE id=? AND status='running' AND current_run_id=?",
+            (handle.pid, task_id, run_id),
+        )
+        if cur.rowcount != 1:
+            raise ManagedExecutionConflict("managed execution handle persist lost task CAS")
+
+    row = conn.execute(
+        "SELECT metadata, worker_pid FROM task_runs "
+        "WHERE id=(SELECT current_run_id FROM tasks WHERE id=?)",
+        (task_id,),
+    ).fetchone()
+    if row is None or row["worker_pid"] != handle.pid:
+        raise ManagedExecutionCapabilityError("managed execution handle readback failed")
+    try:
+        readback_payload = json.loads(row["metadata"])
+    except (TypeError, ValueError):
+        raise ManagedExecutionCapabilityError(
+            "managed execution handle readback failed"
+        ) from None
+    if readback_payload != payload:
+        raise ManagedExecutionCapabilityError("managed execution handle readback mismatch")
+    readback, readback_phase, readback_digest = _managed_handle_from_metadata(
+        readback_payload
+    )
+    if (
+        readback != handle
+        or readback_phase != phase
+        or readback_digest != spec_sha256
+    ):
+        raise ManagedExecutionCapabilityError("managed execution handle readback mismatch")
+    return readback
+
+
+def _managed_review_required(
+    conn: sqlite3.Connection,
+    task_id: str,
+    *,
+    run_id: Optional[int],
+    outcome: str,
+    managed_metadata: dict[str, Any],
+    details: Optional[dict[str, Any]] = None,
+) -> bool:
+    """Close one managed attempt into a sticky, never-runnable review state."""
+    now = int(time.time())
+    payload: dict[str, Any] = {"outcome": outcome}
+    if details:
+        payload.update(details)
+    run_metadata = {
+        "managed_execution": managed_metadata,
+        "managed_reconciliation": payload,
+    }
+    with write_txn(conn):
+        task = conn.execute(
+            "SELECT status, current_run_id FROM tasks WHERE id=?", (task_id,)
+        ).fetchone()
+        if task is None:
+            return False
+        effective_run_id = run_id
+        if effective_run_id is None and task["current_run_id"] is not None:
+            effective_run_id = int(task["current_run_id"])
+        if effective_run_id is not None:
+            conn.execute(
+                "UPDATE task_runs SET status=?, outcome=?, summary=?, metadata=?, "
+                "ended_at=COALESCE(ended_at, ?), claim_lock=NULL, "
+                "claim_expires=NULL, worker_pid=NULL "
+                "WHERE id=? AND task_id=?",
+                (
+                    outcome,
+                    outcome,
+                    "managed attempt requires human review",
+                    json.dumps(run_metadata, ensure_ascii=False, sort_keys=True),
+                    now,
+                    effective_run_id,
+                    task_id,
+                ),
+            )
+        conn.execute(
+            "UPDATE tasks SET status='blocked', current_run_id=NULL, "
+            "claim_lock=NULL, claim_expires=NULL, worker_pid=NULL, "
+            "last_heartbeat_at=NULL WHERE id=?",
+            (task_id,),
+        )
+        exists = conn.execute(
+            "SELECT 1 FROM task_events WHERE task_id=? "
+            "AND kind='managed_review_required' LIMIT 1",
+            (task_id,),
+        ).fetchone()
+        if exists is None:
+            _append_event(
+                conn,
+                task_id,
+                "managed_review_required",
+                payload,
+                run_id=effective_run_id,
+            )
+            return True
+    return False
+
+
+def _managed_safety_stop(
+    conn: sqlite3.Connection,
+    task_id: str,
+    *,
+    outcome: str,
+    details: Optional[dict[str, Any]] = None,
+) -> bool:
+    """Make an uncertain managed run non-runnable without claiming it dead."""
+    payload: dict[str, Any] = {"outcome": outcome}
+    if details:
+        payload.update(details)
+    with write_txn(conn):
+        task = conn.execute(
+            "SELECT status FROM tasks WHERE id=?", (task_id,)
+        ).fetchone()
+        if task is None:
+            return False
+        exists = conn.execute(
+            "SELECT 1 FROM task_events WHERE task_id=? "
+            "AND kind='managed_execution_safety_stopped' LIMIT 1",
+            (task_id,),
+        ).fetchone()
+        if exists is not None:
+            return False
+        conn.execute(
+            "UPDATE tasks SET status='blocked' WHERE id=?",
+            (task_id,),
+        )
+        _append_event(
+            conn,
+            task_id,
+            "managed_execution_safety_stopped",
+            payload,
+            run_id=_current_run_id(conn, task_id),
+        )
+        return True
+
+
+def _managed_is_safety_stopped(conn: sqlite3.Connection, task_id: str) -> bool:
+    return conn.execute(
+        "SELECT 1 FROM task_events WHERE task_id=? "
+        "AND kind='managed_execution_safety_stopped' LIMIT 1",
+        (task_id,),
+    ).fetchone() is not None
+
+
+def _managed_attempt_rows(conn: sqlite3.Connection) -> list[sqlite3.Row]:
+    if not _managed_schema_ready(conn):
+        return []
+    return conn.execute(
+        f"SELECT s.task_id, s.backend, s.spec_sha256, t.status, "
+        "       t.current_run_id, r.id AS run_id, r.started_at, r.ended_at, "
+        "       r.metadata "
+        f"FROM {MANAGED_EXECUTION_SPEC_TABLE} s "
+        "JOIN tasks t ON t.id=s.task_id "
+        "LEFT JOIN task_runs r ON r.id=("
+        "    SELECT id FROM task_runs WHERE task_id=s.task_id "
+        "    ORDER BY id DESC LIMIT 1"
+        ") ORDER BY s.approved_at ASC, s.task_id ASC"
+    ).fetchall()
+
+
+def _reconcile_managed_attempts(
+    conn: sqlite3.Connection,
+    backend_registry: Optional[Mapping[str, ExecutionBackend]],
+) -> tuple[list[str], list[str]]:
+    """Observe/recover managed attempts before any legacy dispatcher reaper."""
+    reconciled: list[str] = []
+    safety_stopped: list[str] = []
+    registry = backend_registry or {}
+    now = int(time.time())
+
+    for row in _managed_attempt_rows(conn):
+        task_id = row["task_id"]
+        run_id = int(row["run_id"]) if row["run_id"] is not None else None
+        if run_id is None:
+            continue  # Approved but never attempted: launch path owns it.
+        if row["ended_at"] is not None:
+            if row["status"] in {"ready", "running", "todo"}:
+                if _managed_review_required(
+                    conn,
+                    task_id,
+                    run_id=run_id,
+                    outcome="managed_attempt_already_used",
+                    managed_metadata={
+                        "backend": row["backend"],
+                        "phase": "closed",
+                        "spec_sha256": row["spec_sha256"],
+                    },
+                ):
+                    reconciled.append(task_id)
+                    safety_stopped.append(task_id)
+            continue
+
+        try:
+            raw_metadata = json.loads(row["metadata"])
+            handle, phase, digest = _managed_handle_from_metadata(raw_metadata)
+        except (TypeError, ValueError, ManagedExecutionCapabilityError):
+            if _managed_safety_stop(
+                conn,
+                task_id,
+                outcome="managed_recovery_invalid_handle",
+            ):
+                reconciled.append(task_id)
+                safety_stopped.append(task_id)
+            continue
+
+        managed_metadata = _managed_handle_metadata(
+            handle, spec_sha256=digest, phase=phase
+        )
+        if digest != row["spec_sha256"] or handle.backend != row["backend"]:
+            if _managed_safety_stop(
+                conn,
+                task_id,
+                outcome="managed_recovery_handle_mismatch",
+            ):
+                reconciled.append(task_id)
+                safety_stopped.append(task_id)
+            continue
+
+        # A task manually returned to ready/todo after its one attempt must be
+        # sealed even if the recovery backend is unavailable. It is never
+        # eligible for a second prepare call. An explicit safety-stop instead
+        # preserves the active run and durable handle until human recovery.
+        if row["status"] != "running":
+            if row["status"] == "blocked" and _managed_is_safety_stopped(
+                conn, task_id
+            ):
+                continue
+            if _managed_review_required(
+                conn,
+                task_id,
+                run_id=run_id,
+                outcome="managed_attempt_already_used",
+                managed_metadata=managed_metadata,
+            ):
+                reconciled.append(task_id)
+                safety_stopped.append(task_id)
+            continue
+
+        backend = registry.get(handle.backend)
+        if backend is None:
+            # Compatibility/default-OFF mode launches nothing. A composition
+            # root may still supply a recovery-only backend on a later tick.
+            continue
+        if getattr(backend, "kind", None) != handle.backend:
+            if _managed_safety_stop(
+                conn,
+                task_id,
+                outcome="managed_recovery_backend_mismatch",
+            ):
+                reconciled.append(task_id)
+                safety_stopped.append(task_id)
+            continue
+
+        try:
+            observation = backend.observe(handle)
+        except Exception:
+            observation = None
+        if observation is None:
+            try:
+                termination = backend.terminate(handle)
+            except Exception:
+                termination = None
+            state = getattr(termination, "state", None)
+            details = {
+                "termination_state": (
+                    state.value if isinstance(state, TerminationState) else "unknown"
+                )
+            }
+            if state is TerminationState.DEAD:
+                changed = _managed_review_required(
+                    conn,
+                    task_id,
+                    run_id=run_id,
+                    outcome="managed_recovery_failed",
+                    managed_metadata=managed_metadata,
+                    details=details,
+                )
+            else:
+                changed = _managed_safety_stop(
+                    conn,
+                    task_id,
+                    outcome="managed_recovery_uncertain",
+                    details=details,
+                )
+                if changed:
+                    safety_stopped.append(task_id)
+            if changed:
+                reconciled.append(task_id)
+            continue
+
+        if observation.state is ExecutionState.RUNNING:
+            elapsed = now - int(row["started_at"] or now)
+            if elapsed < PILOT_TIMEOUT_SECONDS:
+                continue
+            outcome = "managed_timed_out"
+        elif observation.state is ExecutionState.EXITED:
+            outcome = "managed_exited"
+        else:
+            if _managed_safety_stop(
+                conn,
+                task_id,
+                outcome="managed_identity_mismatch",
+                details={"termination_state": "not_signalled"},
+            ):
+                reconciled.append(task_id)
+                safety_stopped.append(task_id)
+            continue
+
+        try:
+            termination = backend.terminate(handle)
+        except Exception:
+            termination = None
+        termination_state = getattr(termination, "state", None)
+        details = {
+            "termination_state": (
+                termination_state.value
+                if isinstance(termination_state, TerminationState)
+                else "unknown"
+            )
+        }
+        if observation.state is ExecutionState.EXITED:
+            details["exit_code"] = observation.exit_code
+        if termination_state is not TerminationState.DEAD:
+            if _managed_safety_stop(
+                conn,
+                task_id,
+                outcome="managed_termination_uncertain",
+                details=details,
+            ):
+                reconciled.append(task_id)
+                safety_stopped.append(task_id)
+            continue
+        if _managed_review_required(
+            conn,
+            task_id,
+            run_id=run_id,
+            outcome=outcome,
+            managed_metadata=managed_metadata,
+            details=details,
+        ):
+            reconciled.append(task_id)
+
+    return reconciled, safety_stopped
+
+
+def _launch_managed_attempts(
+    conn: sqlite3.Connection,
+    *,
+    backend_registry: Optional[Mapping[str, ExecutionBackend]],
+    board: Optional[str],
+    ttl_seconds: Optional[int],
+    dry_run: bool,
+    max_attempts: Optional[int],
+) -> list[str]:
+    """Launch approved work before profile routing, at most once per task."""
+    if dry_run or backend_registry is None or not _managed_schema_ready(conn):
+        return []
+    rows = conn.execute(
+        f"SELECT s.task_id, s.backend, s.spec_sha256 "
+        f"FROM {MANAGED_EXECUTION_SPEC_TABLE} s "
+        "JOIN tasks t ON t.id=s.task_id "
+        "WHERE t.status='ready' AND t.claim_lock IS NULL "
+        "ORDER BY t.priority DESC, t.created_at ASC"
+    ).fetchall()
+    started: list[str] = []
+    for row in rows:
+        if max_attempts is not None and len(started) >= max_attempts:
+            break
+        task_id = row["task_id"]
+        attempted = conn.execute(
+            "SELECT id FROM task_runs WHERE task_id=? ORDER BY id DESC LIMIT 1",
+            (task_id,),
+        ).fetchone()
+        if attempted is not None:
+            _managed_review_required(
+                conn,
+                task_id,
+                run_id=int(attempted["id"]),
+                outcome="managed_attempt_already_used",
+                managed_metadata={
+                    "backend": row["backend"],
+                    "phase": "closed",
+                    "spec_sha256": row["spec_sha256"],
+                },
+            )
+            continue
+        backend = backend_registry.get(row["backend"])
+        if backend is None:
+            continue
+        if getattr(backend, "kind", None) != row["backend"]:
+            continue
+        if getattr(backend, "launch_capable", True) is not True:
+            continue
+        spec = get_managed_execution_spec(conn, task_id)
+        if spec is None:
+            continue
+        task_row = conn.execute(
+            "SELECT * FROM tasks WHERE id=?", (task_id,)
+        ).fetchone()
+        projection_matches = False
+        if task_row is not None:
+            try:
+                current_projection = _approved_spec_from_projection(
+                    task_row,
+                    board=spec.board,
+                    repository_root=Path(spec.repository_root),
+                )
+                projection_matches = bool(
+                    current_projection == spec
+                    and task_row["assignee"] == spec.assignee
+                    and task_row["max_runtime_seconds"]
+                    == spec.max_runtime_seconds
+                )
+            except ValueError:
+                projection_matches = False
+        if not projection_matches:
+            _managed_review_required(
+                conn,
+                task_id,
+                run_id=None,
+                outcome="managed_projection_changed",
+                managed_metadata={
+                    "backend": spec.backend,
+                    "phase": "not-prepared",
+                    "spec_sha256": row["spec_sha256"],
+                },
+            )
+            continue
+        claimed = _claim_managed_task(conn, task_id, ttl_seconds=ttl_seconds)
+        if claimed is None:
+            continue
+
+        handle: Optional[ExecutionHandle] = None
+        managed_metadata: dict[str, Any] = {
+            "backend": spec.backend,
+            "phase": "prepare-failed",
+            "spec_sha256": row["spec_sha256"],
+        }
+        try:
+            workspace, resolved_branch = _resolve_worktree_workspace(
+                claimed, board=board
+            )
+            if (
+                workspace != Path(spec.worktree_path)
+                or resolved_branch != spec.branch_name
+            ):
+                raise ManagedExecutionConflict(
+                    "managed execution workspace projection changed"
+                )
+            prepared = backend.prepare(spec, workspace)
+            if type(prepared) is not ExecutionHandle:
+                raise ManagedExecutionCapabilityError(
+                    "managed execution backend returned an invalid handle"
+                )
+            handle = prepared
+            if prepared.backend != spec.backend:
+                raise ManagedExecutionCapabilityError(
+                    "managed execution backend returned an invalid handle"
+                )
+            handle = _persist_managed_handle(
+                conn,
+                task_id,
+                prepared,
+                spec_sha256=row["spec_sha256"],
+                phase="prepared",
+            )
+            managed_metadata = _managed_handle_metadata(
+                handle, spec_sha256=row["spec_sha256"], phase="prepared"
+            )
+            # Release only the exact handle just read back from durable state.
+            backend.release(handle)
+            _persist_managed_handle(
+                conn,
+                task_id,
+                handle,
+                spec_sha256=row["spec_sha256"],
+                phase="release-sent",
+            )
+            with write_txn(conn):
+                _append_event(
+                    conn,
+                    task_id,
+                    "managed_execution_released",
+                    {"backend": handle.backend},
+                    run_id=_current_run_id(conn, task_id),
+                )
+            started.append(task_id)
+        except Exception:
+            termination_state = "not_prepared"
+            termination_is_dead = handle is None
+            if handle is not None:
+                try:
+                    termination = backend.terminate(handle)
+                    state = getattr(termination, "state", None)
+                    termination_state = (
+                        state.value
+                        if isinstance(state, TerminationState)
+                        else "unknown"
+                    )
+                    termination_is_dead = state is TerminationState.DEAD
+                except Exception:
+                    termination_state = "unknown"
+                    termination_is_dead = False
+            details = {"termination_state": termination_state}
+            if termination_is_dead:
+                _managed_review_required(
+                    conn,
+                    task_id,
+                    run_id=_current_run_id(conn, task_id),
+                    outcome="managed_launch_failed",
+                    managed_metadata=managed_metadata,
+                    details=details,
+                )
+            else:
+                _managed_safety_stop(
+                    conn,
+                    task_id,
+                    outcome="managed_launch_uncertain",
+                    details=details,
+                )
+    return started
 
 
 def dispatch_once(
@@ -7576,6 +8635,7 @@ def dispatch_once(
     board: Optional[str] = None,
     default_assignee: Optional[str] = None,
     max_in_progress_per_profile: Optional[int] = None,
+    backend_registry: Optional[Mapping[str, ExecutionBackend]] = None,
 ) -> DispatchResult:
     """Run one dispatcher tick under the board's single-writer lock.
 
@@ -7610,6 +8670,7 @@ def dispatch_once(
             board=board,
             default_assignee=default_assignee,
             max_in_progress_per_profile=max_in_progress_per_profile,
+            backend_registry=backend_registry,
         )
     with _dispatch_tick_lock(db_path) as held:
         if not held:
@@ -7626,6 +8687,7 @@ def dispatch_once(
             board=board,
             default_assignee=default_assignee,
             max_in_progress_per_profile=max_in_progress_per_profile,
+            backend_registry=backend_registry,
         )
 
 
@@ -7642,6 +8704,7 @@ def _dispatch_once_locked(
     board: Optional[str] = None,
     default_assignee: Optional[str] = None,
     max_in_progress_per_profile: Optional[int] = None,
+    backend_registry: Optional[Mapping[str, ExecutionBackend]] = None,
 ) -> DispatchResult:
     """Run one dispatcher tick.
 
@@ -7671,11 +8734,16 @@ def _dispatch_once_locked(
     ``board`` pins workspace/log/db resolution for this tick to a specific
     board. When omitted, the current-board resolution chain is used.
     """
+    result = DispatchResult()
+    (
+        result.managed_reconciled,
+        result.managed_safety_stopped,
+    ) = _reconcile_managed_attempts(conn, backend_registry)
+
     # Reap zombie children from previously spawned workers. See
     # reap_worker_zombies() for the full rationale.
     reap_worker_zombies()
 
-    result = DispatchResult()
     result.reclaimed = release_stale_claims(conn)
     result.stale = detect_stale_running(
         conn, stale_timeout_seconds=stale_timeout_seconds,
@@ -7699,6 +8767,49 @@ def _dispatch_once_locked(
         result.rate_limited.extend(_crash_rate_limited)
     result.timed_out = enforce_max_runtime(conn)
     result.promoted = recompute_ready(conn, failure_limit=failure_limit)
+
+    # Managed work is selected before profile routing. Respect the same board
+    # concurrency ceilings while keeping backend choice independent from
+    # Hermes profile existence.
+    running_before_managed = int(
+        conn.execute(
+            "SELECT COUNT(*) FROM tasks WHERE status='running'"
+        ).fetchone()[0]
+    )
+    managed_capacity: Optional[int] = None
+    for cap in (max_spawn, max_in_progress):
+        if cap is None:
+            continue
+        remaining = max(0, int(cap) - running_before_managed)
+        managed_capacity = (
+            remaining
+            if managed_capacity is None
+            else min(managed_capacity, remaining)
+        )
+    if (
+        isinstance(max_in_progress_per_profile, int)
+        and max_in_progress_per_profile > 0
+    ):
+        managed_running = int(
+            conn.execute(
+                "SELECT COUNT(*) FROM tasks WHERE status='running' AND assignee=?",
+                (PILOT_ASSIGNEE,),
+            ).fetchone()[0]
+        )
+        remaining = max(0, max_in_progress_per_profile - managed_running)
+        managed_capacity = (
+            remaining
+            if managed_capacity is None
+            else min(managed_capacity, remaining)
+        )
+    result.managed_started = _launch_managed_attempts(
+        conn,
+        backend_registry=backend_registry,
+        board=board,
+        ttl_seconds=ttl_seconds,
+        dry_run=dry_run,
+        max_attempts=managed_capacity,
+    )
 
     # Count tasks already running so max_spawn enforces concurrency rather
     # than a per-tick spawn budget. See the docstring above for the full
@@ -7772,6 +8883,8 @@ def _dispatch_once_locked(
             # there, with the existing diagnostic.
             _default_assignee_resolved = True
     for row in ready_rows:
+        if _is_managed_task(conn, row["id"]):
+            continue
         if max_spawn is not None and running_count + spawned >= max_spawn:
             break
         row_assignee = row["assignee"]
@@ -7963,6 +9076,8 @@ def _dispatch_once_locked(
         "ORDER BY priority DESC, created_at ASC"
     ).fetchall()
     for row in review_rows:
+        if _is_managed_task(conn, row["id"]):
+            continue
         if max_spawn is not None and running_count + spawned >= max_spawn:
             break
         if not row["assignee"]:
@@ -8493,6 +9608,7 @@ def run_daemon(
     failure_limit: int = DEFAULT_SPAWN_FAILURE_LIMIT,
     stop_event=None,
     on_tick=None,
+    backend_registry: Optional[Mapping[str, ExecutionBackend]] = None,
 ) -> None:
     """Run the dispatcher in a loop until interrupted.
 
@@ -8528,6 +9644,7 @@ def run_daemon(
                     conn,
                     max_spawn=max_spawn,
                     failure_limit=failure_limit,
+                    backend_registry=backend_registry,
                 )
             if on_tick is not None:
                 try:

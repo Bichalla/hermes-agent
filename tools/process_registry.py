@@ -544,7 +544,13 @@ class ProcessRegistry:
             return 2.0
 
     @classmethod
-    def _terminate_host_pid(cls, pid: int, expected_start: Optional[int] = None) -> None:
+    def _terminate_host_pid(
+        cls,
+        pid: int,
+        expected_start: Optional[int] = None,
+        *,
+        grace_seconds: Optional[float] = None,
+    ) -> None:
         """Terminate a host-visible PID and its descendants.
 
         ``expected_start`` is the kernel start time captured when we spawned the
@@ -642,7 +648,11 @@ class ProcessRegistry:
         # Escalate to SIGKILL for anything that ignored SIGTERM within the
         # grace window — a daemon stalled in its signal handler would otherwise
         # leak indefinitely.
-        grace = cls._daemon_term_grace_seconds()
+        grace = (
+            cls._daemon_term_grace_seconds()
+            if grace_seconds is None
+            else max(float(grace_seconds), 0.0)
+        )
         if grace <= 0:
             return
         # Sleep out the grace window, then independently re-probe every target
@@ -2010,6 +2020,51 @@ class ProcessRegistry:
         self._write_checkpoint()
 
         return recovered
+
+
+def capture_host_identity(pid: int) -> Optional[int]:
+    """Capture the existing registry's kernel PID-reuse fingerprint.
+
+    This intentionally exposes only the host identity primitive needed by
+    dedicated execution adapters; it does not register or supervise a process.
+    """
+
+    if type(pid) is not int or pid <= 0:
+        return None
+    return ProcessRegistry._safe_host_start_time(pid)
+
+
+def terminate_host_identity(
+    pid: int,
+    expected_start: int,
+    *,
+    grace_seconds: float = 1.0,
+) -> bool:
+    """Identity-check and terminate one host PID tree through ProcessRegistry.
+
+    ``False`` means the PID is gone or its start fingerprint does not match;
+    in either case no signal is sent.  Callers that own a dedicated POSIX
+    process group may separately enumerate and clean verified orphan members.
+    """
+
+    if (
+        type(pid) is not int
+        or pid <= 0
+        or type(expected_start) is not int
+        or expected_start <= 0
+        or type(grace_seconds) not in (int, float)
+        or isinstance(grace_seconds, bool)
+        or grace_seconds < 0
+    ):
+        return False
+    if not ProcessRegistry._host_pid_is_ours(pid, expected_start):
+        return False
+    ProcessRegistry._terminate_host_pid(
+        pid,
+        expected_start,
+        grace_seconds=float(grace_seconds),
+    )
+    return True
 
 
 # Module-level singleton

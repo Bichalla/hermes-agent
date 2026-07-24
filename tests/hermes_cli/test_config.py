@@ -2035,3 +2035,22 @@ class TestCodexAppServerAutoConfig:
 
             raw = yaml.safe_load((tmp_path / "config.yaml").read_text())
             assert raw["compression"]["codex_app_server_auto"] == "hermes"
+
+
+class TestKanbanCodexDirectConfig:
+    """The managed Codex lane is canonical, visible, and default-off."""
+
+    def test_default_config_is_literal_false(self):
+        codex_direct = DEFAULT_CONFIG["kanban"]["codex_direct"]
+
+        assert codex_direct == {"enabled": False}
+        assert type(codex_direct["enabled"]) is bool
+
+    def test_example_config_documents_literal_false(self):
+        example = yaml.safe_load(
+            (Path(__file__).parents[2] / "cli-config.yaml.example").read_text(
+                encoding="utf-8"
+            )
+        )
+
+        assert example["kanban"]["codex_direct"] == {"enabled": False}

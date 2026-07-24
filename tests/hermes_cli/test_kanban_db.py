@@ -3,6 +3,9 @@
 from __future__ import annotations
 
 import concurrent.futures
+import ast
+import hashlib
+import json
 import os
 import sqlite3
 import subprocess
@@ -16,6 +19,30 @@ from pathlib import Path
 import pytest
 
 from hermes_cli import kanban_db as kb
+
+
+def _create_managed_candidate(conn, tmp_path: Path) -> tuple[str, Path]:
+    """Create the exact blocked project/worktree projection approval expects."""
+    repo = (tmp_path / "managed-repo").resolve()
+    repo.mkdir(parents=True, exist_ok=True)
+    task_id = kb.create_task(
+        conn,
+        title="Implement bounded managed attempt",
+        body="Apply the approved task instructions exactly.",
+        initial_status="blocked",
+        workspace_kind="worktree",
+    )
+    conn.execute(
+        "UPDATE tasks SET project_id=?, workspace_path=?, branch_name=? WHERE id=?",
+        (
+            "p_managed",
+            str(repo / ".worktrees" / task_id),
+            f"managed/{task_id}-bounded-attempt",
+            task_id,
+        ),
+    )
+    conn.commit()
+    return task_id, repo
 
 
 @pytest.fixture
@@ -88,6 +115,195 @@ def test_init_creates_expected_tables(kanban_home):
         ).fetchall()
     names = {r["name"] for r in rows}
     assert {"tasks", "task_links", "task_comments", "task_events"} <= names
+
+
+def test_managed_execution_schema_requires_explicit_migration(tmp_path, monkeypatch):
+    home = tmp_path / ".hermes"
+    home.mkdir()
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    db_path = kb.init_db()
+
+    with kb.connect(db_path) as conn:
+        before = kb.managed_execution_schema_status(conn)
+    assert before == {
+        "schema": "kanban-managed-execution-schema/v1",
+        "migrated": False,
+        "table": False,
+        "immutable_insert_trigger": False,
+        "immutable_update_trigger": False,
+        "immutable_delete_trigger": False,
+    }
+
+    # Reopening an ordinary board must not silently install managed DDL.
+    with kb.connect(db_path) as conn:
+        assert kb.managed_execution_schema_status(conn) == before
+
+    with kb.connect(db_path) as conn:
+        migrated = kb.migrate_managed_execution_schema(conn)
+        assert migrated["migrated"] is True
+        assert migrated["table"] is True
+        assert migrated["immutable_insert_trigger"] is True
+        assert migrated["immutable_update_trigger"] is True
+        assert migrated["immutable_delete_trigger"] is True
+
+
+def test_approve_managed_execution_is_canonical_immutable_and_replay_safe(
+    kanban_home, tmp_path
+):
+    with kb.connect() as conn:
+        kb.migrate_managed_execution_schema(conn)
+        task_id, repo = _create_managed_candidate(conn, tmp_path)
+        approved = kb.approve_managed_execution(
+            conn,
+            board="lifelog-control",
+            task_id=task_id,
+            repository_root=repo,
+        )
+        raw = approved.to_canonical_bytes()
+        digest = hashlib.sha256(raw).hexdigest()
+        row = conn.execute(
+            "SELECT spec_bytes, spec_sha256 FROM kanban_execution_specs WHERE task_id=?",
+            (task_id,),
+        ).fetchone()
+        assert bytes(row["spec_bytes"]) == raw
+        assert row["spec_sha256"] == digest
+        assert approved.repository_root == str(repo)
+        assert approved.worktree_path == str(repo / ".worktrees" / task_id)
+        assert approved.project_id == "p_managed"
+        assert approved.branch_name == f"managed/{task_id}-bounded-attempt"
+        task = kb.get_task(conn, task_id)
+        assert (task.status, task.assignee, task.max_runtime_seconds) == (
+            "ready",
+            "codex-direct",
+            1800,
+        )
+        counts_before = (
+            conn.execute("SELECT COUNT(*) FROM kanban_execution_specs").fetchone()[0],
+            conn.execute(
+                "SELECT COUNT(*) FROM task_events WHERE task_id=? AND kind='managed_execution_approved'",
+                (task_id,),
+            ).fetchone()[0],
+        )
+
+        replay = kb.approve_managed_execution(
+            conn,
+            board="lifelog-control",
+            task_id=task_id,
+            repository_root=repo,
+        )
+        assert replay == approved
+        assert counts_before == (
+            conn.execute("SELECT COUNT(*) FROM kanban_execution_specs").fetchone()[0],
+            conn.execute(
+                "SELECT COUNT(*) FROM task_events WHERE task_id=? AND kind='managed_execution_approved'",
+                (task_id,),
+            ).fetchone()[0],
+        )
+
+        conn.execute("UPDATE tasks SET title='mutated after approval' WHERE id=?", (task_id,))
+        conn.commit()
+        with pytest.raises(kb.ManagedExecutionConflict):
+            kb.approve_managed_execution(
+                conn,
+                board="lifelog-control",
+                task_id=task_id,
+                repository_root=repo,
+            )
+        with pytest.raises(sqlite3.IntegrityError):
+            conn.execute(
+                "UPDATE kanban_execution_specs SET approved_at=approved_at+1 WHERE task_id=?",
+                (task_id,),
+            )
+        conn.rollback()
+        with pytest.raises(sqlite3.IntegrityError):
+            conn.execute("DELETE FROM kanban_execution_specs WHERE task_id=?", (task_id,))
+        conn.rollback()
+        original_row = tuple(
+            conn.execute(
+                "SELECT task_id, schema, backend, spec_bytes, spec_sha256, approved_at "
+                "FROM kanban_execution_specs WHERE task_id=?",
+                (task_id,),
+            ).fetchone()
+        )
+        with pytest.raises(sqlite3.IntegrityError):
+            conn.execute(
+                "INSERT OR REPLACE INTO kanban_execution_specs "
+                "(task_id, schema, backend, spec_bytes, spec_sha256, approved_at) "
+                "VALUES (?, ?, ?, ?, ?, ?)",
+                (
+                    task_id,
+                    approved.schema,
+                    approved.backend,
+                    sqlite3.Binary(b"replacement"),
+                    "0" * 64,
+                    1,
+                ),
+            )
+        conn.rollback()
+        assert tuple(
+            conn.execute(
+                "SELECT task_id, schema, backend, spec_bytes, spec_sha256, approved_at "
+                "FROM kanban_execution_specs WHERE task_id=?",
+                (task_id,),
+            ).fetchone()
+        ) == original_row
+
+
+def test_managed_schema_status_rejects_same_named_malformed_objects(kanban_home):
+    with kb.connect() as conn:
+        conn.executescript(
+            """
+            CREATE TABLE kanban_execution_specs (
+                task_id TEXT,
+                schema TEXT,
+                backend TEXT,
+                spec_bytes TEXT,
+                spec_sha256 TEXT,
+                approved_at TEXT
+            );
+            CREATE TRIGGER kanban_execution_specs_immutable_insert
+            BEFORE INSERT ON kanban_execution_specs BEGIN SELECT 1; END;
+            CREATE TRIGGER kanban_execution_specs_immutable_update
+            BEFORE UPDATE ON kanban_execution_specs BEGIN SELECT 1; END;
+            CREATE TRIGGER kanban_execution_specs_immutable_delete
+            BEFORE DELETE ON kanban_execution_specs BEGIN SELECT 1; END;
+            """
+        )
+        assert kb.managed_execution_schema_status(conn)["migrated"] is False
+        with pytest.raises(kb.ManagedExecutionCapabilityError):
+            kb.migrate_managed_execution_schema(conn)
+
+
+def test_approve_managed_execution_is_atomic_on_late_failure(
+    kanban_home, tmp_path, monkeypatch
+):
+    with kb.connect() as conn:
+        kb.migrate_managed_execution_schema(conn)
+        task_id, repo = _create_managed_candidate(conn, tmp_path)
+        original_append = kb._append_event
+
+        def fail_approval_event(conn, event_task_id, kind, *args, **kwargs):
+            if kind == "managed_execution_approved":
+                raise RuntimeError("injected approval failure")
+            return original_append(conn, event_task_id, kind, *args, **kwargs)
+
+        monkeypatch.setattr(kb, "_append_event", fail_approval_event)
+        with pytest.raises(RuntimeError, match="injected approval failure"):
+            kb.approve_managed_execution(
+                conn,
+                board="lifelog-control",
+                task_id=task_id,
+                repository_root=repo,
+            )
+        assert conn.execute(
+            "SELECT COUNT(*) FROM kanban_execution_specs WHERE task_id=?", (task_id,)
+        ).fetchone()[0] == 0
+        task = kb.get_task(conn, task_id)
+        assert (task.status, task.assignee, task.max_runtime_seconds) == (
+            "blocked",
+            None,
+            None,
+        )
 
 
 def test_connect_honors_kanban_busy_timeout_env(kanban_home, monkeypatch):
@@ -1787,6 +2003,639 @@ def test_worker_context_includes_parent_results_and_comments(kanban_home):
 # ---------------------------------------------------------------------------
 # Dispatcher
 # ---------------------------------------------------------------------------
+
+@pytest.mark.parametrize(
+    ("column", "value"),
+    [
+        ("body", "mutated instructions"),
+        ("title", "mutated title"),
+        ("project_id", "p_other"),
+        ("workspace_kind", "scratch"),
+        ("assignee", "other-lane"),
+        ("max_runtime_seconds", 60),
+    ],
+)
+def test_managed_launch_rejects_changed_task_projection(
+    kanban_home, tmp_path, monkeypatch, column, value
+):
+    from hermes_cli.kanban_execution import PILOT_BACKEND
+
+    class CountingBackend:
+        kind = PILOT_BACKEND
+        prepares = 0
+
+        def prepare(self, spec, worktree):
+            self.prepares += 1
+            raise AssertionError("changed projection must not execute")
+
+        def release(self, handle):
+            raise AssertionError
+
+        def observe(self, handle):
+            raise AssertionError
+
+        def terminate(self, handle):
+            raise AssertionError
+
+    backend = CountingBackend()
+    with kb.connect() as conn:
+        kb.migrate_managed_execution_schema(conn)
+        task_id, repo = _create_managed_candidate(conn, tmp_path)
+        spec = kb.approve_managed_execution(
+            conn, board="lifelog-control", task_id=task_id, repository_root=repo
+        )
+        conn.execute(f"UPDATE tasks SET {column}=? WHERE id=?", (value, task_id))
+        conn.commit()
+        worktree = Path(spec.worktree_path)
+        worktree.mkdir(parents=True)
+        monkeypatch.setattr(
+            kb,
+            "_resolve_worktree_workspace",
+            lambda task, board=None: (worktree, spec.branch_name),
+        )
+
+        kb.dispatch_once(
+            conn,
+            board="lifelog-control",
+            backend_registry={PILOT_BACKEND: backend},
+        )
+        assert backend.prepares == 0
+        assert kb.get_task(conn, task_id).status == "blocked"
+        assert conn.execute(
+            "SELECT COUNT(*) FROM task_runs WHERE task_id=?", (task_id,)
+        ).fetchone()[0] == 0
+        assert conn.execute(
+            "SELECT COUNT(*) FROM task_events WHERE task_id=? "
+            "AND kind='managed_review_required'",
+            (task_id,),
+        ).fetchone()[0] == 1
+
+
+def test_managed_backend_selected_before_profile_and_handle_readback_precedes_release(
+    kanban_home, tmp_path, monkeypatch
+):
+    from hermes_cli.kanban_execution import ExecutionHandle, PILOT_BACKEND
+    from hermes_cli import profiles
+
+    events: list[str] = []
+
+    class FakeBackend:
+        kind = PILOT_BACKEND
+
+        def prepare(self, spec, worktree):
+            events.append("prepare")
+            assert worktree == Path(spec.worktree_path)
+            return ExecutionHandle(
+                backend=self.kind,
+                pid=43210,
+                pgid=43210,
+                kernel_start_time=987654,
+            )
+
+        def release(self, handle):
+            row = active_conn.execute(
+                "SELECT metadata FROM task_runs WHERE id=(SELECT current_run_id FROM tasks WHERE id=?)",
+                (task_id,),
+            ).fetchone()
+            managed = json.loads(row["metadata"])["managed_execution"]
+            assert managed == {
+                "backend": self.kind,
+                "kernel_start_time": 987654,
+                "pgid": 43210,
+                "phase": "prepared",
+                "pid": 43210,
+                "spec_sha256": spec_digest,
+            }
+            events.append("release")
+
+        def observe(self, handle):  # pragma: no cover - not used in launch tick
+            raise AssertionError("observe must not run while launching")
+
+        def terminate(self, handle):  # pragma: no cover - not used in launch tick
+            raise AssertionError("terminate must not run while launching")
+
+    monkeypatch.setattr(profiles, "profile_exists", lambda _name: False)
+    with kb.connect() as active_conn:
+        kb.migrate_managed_execution_schema(active_conn)
+        task_id, repo = _create_managed_candidate(active_conn, tmp_path)
+        spec = kb.approve_managed_execution(
+            active_conn,
+            board="lifelog-control",
+            task_id=task_id,
+            repository_root=repo,
+        )
+        spec_digest = hashlib.sha256(spec.to_canonical_bytes()).hexdigest()
+        worktree = Path(spec.worktree_path)
+        worktree.mkdir(parents=True)
+        monkeypatch.setattr(
+            kb,
+            "_resolve_worktree_workspace",
+            lambda task, board=None: (worktree, spec.branch_name),
+        )
+
+        result = kb.dispatch_once(
+            active_conn,
+            board="lifelog-control",
+            backend_registry={PILOT_BACKEND: FakeBackend()},
+        )
+        assert events == ["prepare", "release"]
+        assert result.managed_started == [task_id]
+        assert kb.get_task(active_conn, task_id).status == "running"
+        metadata = json.loads(
+            active_conn.execute(
+                "SELECT metadata FROM task_runs WHERE task_id=?", (task_id,)
+            ).fetchone()["metadata"]
+        )
+        assert metadata["managed_execution"]["phase"] == "release-sent"
+
+
+def test_managed_attempt_is_never_launched_twice(kanban_home, tmp_path, monkeypatch):
+    from hermes_cli.kanban_execution import ExecutionHandle, PILOT_BACKEND
+
+    class FakeBackend:
+        kind = PILOT_BACKEND
+        prepares = 0
+
+        def prepare(self, spec, worktree):
+            self.prepares += 1
+            return ExecutionHandle(self.kind, 43211, 43211, 987655)
+
+        def release(self, handle):
+            return None
+
+        def observe(self, handle):
+            raise AssertionError
+
+        def terminate(self, handle):
+            raise AssertionError
+
+    backend = FakeBackend()
+    with kb.connect() as conn:
+        kb.migrate_managed_execution_schema(conn)
+        task_id, repo = _create_managed_candidate(conn, tmp_path)
+        spec = kb.approve_managed_execution(
+            conn, board="lifelog-control", task_id=task_id, repository_root=repo
+        )
+        worktree = Path(spec.worktree_path)
+        worktree.mkdir(parents=True)
+        monkeypatch.setattr(
+            kb,
+            "_resolve_worktree_workspace",
+            lambda task, board=None: (worktree, spec.branch_name),
+        )
+        registry = {PILOT_BACKEND: backend}
+        kb.dispatch_once(conn, board="lifelog-control", backend_registry=registry)
+        conn.execute(
+            "UPDATE tasks SET status='ready', claim_lock=NULL, claim_expires=NULL, "
+            "worker_pid=NULL, current_run_id=NULL WHERE id=?",
+            (task_id,),
+        )
+        conn.commit()
+        result = kb.dispatch_once(
+            conn, board="lifelog-control", backend_registry=registry
+        )
+        assert backend.prepares == 1
+        assert result.managed_started == []
+        assert kb.get_task(conn, task_id).status == "blocked"
+
+
+def test_managed_reconciliation_is_first_inside_dispatch_lock(
+    kanban_home, monkeypatch
+):
+    order: list[str] = []
+    monkeypatch.setattr(
+        kb,
+        "_reconcile_managed_attempts",
+        lambda conn, backend_registry: order.append("managed") or ([], []),
+    )
+    monkeypatch.setattr(
+        kb,
+        "reap_worker_zombies",
+        lambda: order.append("legacy-reap"),
+    )
+    with kb.connect() as conn:
+        kb.dispatch_once(conn, backend_registry={})
+    assert order[:2] == ["managed", "legacy-reap"]
+
+
+def test_managed_tasks_are_structurally_excluded_from_legacy_reclaim_paths(
+    kanban_home, tmp_path, monkeypatch
+):
+    with kb.connect() as conn:
+        kb.migrate_managed_execution_schema(conn)
+        task_id, repo = _create_managed_candidate(conn, tmp_path)
+        kb.approve_managed_execution(
+            conn, board="lifelog-control", task_id=task_id, repository_root=repo
+        )
+        claimed = kb._claim_managed_task(conn, task_id, ttl_seconds=1)
+        assert claimed is not None
+        now = int(time.time())
+        conn.execute(
+            "UPDATE tasks SET claim_expires=?, worker_pid=?, started_at=?, "
+            "last_heartbeat_at=?, max_runtime_seconds=1 WHERE id=?",
+            (now - 10, 999999, now - 7200, now - 7200, task_id),
+        )
+        conn.execute(
+            "UPDATE task_runs SET claim_expires=?, worker_pid=?, started_at=?, "
+            "max_runtime_seconds=1 WHERE task_id=?",
+            (now - 10, 999999, now - 7200, task_id),
+        )
+        conn.commit()
+        monkeypatch.setattr(kb, "_pid_alive", lambda _pid: False)
+
+        assert kb.release_stale_claims(conn) == 0
+        assert kb.detect_stale_running(conn, stale_timeout_seconds=1) == []
+        assert kb.detect_crashed_workers(conn) == []
+        assert kb.enforce_max_runtime(conn, signal_fn=lambda *_args: None) == []
+        assert kb.reclaim_task(conn, task_id, reason="legacy") is False
+        assert kb._record_task_failure(
+            conn, task_id, "legacy retry", outcome="crashed"
+        ) is False
+        assert kb.get_task(conn, task_id).status == "running"
+
+
+def test_managed_exit_reconciles_once_to_sticky_review_without_retry(
+    kanban_home, tmp_path, monkeypatch
+):
+    from hermes_cli.kanban_execution import (
+        ExecutionHandle,
+        ExecutionObservation,
+        ExecutionState,
+        PILOT_BACKEND,
+        TerminationObservation,
+        TerminationState,
+    )
+
+    class FakeBackend:
+        kind = PILOT_BACKEND
+        prepares = 0
+
+        def prepare(self, spec, worktree):
+            self.prepares += 1
+            return ExecutionHandle(self.kind, 43212, 43212, 987656)
+
+        def release(self, handle):
+            return None
+
+        def observe(self, handle):
+            return ExecutionObservation(ExecutionState.EXITED, 0)
+
+        def terminate(self, handle):
+            return TerminationObservation(TerminationState.DEAD)
+
+    backend = FakeBackend()
+    registry = {PILOT_BACKEND: backend}
+    with kb.connect() as conn:
+        kb.migrate_managed_execution_schema(conn)
+        task_id, repo = _create_managed_candidate(conn, tmp_path)
+        spec = kb.approve_managed_execution(
+            conn, board="lifelog-control", task_id=task_id, repository_root=repo
+        )
+        worktree = Path(spec.worktree_path)
+        worktree.mkdir(parents=True)
+        monkeypatch.setattr(
+            kb,
+            "_resolve_worktree_workspace",
+            lambda task, board=None: (worktree, spec.branch_name),
+        )
+        kb.dispatch_once(conn, board="lifelog-control", backend_registry=registry)
+        result = kb.dispatch_once(
+            conn, board="lifelog-control", backend_registry=registry
+        )
+        assert result.managed_reconciled == [task_id]
+        assert kb.get_task(conn, task_id).status == "blocked"
+        assert backend.prepares == 1
+        event_count = conn.execute(
+            "SELECT COUNT(*) FROM task_events WHERE task_id=? "
+            "AND kind='managed_review_required'",
+            (task_id,),
+        ).fetchone()[0]
+        kb.dispatch_once(conn, board="lifelog-control", backend_registry=registry)
+        assert backend.prepares == 1
+        assert conn.execute(
+            "SELECT COUNT(*) FROM task_events WHERE task_id=? "
+            "AND kind='managed_review_required'",
+            (task_id,),
+        ).fetchone()[0] == event_count == 1
+
+
+def test_managed_identity_mismatch_safety_stops_without_terminal_cleanup(
+    kanban_home, tmp_path, monkeypatch
+):
+    from hermes_cli.kanban_execution import (
+        ExecutionHandle,
+        ExecutionObservation,
+        ExecutionState,
+        PILOT_BACKEND,
+    )
+
+    class FakeBackend:
+        kind = PILOT_BACKEND
+
+        def prepare(self, spec, worktree):
+            return ExecutionHandle(self.kind, 43213, 43213, 987657)
+
+        def release(self, handle):
+            return None
+
+        def observe(self, handle):
+            return ExecutionObservation(ExecutionState.IDENTITY_MISMATCH, None)
+
+        def terminate(self, handle):
+            raise AssertionError("identity mismatch must signal nothing")
+
+    backend = FakeBackend()
+    registry = {PILOT_BACKEND: backend}
+    with kb.connect() as conn:
+        kb.migrate_managed_execution_schema(conn)
+        task_id, repo = _create_managed_candidate(conn, tmp_path)
+        spec = kb.approve_managed_execution(
+            conn, board="lifelog-control", task_id=task_id, repository_root=repo
+        )
+        worktree = Path(spec.worktree_path)
+        worktree.mkdir(parents=True)
+        monkeypatch.setattr(
+            kb,
+            "_resolve_worktree_workspace",
+            lambda task, board=None: (worktree, spec.branch_name),
+        )
+        kb.dispatch_once(conn, board="lifelog-control", backend_registry=registry)
+        run_id = conn.execute(
+            "SELECT current_run_id FROM tasks WHERE id=?", (task_id,)
+        ).fetchone()[0]
+
+        result = kb.dispatch_once(
+            conn, board="lifelog-control", backend_registry=registry
+        )
+        assert result.managed_safety_stopped == [task_id]
+        task = kb.get_task(conn, task_id)
+        assert task.status == "blocked"
+        assert task.current_run_id == run_id
+        run = conn.execute(
+            "SELECT status, ended_at, metadata FROM task_runs WHERE id=?", (run_id,)
+        ).fetchone()
+        assert run["status"] == "running"
+        assert run["ended_at"] is None
+        assert json.loads(run["metadata"])["managed_execution"]["pid"] == 43213
+        assert conn.execute(
+            "SELECT COUNT(*) FROM task_events WHERE task_id=? "
+            "AND kind='managed_execution_safety_stopped'",
+            (task_id,),
+        ).fetchone()[0] == 1
+        assert conn.execute(
+            "SELECT COUNT(*) FROM task_events WHERE task_id=? "
+            "AND kind='managed_review_required'",
+            (task_id,),
+        ).fetchone()[0] == 0
+
+        replay = kb.dispatch_once(
+            conn, board="lifelog-control", backend_registry=registry
+        )
+        assert replay.managed_reconciled == []
+        assert replay.managed_safety_stopped == []
+        assert conn.execute(
+            "SELECT COUNT(*) FROM task_events WHERE task_id=? "
+            "AND kind='managed_execution_safety_stopped'",
+            (task_id,),
+        ).fetchone()[0] == 1
+
+
+@pytest.mark.parametrize("mode", ["invalid_metadata", "backend_kind_mismatch"])
+def test_managed_uncertain_recovery_never_claims_terminal_cleanup(
+    kanban_home, tmp_path, monkeypatch, mode
+):
+    from hermes_cli.kanban_execution import ExecutionHandle, PILOT_BACKEND
+
+    class LaunchBackend:
+        kind = PILOT_BACKEND
+
+        def prepare(self, spec, worktree):
+            return ExecutionHandle(self.kind, 43214, 43214, 987658)
+
+        def release(self, handle):
+            return None
+
+        def observe(self, handle):
+            raise AssertionError("uncertain branch must not observe")
+
+        def terminate(self, handle):
+            raise AssertionError("uncertain identity must signal nothing")
+
+    class WrongKindBackend(LaunchBackend):
+        kind = "wrong-backend/v1"
+
+    backend = LaunchBackend()
+    with kb.connect() as conn:
+        kb.migrate_managed_execution_schema(conn)
+        task_id, repo = _create_managed_candidate(conn, tmp_path)
+        spec = kb.approve_managed_execution(
+            conn, board="lifelog-control", task_id=task_id, repository_root=repo
+        )
+        worktree = Path(spec.worktree_path)
+        worktree.mkdir(parents=True)
+        monkeypatch.setattr(
+            kb,
+            "_resolve_worktree_workspace",
+            lambda task, board=None: (worktree, spec.branch_name),
+        )
+        registry = {PILOT_BACKEND: backend}
+        kb.dispatch_once(conn, board="lifelog-control", backend_registry=registry)
+        task_before = kb.get_task(conn, task_id)
+        run_id = task_before.current_run_id
+        assert run_id is not None
+        if mode == "invalid_metadata":
+            replacement_metadata = '{"corrupt":true}'
+            conn.execute(
+                "UPDATE task_runs SET metadata=? WHERE id=?",
+                (replacement_metadata, run_id),
+            )
+            conn.commit()
+            recovery_registry = registry
+        else:
+            replacement_metadata = conn.execute(
+                "SELECT metadata FROM task_runs WHERE id=?", (run_id,)
+            ).fetchone()[0]
+            recovery_registry = {PILOT_BACKEND: WrongKindBackend()}
+
+        result = kb.dispatch_once(
+            conn,
+            board="lifelog-control",
+            backend_registry=recovery_registry,
+        )
+        assert result.managed_safety_stopped == [task_id]
+        task = kb.get_task(conn, task_id)
+        assert task.status == "blocked"
+        assert task.current_run_id == run_id
+        run = conn.execute(
+            "SELECT status, ended_at, metadata FROM task_runs WHERE id=?", (run_id,)
+        ).fetchone()
+        assert run["status"] == "running"
+        assert run["ended_at"] is None
+        assert run["metadata"] == replacement_metadata
+        assert conn.execute(
+            "SELECT COUNT(*) FROM task_events WHERE task_id=? "
+            "AND kind='managed_execution_safety_stopped'",
+            (task_id,),
+        ).fetchone()[0] == 1
+        assert conn.execute(
+            "SELECT COUNT(*) FROM task_events WHERE task_id=? "
+            "AND kind='managed_review_required'",
+            (task_id,),
+        ).fetchone()[0] == 0
+
+        replay = kb.dispatch_once(
+            conn,
+            board="lifelog-control",
+            backend_registry=recovery_registry,
+        )
+        assert replay.managed_reconciled == []
+        assert replay.managed_safety_stopped == []
+
+
+def test_recovery_only_registry_never_consumes_queued_approved_attempt(
+    kanban_home, tmp_path, monkeypatch
+):
+    from gateway.kanban_watchers import _RecoveryOnlyCodexBackend
+    from hermes_cli.kanban_execution import (
+        ExecutionHandle,
+        ExecutionObservation,
+        ExecutionState,
+        PILOT_BACKEND,
+        TerminationObservation,
+        TerminationState,
+    )
+
+    class Backend:
+        kind = PILOT_BACKEND
+
+        def __init__(self):
+            self.prepares = 0
+
+        def prepare(self, spec, worktree):
+            self.prepares += 1
+            identity = 50000 + self.prepares
+            return ExecutionHandle(self.kind, identity, identity, identity)
+
+        def release(self, handle):
+            return None
+
+        def observe(self, handle):
+            return ExecutionObservation(ExecutionState.EXITED, 0)
+
+        def terminate(self, handle):
+            return TerminationObservation(TerminationState.DEAD)
+
+    backend = Backend()
+    with kb.connect() as conn:
+        kb.migrate_managed_execution_schema(conn)
+        active_id, active_repo = _create_managed_candidate(
+            conn, tmp_path / "active"
+        )
+        active_spec = kb.approve_managed_execution(
+            conn,
+            board="lifelog-control",
+            task_id=active_id,
+            repository_root=active_repo,
+        )
+        queued_id, queued_repo = _create_managed_candidate(
+            conn, tmp_path / "queued"
+        )
+        queued_spec = kb.approve_managed_execution(
+            conn,
+            board="lifelog-control",
+            task_id=queued_id,
+            repository_root=queued_repo,
+        )
+        Path(active_spec.worktree_path).mkdir(parents=True)
+        Path(queued_spec.worktree_path).mkdir(parents=True)
+        monkeypatch.setattr(
+            kb,
+            "_resolve_worktree_workspace",
+            lambda task, board=None: (Path(task.workspace_path), task.branch_name),
+        )
+        normal_registry = {PILOT_BACKEND: backend}
+        launched = kb.dispatch_once(
+            conn,
+            board="lifelog-control",
+            backend_registry=normal_registry,
+            max_spawn=1,
+        )
+        assert launched.managed_started == [active_id]
+        assert backend.prepares == 1
+
+        recovery = _RecoveryOnlyCodexBackend(backend)
+        assert recovery.launch_capable is False
+        recovered = kb.dispatch_once(
+            conn,
+            board="lifelog-control",
+            backend_registry={PILOT_BACKEND: recovery},
+        )
+        assert recovered.managed_reconciled == [active_id]
+        assert kb.get_task(conn, queued_id).status == "ready"
+        assert conn.execute(
+            "SELECT COUNT(*) FROM task_runs WHERE task_id=?", (queued_id,)
+        ).fetchone()[0] == 0
+        assert conn.execute(
+            "SELECT COUNT(*) FROM task_events WHERE task_id=? "
+            "AND kind='managed_review_required'",
+            (queued_id,),
+        ).fetchone()[0] == 0
+        assert backend.prepares == 1
+
+        next_tick = kb.dispatch_once(
+            conn,
+            board="lifelog-control",
+            backend_registry=normal_registry,
+        )
+        assert next_tick.managed_started == [queued_id]
+        assert backend.prepares == 2
+        assert conn.execute(
+            "SELECT COUNT(*) FROM task_runs WHERE task_id=?", (queued_id,)
+        ).fetchone()[0] == 1
+
+
+def test_registry_absent_preserves_legacy_and_does_not_claim_managed(
+    kanban_home, tmp_path, all_assignees_spawnable
+):
+    spawns: list[str] = []
+
+    def fake_spawn(task, workspace):
+        spawns.append(task.id)
+
+    with kb.connect() as conn:
+        kb.migrate_managed_execution_schema(conn)
+        managed_id, repo = _create_managed_candidate(conn, tmp_path)
+        kb.approve_managed_execution(
+            conn,
+            board="lifelog-control",
+            task_id=managed_id,
+            repository_root=repo,
+        )
+        legacy_id = kb.create_task(conn, title="legacy", assignee="alice")
+        kb.dispatch_once(conn, spawn_fn=fake_spawn, backend_registry=None)
+        assert spawns == [legacy_id]
+        assert kb.get_task(conn, managed_id).status == "ready"
+
+
+def test_kanban_db_has_no_codex_adapter_import_config_or_argv():
+    source_path = Path(kb.__file__)
+    source = source_path.read_text(encoding="utf-8")
+    tree = ast.parse(source)
+    imports = {
+        alias.name
+        for node in ast.walk(tree)
+        if isinstance(node, ast.Import)
+        for alias in node.names
+    }
+    imports.update(
+        node.module or ""
+        for node in ast.walk(tree)
+        if isinstance(node, ast.ImportFrom)
+    )
+    assert not any("kanban_codex_backend" in name for name in imports)
+    assert "--strict-config" not in source
+    assert "sandbox_workspace_write.exclude_slash_tmp" not in source
+    assert "codex_direct.enabled" not in source
 
 def test_dispatch_dry_run_does_not_claim(kanban_home, all_assignees_spawnable):
     with kb.connect() as conn:

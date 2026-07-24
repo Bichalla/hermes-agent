@@ -1496,3 +1496,10 @@ updates:
 #     binary_path: ""                               # "" = resolve op via PATH; else absolute path
 #     cache_ttl_seconds: 300                        # 0 disables BOTH cache layers
 #     override_existing: true                       # resolved values win over existing env
+
+# =============================================================================
+# Kanban execution (default OFF)
+# =============================================================================
+kanban:
+  codex_direct:
+    enabled: false

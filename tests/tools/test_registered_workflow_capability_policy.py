@@ -22,6 +22,7 @@ def test_initial_catalog_is_closed_and_versioned():
         "kanban.status-memory.v1",
         "kanban-intake.pending-soft-delete.v1",
         "lifelog.diet-intake.v1",
+        "review-ledger.history.v1",
     }
     assert catalog["kanban-intake.pending-soft-delete.v1"].effects == frozenset(
         {WorkflowEffect.READ, WorkflowEffect.SOFT_DELETE, WorkflowEffect.RESTORE}
@@ -164,18 +165,43 @@ def test_unknown_or_cross_effect_operation_denies_unregistered():
 
 
 @pytest.mark.parametrize(
-    "capability_id,operation",
+    "operation,effect",
     [
-        ("review-ledger.history.v1", "start-or-reconcile"),
+        ("freeze", WorkflowEffect.CREATE),
+        ("start_attempt", WorkflowEffect.CREATE),
+        ("record_result", WorkflowEffect.UPDATE),
+        ("status", WorkflowEffect.READ),
+        ("finalize", WorkflowEffect.READ),
     ],
 )
-def test_phase1_excluded_owner_capabilities_deny(capability_id, operation):
+def test_review_ledger_is_main_controller_only(operation, effect):
     assert evaluate_registered_capability(
-        capability_id,
+        "review-ledger.history.v1",
         operation,
-        WorkflowEffect.CREATE,
+        effect,
+        schema_valid=True,
+        authority_mode=AuthorityMode.MAIN_CONTROLLER,
+        owner_ready=True,
+        target_valid=True,
+    ) is CapabilityDecision.ALLOW
+    assert evaluate_registered_capability(
+        "review-ledger.history.v1",
+        operation,
+        effect,
         schema_valid=True,
         authority_mode=AuthorityMode.FOREGROUND_CURRENT_TURN,
+        owner_ready=True,
+        target_valid=True,
+    ) is CapabilityDecision.DENY_AUTHORITY_MISSING
+
+
+def test_review_ledger_unknown_operation_remains_unregistered():
+    assert evaluate_registered_capability(
+        "review-ledger.history.v1",
+        "start-or-reconcile",
+        WorkflowEffect.CREATE,
+        schema_valid=True,
+        authority_mode=AuthorityMode.MAIN_CONTROLLER,
         owner_ready=True,
         target_valid=True,
     ) is CapabilityDecision.DENY_UNREGISTERED_ACTION

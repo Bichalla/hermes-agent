@@ -266,6 +266,14 @@ TOOLSETS = {
         "includes": [],
     },
 
+    "review-ledger-controller": {
+        "description": (
+            "Default-off main-controller-only fixed review-ledger owner route."
+        ),
+        "tools": ["registered_review_ledger"],
+        "includes": [],
+    },
+
     "kanban": {
         "description": (
             "Kanban multi-agent coordination — only active when the agent "

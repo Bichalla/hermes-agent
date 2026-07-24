@@ -15568,6 +15568,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             profile=getattr(context.source, "profile", "") or "",
             async_delivery=_async_delivery,
             user_text=user_text,
+            controller_role=(
+                "main_controller" if isinstance(user_text, str) else ""
+            ),
         )
 
     def _clear_session_env(self, tokens: list) -> None:

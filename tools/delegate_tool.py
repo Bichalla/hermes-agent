@@ -30,7 +30,7 @@ from concurrent.futures import (
 )
 from typing import Any, Dict, List, Optional
 
-from toolsets import TOOLSETS
+from toolsets import TOOLSETS, resolve_toolset
 
 # Sentinel value used by the runtime provider system for providers that are
 # not natively known (named custom providers, third-party aggregators, etc.).
@@ -50,6 +50,7 @@ DELEGATE_BLOCKED_TOOLS = frozenset(
         "send_message",  # no cross-platform side effects
         "execute_code",  # children should reason step-by-step, not write scripts
         "cronjob",  # no scheduling more work in the parent's name
+        "registered_review_ledger",  # owner-only governance route stays parent-bound
     ]
 )
 
@@ -792,23 +793,21 @@ def _resolve_workspace_hint(parent_agent) -> Optional[str]:
 
 
 def _strip_blocked_tools(toolsets: List[str]) -> List[str]:
-    """Remove toolsets that contain only blocked tools.
+    """Remove every child toolset whose final expansion exposes a blocked tool.
 
-    The strip set is derived from DELEGATE_BLOCKED_TOOLS plus the explicit
-    composite/scenario toolsets (delegation, code_execution) that have no
-    one-to-one tool. This keeps the blocklist and the strip set in lockstep
-    so new blocked tools can't silently leak through as toolset names.
+    Checking the fully-resolved tool list closes aliases (for example ``all``)
+    and mixed/composite toolsets, not just dedicated one-tool bundles.
     """
-    # Composite toolsets that should never pass through to children, even
-    # though their individual tools aren't all in DELEGATE_BLOCKED_TOOLS.
-    _COMPOSITE_BLOCKED_TOOLSETS = frozenset({"delegation", "code_execution"})
-    blocked_toolset_names = {
-        name
-        for name, defn in TOOLSETS.items()
-        if name in _COMPOSITE_BLOCKED_TOOLSETS
-        or all(t in DELEGATE_BLOCKED_TOOLS for t in defn.get("tools", []))
-    }
-    return [t for t in toolsets if t not in blocked_toolset_names]
+    kept: List[str] = []
+    for name in toolsets:
+        try:
+            resolved = set(resolve_toolset(name))
+        except Exception:
+            resolved = set(TOOLSETS.get(name, {}).get("tools", []))
+        if resolved.intersection(DELEGATE_BLOCKED_TOOLS):
+            continue
+        kept.append(name)
+    return kept
 
 
 def _emit_parent_console(parent_agent, line: str) -> None:

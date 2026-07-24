@@ -55,6 +55,57 @@ class TestResolveToolset:
         tools = resolve_toolset("web")
         assert set(tools) == {"web_search", "web_extract"}
 
+    def test_review_ledger_controller_is_dedicated_and_narrow(self):
+        assert resolve_toolset("review-ledger-controller") == [
+            "registered_review_ledger"
+        ]
+
+
+    def test_review_ledger_controller_is_configurable_and_default_off(self):
+        from hermes_cli.tools_config import CONFIGURABLE_TOOLSETS, _DEFAULT_OFF_TOOLSETS
+
+        assert "review-ledger-controller" in {
+            name for name, _label, _description in CONFIGURABLE_TOOLSETS
+        }
+        assert "review-ledger-controller" in _DEFAULT_OFF_TOOLSETS
+
+    def test_review_ledger_controller_visibility_requires_flag_and_toolset(
+        self, monkeypatch
+    ):
+        import model_tools
+        import tools.registered_review_ledger as tool
+
+        monkeypatch.setattr(tool, "_feature_enabled", lambda: True)
+        monkeypatch.setattr(tool, "_dependencies_ready", lambda: True)
+        from tools.registry import invalidate_check_fn_cache
+
+        invalidate_check_fn_cache()
+        model_tools._tool_defs_cache.clear()
+        default_names = {
+            item["function"]["name"]
+            for item in model_tools.get_tool_definitions(None, quiet_mode=True)
+        }
+        assert "registered_review_ledger" not in default_names
+
+        explicit_names = {
+            item["function"]["name"]
+            for item in model_tools.get_tool_definitions(
+                ["review-ledger-controller"], quiet_mode=True
+            )
+        }
+        assert "registered_review_ledger" in explicit_names
+
+        monkeypatch.setattr(tool, "_feature_enabled", lambda: False)
+        invalidate_check_fn_cache()
+        model_tools._tool_defs_cache.clear()
+        disabled_names = {
+            item["function"]["name"]
+            for item in model_tools.get_tool_definitions(
+                ["review-ledger-controller"], quiet_mode=True
+            )
+        }
+        assert "registered_review_ledger" not in disabled_names
+
     def test_composite_toolset(self):
         tools = resolve_toolset("debugging")
         assert "terminal" in tools

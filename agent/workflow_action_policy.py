@@ -81,6 +81,7 @@ _ADAPTER_IDS = frozenset(
         "kanban-status-memory",
         "kanban-intake-pending",
         "lifelog-diet-recorder",
+        "review-ledger-controller",
     }
 )
 
@@ -183,6 +184,19 @@ _REGISTERED_CAPABILITIES: Mapping[str, RegisteredCapability] = MappingProxyType(
             readback_required=True,
             soft_delete_restore_required=False,
         ),
+        "review-ledger.history.v1": RegisteredCapability(
+            capability_id="review-ledger.history.v1",
+            effects=frozenset(
+                {WorkflowEffect.CREATE, WorkflowEffect.UPDATE, WorkflowEffect.READ}
+            ),
+            authority_modes=frozenset({AuthorityMode.MAIN_CONTROLLER}),
+            adapter_id="review-ledger-controller",
+            input_schema_id="review-ledger-controller/v1",
+            result_schema_id="review-ledger-controller-result/v1",
+            idempotency=IdempotencyMode.OWNER_ATOMIC,
+            readback_required=True,
+            soft_delete_restore_required=False,
+        ),
     }
 )
 
@@ -195,6 +209,11 @@ _REGISTERED_OPERATIONS: Mapping[tuple[str, str], WorkflowEffect] = MappingProxyT
         ("kanban-intake.pending-soft-delete.v1", "pending_soft_delete"): WorkflowEffect.SOFT_DELETE,
         ("kanban-intake.pending-soft-delete.v1", "pending_restore"): WorkflowEffect.RESTORE,
         ("lifelog.diet-intake.v1", "diet_intake_record"): WorkflowEffect.CREATE,
+        ("review-ledger.history.v1", "freeze"): WorkflowEffect.CREATE,
+        ("review-ledger.history.v1", "start_attempt"): WorkflowEffect.CREATE,
+        ("review-ledger.history.v1", "record_result"): WorkflowEffect.UPDATE,
+        ("review-ledger.history.v1", "status"): WorkflowEffect.READ,
+        ("review-ledger.history.v1", "finalize"): WorkflowEffect.READ,
     }
 )
 _REGISTERED_OPERATION_AUTHORITIES: Mapping[
@@ -228,6 +247,21 @@ _REGISTERED_OPERATION_AUTHORITIES: Mapping[
         ),
         ("lifelog.diet-intake.v1", "diet_intake_record"): frozenset(
             {AuthorityMode.FOREGROUND_CURRENT_TURN}
+        ),
+        ("review-ledger.history.v1", "freeze"): frozenset(
+            {AuthorityMode.MAIN_CONTROLLER}
+        ),
+        ("review-ledger.history.v1", "start_attempt"): frozenset(
+            {AuthorityMode.MAIN_CONTROLLER}
+        ),
+        ("review-ledger.history.v1", "record_result"): frozenset(
+            {AuthorityMode.MAIN_CONTROLLER}
+        ),
+        ("review-ledger.history.v1", "status"): frozenset(
+            {AuthorityMode.MAIN_CONTROLLER}
+        ),
+        ("review-ledger.history.v1", "finalize"): frozenset(
+            {AuthorityMode.MAIN_CONTROLLER}
         ),
     }
 )

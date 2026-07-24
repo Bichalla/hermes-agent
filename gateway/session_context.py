@@ -98,6 +98,12 @@ _SESSION_MESSAGE_ID: ContextVar = ContextVar("HERMES_SESSION_MESSAGE_ID", defaul
 _TRUSTED_CURRENT_USER_TEXT: ContextVar[str | None] = ContextVar(
     "trusted_current_user_text", default=None
 )
+# Host-owned execution role. It is deliberately not in _VAR_MAP and has no
+# environment fallback, so model input and subprocess environment cannot mint
+# main-controller authority.
+_SESSION_CONTROLLER_ROLE: ContextVar[str] = ContextVar(
+    "session_controller_role", default=""
+)
 
 _SESSION_PROFILE: ContextVar = ContextVar("HERMES_SESSION_PROFILE", default=_UNSET)
 
@@ -178,6 +184,7 @@ def set_session_vars(
     async_delivery: bool = True,
     ui_session_id: str = "",
     user_text: str | None = None,
+    controller_role: str = "",
 ) -> list:
     """Set all session context variables and return reset tokens.
 
@@ -216,6 +223,7 @@ def set_session_vars(
         _TRUSTED_CURRENT_USER_TEXT.set(
             user_text if isinstance(user_text, str) else None
         ),
+        _SESSION_CONTROLLER_ROLE.set(controller_role),
     ]
     try:
         from agent.runtime_cwd import set_session_cwd
@@ -253,12 +261,12 @@ def clear_session_vars(tokens: list) -> None:
     ):
         var.set("")
     _TRUSTED_CURRENT_USER_TEXT.set(None)
+    _SESSION_CONTROLLER_ROLE.set("")
     # Reset async-delivery capability to the "never set" sentinel rather than a
     # falsy value: a cleared context should fall back to the default-supported
     # behavior (CLI / unaware paths), not be mistaken for an opted-out
     # stateless adapter.
     _SESSION_ASYNC_DELIVERY.set(_UNSET)
-    _TRUSTED_CURRENT_USER_TEXT.set(None)
     try:
         from agent.runtime_cwd import clear_session_cwd
 
@@ -308,6 +316,7 @@ def reset_session_vars() -> None:
     # which resets this var on the handler-exit path for the symmetric concern.
     _SESSION_ASYNC_DELIVERY.set(_UNSET)
     _TRUSTED_CURRENT_USER_TEXT.set(None)
+    _SESSION_CONTROLLER_ROLE.set("")
     try:
         from agent.runtime_cwd import clear_session_cwd
 
@@ -323,6 +332,11 @@ def get_trusted_current_user_text() -> str | None:
     string is a bound empty event and must not fall back to rendered prompt text.
     """
     return _TRUSTED_CURRENT_USER_TEXT.get()
+
+
+def get_session_controller_role() -> str:
+    """Return the host-bound controller role with no environment fallback."""
+    return _SESSION_CONTROLLER_ROLE.get()
 
 
 def get_session_env(name: str, default: str = "") -> str:

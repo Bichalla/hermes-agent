@@ -8,6 +8,7 @@ arbitrary toolsets.
 
 from types import SimpleNamespace
 
+from toolsets import TOOLSETS
 from tools.delegate_tool import _strip_blocked_tools, _emit_parent_console
 
 
@@ -53,6 +54,26 @@ class TestToolsetIntersection:
         assert "clarify" not in child
         assert "memory" not in child
         assert "terminal" in child
+
+    def test_strip_blocked_removes_review_ledger_controller(self):
+        child = _strip_blocked_tools(
+            ["terminal", "review-ledger-controller"]
+        )
+        assert child == ["terminal"]
+
+    def test_alias_and_mixed_composite_cannot_expose_review_ledger(self):
+        assert _strip_blocked_tools(["terminal", "all", "*"]) == ["terminal"]
+        TOOLSETS["mixed-review-ledger-test"] = {
+            "description": "test-only mixed composite",
+            "tools": ["terminal", "registered_review_ledger"],
+            "includes": [],
+        }
+        try:
+            assert _strip_blocked_tools(
+                ["terminal", "mixed-review-ledger-test"]
+            ) == ["terminal"]
+        finally:
+            TOOLSETS.pop("mixed-review-ledger-test", None)
 
     def test_empty_intersection_yields_empty_toolsets(self):
         """If parent has no overlap with requested, child gets nothing extra."""

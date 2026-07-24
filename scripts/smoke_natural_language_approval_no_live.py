@@ -339,9 +339,18 @@ def _probe_kanban_tools() -> dict[str, Any]:
         clear_current_turn_user_authority,
         fingerprint_user_action,
         fingerprint_workflow_target,
+        infer_blocked_create_generated_title,
+        infer_explicit_blocked_create_targets,
+        infer_explicit_workflow_scope,
         reset_current_turn_user_authority,
     )
 
+    natural_create_request = (
+        "Phase 2 운영 blocker 카드를 active board에 default blocked로 지금 생성"
+    )
+    create_classes, create_targets = infer_explicit_workflow_scope(
+        natural_create_request
+    )
     authority = CurrentTurnUserAuthority(
         turn_id="opaque-no-live-turn",
         source_role="user",
@@ -349,12 +358,19 @@ def _probe_kanban_tools() -> dict[str, Any]:
         platform_scope="synthetic",
         user_message_index=0,
         user_action_fingerprint=fingerprint_user_action(
-            "create one blocked synthetic approval card"
+            natural_create_request
         ),
         source_event_fingerprint=fingerprint_user_action(
             "source-event:no-live-blocked-create"
         ),
-        allowed_action_classes=frozenset({"explicit_blocked_card_create"}),
+        allowed_action_classes=create_classes,
+        target_fingerprints=create_targets,
+        blocked_create_target_fingerprints=(
+            infer_explicit_blocked_create_targets(natural_create_request)
+        ),
+        blocked_create_generated_title=infer_blocked_create_generated_title(
+            natural_create_request
+        ),
     )
     session_tokens = set_session_vars(
         platform=authority.platform_scope,
@@ -446,6 +462,10 @@ def _probe_kanban_tools() -> dict[str, Any]:
     create_evidence = first["decision_evidence"]
     comment_evidence = comment["decision_evidence"]
     return {
+        "natural_blocked_create_inferred": (
+            authority.allows("explicit_blocked_card_create")
+            and bool(authority.blocked_create_generated_title)
+        ),
         "blocked_create_idempotent": first["task_id"] == retry["task_id"] and count == 1,
         "blocked_key_present": bool(
             stored

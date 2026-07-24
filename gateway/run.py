@@ -11366,7 +11366,10 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         context = build_session_context(source, self.config, session_entry)
 
         # Set session context variables for tools (task-local, concurrency-safe)
-        _session_env_tokens = self._set_session_env(context)
+        _session_env_tokens = self._set_session_env(
+            context,
+            user_text=event.text if isinstance(event.text, str) else "",
+        )
 
         # Read privacy.redact_pii from config (re-read per message)
         _redact_pii = False
@@ -15530,7 +15533,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
 
         return delivered
 
-    def _set_session_env(self, context: SessionContext) -> list:
+    def _set_session_env(
+        self, context: SessionContext, *, user_text: str | None = None
+    ) -> list:
         """Set session context variables for the current async task.
 
         Uses ``contextvars`` instead of ``os.environ`` so that concurrent
@@ -15562,6 +15567,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             message_id=str(context.source.message_id) if context.source.message_id else "",
             profile=getattr(context.source, "profile", "") or "",
             async_delivery=_async_delivery,
+            user_text=user_text,
         )
 
     def _clear_session_env(self, tokens: list) -> None:
@@ -19364,6 +19370,11 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     return f"[user did not respond within {int(timeout / 60)}m]"
                 return response
 
+            setattr(
+                _clarify_callback_sync,
+                "_hermes_trusted_user_response",
+                True,
+            )
             agent.clarify_callback = _clarify_callback_sync
 
             # Show assistant thinking between tool calls — independent of

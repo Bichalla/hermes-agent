@@ -53,6 +53,16 @@ def _flatten_choice(c) -> str:
     return str(c).strip()
 
 
+def _callback_returns_trusted_user_response(callback: Callable) -> bool:
+    """True only for a host callback explicitly marked as genuine user UI."""
+    if bool(getattr(callback, "_hermes_trusted_user_response", False)):
+        return True
+    bound_function = getattr(callback, "__func__", None)
+    return bool(
+        getattr(bound_function, "_hermes_trusted_user_response", False)
+    )
+
+
 def clarify_tool(
     question: str,
     choices: Optional[List[str]] = None,
@@ -106,10 +116,25 @@ def clarify_tool(
             ensure_ascii=False,
         )
 
+    normalized_response = str(user_response).strip()
+    if normalized_response and _callback_returns_trusted_user_response(callback):
+        try:
+            from tools.workflow_authority import (
+                extend_current_turn_user_authority_from_interactive_response,
+            )
+
+            extend_current_turn_user_authority_from_interactive_response(
+                normalized_response
+            )
+        except Exception:
+            # Clarify remains usable even if no active workflow-authority turn
+            # exists or a host integration is partially upgraded.
+            pass
+
     return json.dumps({
         "question": question,
         "choices_offered": choices,
-        "user_response": str(user_response).strip(),
+        "user_response": normalized_response,
     }, ensure_ascii=False)
 
 

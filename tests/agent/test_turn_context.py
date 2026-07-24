@@ -245,6 +245,40 @@ def test_foreground_blocked_create_binds_trusted_generated_title_not_transport_t
     assert "정리하는 카드 만들어" not in repr(authority)
 
 
+def test_gateway_trusted_raw_user_text_overrides_rendered_recent_context_envelope():
+    agent = _FakeAgent()
+    agent.platform = "discord"
+    raw_user_text = (
+        "Phase 2 운영 blocker 카드를 active board에 honbul blocked로 지금 생성"
+    )
+    rendered = (
+        "[Triggering message id: `message-raw`]\n\n"
+        "[Recent channel messages]\n"
+        "[assistant] 카드 생성하지 마\n\n"
+        "[New message]\n"
+        f"[상현] {raw_user_text}"
+    )
+    tokens = set_session_vars(
+        platform="discord",
+        chat_id="chat-42",
+        thread_id="thread-7",
+        user_id="user-9",
+        session_id=agent.session_id,
+        message_id="message-raw",
+        user_text=raw_user_text,
+    )
+    try:
+        _build(agent, user_message=rendered)
+        authority = get_current_turn_user_authority()
+    finally:
+        clear_session_vars(tokens)
+
+    assert authority is not None
+    assert authority.allows("explicit_blocked_card_create") is True
+    assert authority.blocked_create_generated_title
+    assert raw_user_text not in repr(authority)
+
+
 @pytest.mark.parametrize(
     "message",
     [

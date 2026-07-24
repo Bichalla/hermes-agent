@@ -14,7 +14,7 @@ import secrets
 import threading
 import unicodedata
 from contextvars import ContextVar, Token
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 
 _FINGERPRINT_RE = re.compile(r"^[a-f0-9]{64}$")
 _TASK_ID_RE = re.compile(r"(?<![a-z0-9])t_[a-z0-9]{6,64}(?![a-z0-9])", re.IGNORECASE)
@@ -66,6 +66,11 @@ _NEGATION_TOKENS = (
     "삭제하지",
     "복원하지",
     "기록하지",
+    "만들지",
+    "생성하지",
+    "추가하지",
+    "등록하지",
+    "남기지",
     " 안 ",
     "안 했",
     "안 해",
@@ -91,6 +96,13 @@ _REPORTED_SPEECH_TOKENS = (
     "라고 설명",
     "라며 말",
     "라며 요청",
+    "고 말했다",
+    "달라고 했",
+    "달라 했",
+    "달랬",
+    "보고했다",
+    "was reported",
+    " saying ",
 )
 
 
@@ -295,12 +307,40 @@ def _is_affirmative_command(normalized: str) -> bool:
 
 
 def _is_direct_blocked_create_command(normalized: str) -> bool:
-    """Recognize a create imperative whose verb belongs to the card clause."""
+    """Recognize broad natural card-create intent in one affirmative clause."""
+    reported_speech = any(
+        token in normalized for token in _REPORTED_SPEECH_TOKENS
+    )
+    reaffirmed_execution = (
+        any(token in normalized for token in ("했잖아", "말했잖아", "요청했잖아"))
+        and any(
+            token in normalized
+            for token in (
+                "지금 만들어",
+                "지금 생성",
+                "이어서 해",
+                "이어서 진행",
+                "그대로 해",
+                "계속해",
+            )
+        )
+    )
     if (
         not normalized
         or _has_negation(normalized)
-        or any(token in normalized for token in _NON_COMMAND_TOKENS)
-        or any(token in normalized for token in _REPORTED_SPEECH_TOKENS)
+        or any(token in normalized for token in _NON_COMMAND_TOKENS if token != "?")
+        or (reported_speech and not reaffirmed_execution)
+    ):
+        return False
+    if "?" in normalized and not (
+        re.match(
+            r"^(?:please\s+)?(?:(?:can|could|would|will)\s+you\s+)",
+            normalized,
+        )
+        or re.search(
+            r"(?:해줘|해주세요|만들어줘|생성해줘|추가해줘|등록해줘|줄래)\?$",
+            normalized,
+        )
     ):
         return False
     clauses = tuple(
@@ -308,22 +348,56 @@ def _is_direct_blocked_create_command(normalized: str) -> bool:
         for clause in re.split(r"[.!?。！？\n]+", normalized)
         if clause.strip()
     )
-    english_card_object = re.compile(
-        r"^(?:please\s+)?(?:create|make|add)\s+"
-        r"(?:(?:a|an|the|one|new|blocked|kanban)\s+)*card"
-        r"(?:\s+(?:called|titled)\s+(?:\"[^\"]{1,200}\"|'[^']{1,200}'|“[^”]{1,200}”|‘[^’]{1,200}’))?"
-        r"(?:\s+please)?$"
+    english_card_intent = re.compile(
+        r"^(?:please\s+)?"
+        r"(?:(?:can|could|would|will)\s+you\s+)?"
+        r"(?:create|make|add|open|record)\b.*\b"
+        r"(?:(?:kanban|tracking|blocked|new)\s+)*card\b"
     )
-    korean_card_object = re.compile(
-        r"카드(?:를|은|는|도|로)?"
-        r"(?:\s+(?:하나(?:만)?|한\s*장|1\s*장|새로|다시|바로|좀|먼저))*\s+"
-        r"(?:만들어|만들어라|만들어줘|만들어주세요|생성해|생성해라|생성해줘|생성해주세요)$"
+    english_convert_intent = re.compile(
+        r"^(?:please\s+)?(?:(?:can|could|would|will)\s+you\s+)?"
+        r"(?:turn|convert)\b.*\binto\b.*\bcard\b"
+    )
+    korean_card = re.compile(r"(?:칸반\s*)?카드(?:를|은|는|도|로|에)?")
+    korean_create_verb = re.compile(
+        r"(?:만들(?:어|어라|어줘|어주세요|자|기|다)?|"
+        r"생성(?:해|해라|해줘|해주세요|하자|하기)?|"
+        r"추가(?:해|해줘|해주세요|하자|하기)?|"
+        r"등록(?:해|해줘|해주세요|하자|하기)?|"
+        r"남겨|남겨줘|남겨주세요|올려|올려줘|열어|열어줘|파줘|파라)"
+    )
+    korean_past_report = re.compile(
+        r"(?:만들었|생성했|추가했|등록했|남겼|올렸|열었|팠)"
+    )
+    korean_meta_ending = re.compile(
+        r"(?:구현|인식|파싱|알아듣)(?:해|해줘|해주세요|하라고|하게|하도록)?$"
+    )
+    korean_conditional = re.compile(
+        r"(?:만들|생성|추가|등록|남기|올리|열)면\b"
+    )
+    nested_korean_object = re.compile(
+        r"(?:댓글|코멘트|문서|메시지|텍스트|기록|내용)(?:을|를|은|는)"
+    )
+    nested_english_object = re.compile(
+        r"\b(?:comment|note|message|text|readback|result|report)\b"
     )
     for clause in clauses:
-        if english_card_object.fullmatch(clause):
+        english_match = english_card_intent.search(clause) or english_convert_intent.search(
+            clause
+        )
+        if english_match and not nested_english_object.search(clause[: english_match.end()]):
             return True
-        if korean_card_object.search(clause):
-            return True
+        card_match = korean_card.search(clause)
+        if card_match and not (
+            korean_past_report.search(clause)
+            or korean_meta_ending.search(clause)
+            or korean_conditional.search(clause)
+        ):
+            create_match = korean_create_verb.search(clause, card_match.end())
+            if create_match and not nested_korean_object.search(
+                clause[card_match.end() : create_match.start()]
+            ):
+                return True
     return False
 
 
@@ -569,6 +643,56 @@ def reset_current_turn_user_authority(
 
 def get_current_turn_user_authority() -> CurrentTurnUserAuthority | None:
     return _current_turn_user_authority.get()
+
+
+def extend_current_turn_user_authority_from_interactive_response(
+    user_response: str,
+) -> CurrentTurnUserAuthority | None:
+    """Merge a genuine interactive user response into the active turn grant.
+
+    The caller must independently authenticate the callback as a real user UI.
+    No raw response is retained: only closed grants, title output, and a digest
+    become part of the authority object.
+    """
+    if not isinstance(user_response, str) or not user_response.strip():
+        return get_current_turn_user_authority()
+    current = get_current_turn_user_authority()
+    if current is None or not matches_active_workflow_turn(current):
+        return current
+
+    classes, targets = infer_explicit_workflow_scope(user_response)
+    grants = infer_explicit_workflow_grants(user_response)
+    operations = infer_explicit_workflow_operations(user_response)
+    create_targets = infer_explicit_blocked_create_targets(user_response)
+    generated_title = infer_blocked_create_generated_title(user_response)
+    if not (classes or targets or grants or operations or create_targets or generated_title):
+        return current
+
+    updated = replace(
+        current,
+        user_action_fingerprint=fingerprint_user_action(
+            "interactive-response/v1\n"
+            + current.user_action_fingerprint
+            + "\n"
+            + user_response
+        ),
+        allowed_action_classes=current.allowed_action_classes | classes,
+        allowed_operations=current.allowed_operations | operations,
+        operation_target_grants=current.operation_target_grants | grants,
+        target_fingerprints=current.target_fingerprints | targets,
+        blocked_create_target_fingerprints=(
+            current.blocked_create_target_fingerprints | create_targets
+        ),
+        blocked_create_generated_title=(
+            generated_title or current.blocked_create_generated_title
+        ),
+        coarse_estimate_authorized=(
+            current.coarse_estimate_authorized
+            or infer_coarse_estimate_authority(user_response)
+        ),
+    )
+    bind_current_turn_user_authority(updated)
+    return updated
 
 
 def bind_active_workflow_turn(turn_id: str, platform: str, session_id: str) -> None:

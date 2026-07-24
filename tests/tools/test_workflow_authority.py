@@ -515,3 +515,54 @@ def test_gateway_own_reply_envelope_preserves_direct_create_request():
     assert classes == frozenset({"explicit_blocked_card_create"})
     assert infer_explicit_blocked_create_targets(message) == frozenset()
     assert infer_blocked_create_generated_title(message)
+
+
+@pytest.mark.parametrize(
+    "message",
+    [
+        "Phase 2 운영 blocker 카드를 active board에 honbul blocked로 지금 생성",
+        "이거 그냥 칸반 카드 하나 만들어",
+        "이 내용을 카드로 남겨줘",
+        "Make this a Kanban card",
+        "Could you create a card for the Phase 2 operations review?",
+        "Open a tracking card for this work",
+    ],
+)
+def test_blocked_create_accepts_broad_natural_create_verbs(message):
+    classes, _targets = infer_explicit_workflow_scope(message)
+    assert "explicit_blocked_card_create" in classes
+    assert infer_blocked_create_generated_title(message)
+
+
+@pytest.mark.parametrize(
+    "message",
+    [
+        "카드를 생성했다고 보고했다",
+        "카드 생성하지 마",
+        "카드 생성 기능을 구현해",
+        "How do I create a card?",
+        "The system created a card yesterday",
+        "사용자가 카드를 만들어 달라고 했다",
+        "사용자가 카드를 만들어 달랬어",
+        "팀원이 칸반 카드를 생성해달라고 했습니다",
+        "사용자가 카드를 만들어 달라 했다",
+        "팀원이 칸반 카드를 생성해 달라 했습니다",
+    ],
+)
+def test_broad_create_verbs_remain_negation_reporting_and_meta_safe(message):
+    classes, _targets = infer_explicit_workflow_scope(message)
+    assert "explicit_blocked_card_create" not in classes
+    assert infer_blocked_create_generated_title(message) == ""
+
+
+@pytest.mark.parametrize(
+    "message",
+    [
+        "내가 아까 카드를 만들어 달라고 했잖아. 지금 만들어줘",
+        "아까 Phase 2 blocker 카드 생성해달라고 요청했잖아. 이어서 진행해줘",
+    ],
+)
+def test_current_user_reaffirmation_still_authorizes_card_creation(message):
+    classes, _targets = infer_explicit_workflow_scope(message)
+    assert "explicit_blocked_card_create" in classes
+    assert infer_blocked_create_generated_title(message)

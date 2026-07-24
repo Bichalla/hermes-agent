@@ -7,6 +7,7 @@ from gateway.config import Platform
 from gateway.run import GatewayRunner
 from gateway.session import SessionContext, SessionSource
 from gateway.session_context import (
+    get_trusted_current_user_text,
     get_session_env,
     set_session_vars,
     clear_session_vars,
@@ -167,6 +168,40 @@ def test_set_session_env_handles_missing_optional_fields():
     assert get_session_env("HERMES_SESSION_THREAD_ID") == ""
 
     runner._clear_session_env(tokens)
+
+
+def test_trusted_current_user_text_is_private_task_local_context(monkeypatch):
+    monkeypatch.delenv("HERMES_TRUSTED_CURRENT_USER_TEXT", raising=False)
+    assert get_trusted_current_user_text() is None
+
+    tokens = set_session_vars(user_text="카드 하나 만들어")
+    try:
+        assert get_trusted_current_user_text() == "카드 하나 만들어"
+        assert "HERMES_TRUSTED_CURRENT_USER_TEXT" not in os.environ
+        assert "HERMES_TRUSTED_CURRENT_USER_TEXT" not in _VAR_MAP
+    finally:
+        clear_session_vars(tokens)
+
+    assert get_trusted_current_user_text() is None
+
+
+def test_gateway_set_session_env_binds_raw_user_text_privately():
+    runner = object.__new__(GatewayRunner)
+    source = SessionSource(
+        platform=Platform.DISCORD,
+        chat_id="channel-1",
+        chat_type="group",
+        user_id="user-1",
+    )
+    context = SessionContext(source=source, connected_platforms=[], home_channels={})
+
+    tokens = runner._set_session_env(context, user_text="make this a card")
+    try:
+        assert get_trusted_current_user_text() == "make this a card"
+    finally:
+        runner._clear_session_env(tokens)
+
+    assert get_trusted_current_user_text() is None
 
 
 # ---------------------------------------------------------------------------

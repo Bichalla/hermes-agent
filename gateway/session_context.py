@@ -91,6 +91,14 @@ _SESSION_UI_SESSION_ID: ContextVar = ContextVar("HERMES_UI_SESSION_ID", default=
 # private-chat topic (those lanes route only with thread id + reply anchor).
 _SESSION_MESSAGE_ID: ContextVar = ContextVar("HERMES_SESSION_MESSAGE_ID", default=_UNSET)
 
+# Raw text from the accepted current foreground user event. This remains private
+# to the in-process task context: it is not in _VAR_MAP, has no environment
+# fallback, and is never propagated to subprocesses. Workflow authority uses it
+# instead of reverse-parsing rendered reply/history envelopes.
+_TRUSTED_CURRENT_USER_TEXT: ContextVar[str | None] = ContextVar(
+    "trusted_current_user_text", default=None
+)
+
 _SESSION_PROFILE: ContextVar = ContextVar("HERMES_SESSION_PROFILE", default=_UNSET)
 
 # Whether the current session's delivery channel can route an ASYNC completion
@@ -169,6 +177,7 @@ def set_session_vars(
     cwd: str = "",
     async_delivery: bool = True,
     ui_session_id: str = "",
+    user_text: str | None = None,
 ) -> list:
     """Set all session context variables and return reset tokens.
 
@@ -204,6 +213,9 @@ def set_session_vars(
         _SESSION_MESSAGE_ID.set(message_id),
         _SESSION_PROFILE.set(profile),
         _SESSION_ASYNC_DELIVERY.set(bool(async_delivery)),
+        _TRUSTED_CURRENT_USER_TEXT.set(
+            user_text if isinstance(user_text, str) else None
+        ),
     ]
     try:
         from agent.runtime_cwd import set_session_cwd
@@ -240,11 +252,13 @@ def clear_session_vars(tokens: list) -> None:
         _SESSION_PROFILE,
     ):
         var.set("")
+    _TRUSTED_CURRENT_USER_TEXT.set(None)
     # Reset async-delivery capability to the "never set" sentinel rather than a
     # falsy value: a cleared context should fall back to the default-supported
     # behavior (CLI / unaware paths), not be mistaken for an opted-out
     # stateless adapter.
     _SESSION_ASYNC_DELIVERY.set(_UNSET)
+    _TRUSTED_CURRENT_USER_TEXT.set(None)
     try:
         from agent.runtime_cwd import clear_session_cwd
 
@@ -293,12 +307,22 @@ def reset_session_vars() -> None:
     # same inheritance-leak reason as the mapped vars above — see clear_session_vars,
     # which resets this var on the handler-exit path for the symmetric concern.
     _SESSION_ASYNC_DELIVERY.set(_UNSET)
+    _TRUSTED_CURRENT_USER_TEXT.set(None)
     try:
         from agent.runtime_cwd import clear_session_cwd
 
         clear_session_cwd()
     except Exception:
         pass
+
+
+def get_trusted_current_user_text() -> str | None:
+    """Return the raw accepted foreground-user event text for this task.
+
+    ``None`` means the ingress did not bind a trusted raw text source. An empty
+    string is a bound empty event and must not fall back to rendered prompt text.
+    """
+    return _TRUSTED_CURRENT_USER_TEXT.get()
 
 
 def get_session_env(name: str, default: str = "") -> str:

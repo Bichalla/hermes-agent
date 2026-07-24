@@ -156,6 +156,75 @@ class TestClarifyToolCallbackHandling:
         result = json.loads(clarify_tool("Q?", callback=mock_callback))
         assert result["user_response"] == "response with spaces"
 
+    def test_trusted_interactive_response_extends_active_card_authority(self):
+        from tools.workflow_authority import (
+            CurrentTurnUserAuthority,
+            bind_active_workflow_turn,
+            bind_current_turn_user_authority,
+            clear_current_turn_user_authority,
+            fingerprint_user_action,
+            get_current_turn_user_authority,
+        )
+
+        authority = CurrentTurnUserAuthority(
+            turn_id="clarify-turn",
+            source_role="user",
+            session_scope="session-1",
+            platform_scope="discord",
+            user_message_index=0,
+            user_action_fingerprint=fingerprint_user_action("continue"),
+        )
+        bind_active_workflow_turn(
+            authority.turn_id, authority.platform_scope, authority.session_scope
+        )
+        bind_current_turn_user_authority(authority)
+
+        def trusted_callback(_question, _choices):
+            return "Phase 2 blocker 카드를 active board에 지금 생성"
+
+        setattr(trusted_callback, "_hermes_trusted_user_response", True)
+        try:
+            clarify_tool("진행할까요?", callback=trusted_callback)
+            updated = get_current_turn_user_authority()
+            assert updated is not None
+            assert updated.allows("explicit_blocked_card_create") is True
+            assert updated.blocked_create_generated_title
+        finally:
+            clear_current_turn_user_authority()
+
+    def test_untrusted_synthetic_clarify_callback_cannot_extend_authority(self):
+        from tools.workflow_authority import (
+            CurrentTurnUserAuthority,
+            bind_active_workflow_turn,
+            bind_current_turn_user_authority,
+            clear_current_turn_user_authority,
+            fingerprint_user_action,
+            get_current_turn_user_authority,
+        )
+
+        authority = CurrentTurnUserAuthority(
+            turn_id="synthetic-clarify-turn",
+            source_role="user",
+            session_scope="session-1",
+            platform_scope="oneshot",
+            user_message_index=0,
+            user_action_fingerprint=fingerprint_user_action("continue"),
+        )
+        bind_active_workflow_turn(
+            authority.turn_id, authority.platform_scope, authority.session_scope
+        )
+        bind_current_turn_user_authority(authority)
+        try:
+            clarify_tool(
+                "진행할까요?",
+                callback=lambda _q, _c: "Phase 2 blocker 카드를 지금 생성",
+            )
+            updated = get_current_turn_user_authority()
+            assert updated is not None
+            assert updated.allows("explicit_blocked_card_create") is False
+        finally:
+            clear_current_turn_user_authority()
+
 
 class TestCheckClarifyRequirements:
     """Tests for the requirements check function."""

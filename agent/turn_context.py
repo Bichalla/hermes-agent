@@ -394,8 +394,17 @@ def build_turn_context(
             pass
 
     if _accepts_current_user_authority(agent):
-        from gateway.session_context import get_session_env
+        from gateway.session_context import (
+            get_session_env,
+            get_trusted_current_user_text,
+        )
 
+        trusted_user_text = get_trusted_current_user_text()
+        authority_user_message = (
+            trusted_user_text
+            if trusted_user_text is not None
+            else original_user_message
+        )
         message_id = get_session_env("HERMES_SESSION_MESSAGE_ID", "").strip()
         source_event_fingerprint = ""
         if message_id:
@@ -412,10 +421,10 @@ def build_turn_context(
                 )
             )
         allowed_action_classes, target_fingerprints = infer_explicit_workflow_scope(
-            original_user_message
+            authority_user_message
         )
         operation_target_grants = infer_explicit_workflow_grants(
-            original_user_message
+            authority_user_message
         )
         authority = CurrentTurnUserAuthority(
             turn_id=turn_id,
@@ -424,23 +433,23 @@ def build_turn_context(
             platform_scope=str(getattr(agent, "platform", "") or "unknown"),
             user_message_index=current_turn_user_idx,
             user_action_fingerprint=fingerprint_user_action(
-                original_user_message
+                authority_user_message or "empty-current-user-event"
             ),
             source_event_fingerprint=source_event_fingerprint,
             allowed_action_classes=allowed_action_classes,
             allowed_operations=infer_explicit_workflow_operations(
-                original_user_message
+                authority_user_message
             ),
             operation_target_grants=operation_target_grants,
             target_fingerprints=target_fingerprints,
             blocked_create_target_fingerprints=(
-                infer_explicit_blocked_create_targets(original_user_message)
+                infer_explicit_blocked_create_targets(authority_user_message)
             ),
             blocked_create_generated_title=infer_blocked_create_generated_title(
-                original_user_message
+                authority_user_message
             ),
             coarse_estimate_authorized=infer_coarse_estimate_authority(
-                original_user_message
+                authority_user_message
             ),
         )
         bind_current_turn_user_authority(authority)

@@ -255,6 +255,7 @@ def test_non_commands_and_multi_target_text_mint_no_grants(message):
         "오늘 아침 고단백 두유 / 바이오 그릭 요거트 / 첵스 컵 40g",
         "고단백 두유 2팩 먹었고 맛밤도 1개 먹음",
         "Record my lunch intake",
+        "이게 첵스 영양표니까 편의점 간식으로 등록하고 오늘 아침에 먹은것도 기록도 해줘",
     ],
 )
 def test_confirmed_diet_text_mints_exact_self_diet_grant(message):

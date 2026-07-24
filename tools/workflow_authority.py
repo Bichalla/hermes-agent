@@ -476,8 +476,9 @@ def _is_confirmed_diet_intake(normalized: str) -> bool:
     )
     if named_other and not explicit_self:
         return False
-    explicit_record = any(
-        token in normalized for token in ("기록해", "기록해줘", "record")
+    explicit_record = (
+        re.search(r"기록(?:도)?\s*해(?:줘|주세요)?", normalized) is not None
+        or "record" in normalized
     ) and any(
         token in normalized
         for token in (

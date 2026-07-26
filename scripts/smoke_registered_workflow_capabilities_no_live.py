@@ -290,6 +290,7 @@ def run_temp_smoke() -> dict[str, Any]:
         finally:
             host_lib.shm_unlink(denied_shm_name.encode())
         agent_tests = [
+            "tests/test_model_tools_schema_cache_isolation.py",
             "tests/tools/test_registered_workflow_capability_policy.py",
             "tests/tools/test_workflow_authority.py",
             "tests/tools/test_registered_local_workflow.py",
@@ -299,6 +300,12 @@ def run_temp_smoke() -> dict[str, Any]:
             "tests/hermes_cli/test_kanban_capability_migrate.py",
             "tests/hermes_cli/test_kanban_intake_migrate.py",
             "tests/integration/test_review_ledger_registered_capability.py",
+            # These tests intentionally require canonical Lifelog fixtures or
+            # launching /bin/sh. They are covered by the focused host suite and
+            # cannot run inside this copied-source default-deny sandbox.
+            "--deselect=tests/tools/test_registered_local_workflow.py::test_diet_owner_real_dispatcher_writes_temp_db_and_replays",
+            "--deselect=tests/tools/test_registered_local_workflow.py::test_childcare_owner_real_dispatcher_writes_temp_db_and_replays",
+            "--deselect=tests/tools/test_terminal_tool.py::test_shell_obfuscated_reserved_authority_cannot_create_blocked_card",
         ]
         agent_result = _run(
             [

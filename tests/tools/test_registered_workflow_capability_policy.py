@@ -19,9 +19,13 @@ from agent.workflow_action_policy import (
 def test_initial_catalog_is_closed_and_versioned():
     catalog = registered_capability_catalog()
     assert set(catalog) == {
+        "company-work-os.initial-seed-preview.v1",
+        "company-work-os.initial-seed-record.v1",
         "kanban.status-memory.v1",
         "kanban-intake.pending-soft-delete.v1",
+        "lifelog.childcare-event.v1",
         "lifelog.diet-intake.v1",
+        "lifelog.semantic-debug-issue.v1",
         "review-ledger.history.v1",
     }
     assert catalog["kanban-intake.pending-soft-delete.v1"].effects == frozenset(
@@ -31,6 +35,111 @@ def test_initial_catalog_is_closed_and_versioned():
         validate_registered_capability(capability)
         assert "/" not in capability.adapter_id
         assert ".py" not in capability.adapter_id
+
+
+def test_company_work_os_capabilities_match_the_frozen_contracts_exactly():
+    catalog = registered_capability_catalog()
+    assert catalog["company-work-os.initial-seed-preview.v1"] == RegisteredCapability(
+        capability_id="company-work-os.initial-seed-preview.v1",
+        effects=frozenset({WorkflowEffect.READ}),
+        authority_modes=frozenset(
+            {
+                AuthorityMode.LOCAL_READ_BOUNDARY,
+                AuthorityMode.FOREGROUND_CURRENT_TURN,
+            }
+        ),
+        adapter_id="company-work-os-initial-seed",
+        input_schema_id="company-work-os-initial-seed-preview/v1",
+        result_schema_id="company-work-os-initial-seed-preview-result/v1",
+        idempotency=IdempotencyMode.READ_ONLY,
+        readback_required=True,
+        soft_delete_restore_required=False,
+    )
+    assert catalog["company-work-os.initial-seed-record.v1"] == RegisteredCapability(
+        capability_id="company-work-os.initial-seed-record.v1",
+        effects=frozenset({WorkflowEffect.CREATE}),
+        authority_modes=frozenset({AuthorityMode.FOREGROUND_CURRENT_TURN}),
+        adapter_id="company-work-os-initial-seed",
+        input_schema_id="company-work-os-initial-seed-record/v1",
+        result_schema_id="company-work-os-initial-seed-record-result/v1",
+        idempotency=IdempotencyMode.DETERMINISTIC_REPLAY,
+        readback_required=True,
+        soft_delete_restore_required=False,
+    )
+
+
+@pytest.mark.parametrize(
+    "authority_mode",
+    [AuthorityMode.LOCAL_READ_BOUNDARY, AuthorityMode.FOREGROUND_CURRENT_TURN],
+)
+def test_company_work_os_preview_is_read_only_at_the_local_or_foreground_boundary(
+    authority_mode,
+):
+    assert evaluate_registered_capability(
+        "company-work-os.initial-seed-preview.v1",
+        "company_work_os_initial_seed_preview",
+        WorkflowEffect.READ,
+        schema_valid=True,
+        authority_mode=authority_mode,
+        owner_ready=True,
+        target_valid=True,
+    ) is CapabilityDecision.ALLOW
+    assert evaluate_registered_capability(
+        "company-work-os.initial-seed-preview.v1",
+        "company_work_os_initial_seed_preview",
+        WorkflowEffect.READ,
+        schema_valid=True,
+        authority_mode=AuthorityMode.EXISTING_DISPATCHER_WORKER,
+        owner_ready=True,
+        target_valid=True,
+    ) is CapabilityDecision.DENY_AUTHORITY_MISSING
+
+
+def test_company_work_os_record_is_foreground_current_turn_create_only():
+    assert evaluate_registered_capability(
+        "company-work-os.initial-seed-record.v1",
+        "company_work_os_initial_seed_record",
+        WorkflowEffect.CREATE,
+        schema_valid=True,
+        authority_mode=AuthorityMode.FOREGROUND_CURRENT_TURN,
+        owner_ready=True,
+        target_valid=True,
+    ) is CapabilityDecision.ALLOW
+    for denied_mode in (
+        AuthorityMode.LOCAL_READ_BOUNDARY,
+        AuthorityMode.EXISTING_DISPATCHER_WORKER,
+        AuthorityMode.MAIN_CONTROLLER,
+    ):
+        assert evaluate_registered_capability(
+            "company-work-os.initial-seed-record.v1",
+            "company_work_os_initial_seed_record",
+            WorkflowEffect.CREATE,
+            schema_valid=True,
+            authority_mode=denied_mode,
+            owner_ready=True,
+            target_valid=True,
+        ) is CapabilityDecision.DENY_AUTHORITY_MISSING
+
+
+def test_company_work_os_operations_reject_cross_effects_and_unknown_names():
+    assert evaluate_registered_capability(
+        "company-work-os.initial-seed-preview.v1",
+        "company_work_os_initial_seed_preview",
+        WorkflowEffect.CREATE,
+        schema_valid=True,
+        authority_mode=AuthorityMode.FOREGROUND_CURRENT_TURN,
+        owner_ready=True,
+        target_valid=True,
+    ) is CapabilityDecision.DENY_UNREGISTERED_ACTION
+    assert evaluate_registered_capability(
+        "company-work-os.initial-seed-record.v1",
+        "company_work_os_initial_seed_apply",
+        WorkflowEffect.CREATE,
+        schema_valid=True,
+        authority_mode=AuthorityMode.FOREGROUND_CURRENT_TURN,
+        owner_ready=True,
+        target_valid=True,
+    ) is CapabilityDecision.DENY_UNREGISTERED_ACTION
 
 
 @pytest.mark.parametrize(
@@ -88,6 +197,27 @@ def test_diet_intake_registered_operation_is_foreground_create_only():
     assert evaluate_registered_capability(
         "lifelog.diet-intake.v1",
         "diet_intake_record",
+        WorkflowEffect.CREATE,
+        schema_valid=True,
+        authority_mode=AuthorityMode.EXISTING_DISPATCHER_WORKER,
+        owner_ready=True,
+        target_valid=True,
+    ) is CapabilityDecision.DENY_AUTHORITY_MISSING
+
+
+def test_childcare_event_registered_operation_is_foreground_create_only():
+    assert evaluate_registered_capability(
+        "lifelog.childcare-event.v1",
+        "childcare_event_record",
+        WorkflowEffect.CREATE,
+        schema_valid=True,
+        authority_mode=AuthorityMode.FOREGROUND_CURRENT_TURN,
+        owner_ready=True,
+        target_valid=True,
+    ) is CapabilityDecision.ALLOW
+    assert evaluate_registered_capability(
+        "lifelog.childcare-event.v1",
+        "childcare_event_record",
         WorkflowEffect.CREATE,
         schema_valid=True,
         authority_mode=AuthorityMode.EXISTING_DISPATCHER_WORKER,

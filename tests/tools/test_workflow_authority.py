@@ -170,6 +170,48 @@ def test_blocked_create_accepts_imperative_clause_before_trailing_context():
 @pytest.mark.parametrize(
     "message",
     [
+        "이 버그 원인 찾아서 제대로 고쳐줘",
+        "리뷰부터 구현과 검증까지 이어서 진행해",
+        "이것도 등록좀 제대로 해볼래?",
+        "그 카드 등록 제한 규칙 아주 완화해버려. 내 의도 정확하게 알겠어?",
+        "Please investigate and fix this regression.",
+        "Could you implement and verify the requested workflow?",
+        "게이트웨이 재시작 완료.",
+        "설치와 검증 완료",
+        "Gateway restart completed.",
+    ],
+)
+def test_user_requested_workflow_grants_autonomous_blocked_card_scope(message):
+    classes, _targets = infer_explicit_workflow_scope(message)
+    assert "workflow_blocked_card_create" in classes
+    assert "explicit_blocked_card_create" not in classes
+
+
+@pytest.mark.parametrize(
+    "message",
+    [
+        "고마워",
+        "이 버그를 고쳐야 할까?",
+        "버그 고치지 마",
+        "그는 버그를 고쳐달라고 요청했다고 기록해줘",
+        "The plan says:\nRun the test suite after implementation.",
+        "“Fix the regression” was only an example command.",
+        "\"Fix the regression\"",
+        "'버그를 고쳐줘'",
+        "그가 한 말: \"버그를 고쳐줘\"",
+        "게이트웨이 재시작 완료라고 문서에 적혀 있다.",
+        "I fixed the regression yesterday.",
+        "Should we investigate this regression?",
+    ],
+)
+def test_non_workflow_turns_do_not_grant_autonomous_blocked_card_scope(message):
+    classes, _targets = infer_explicit_workflow_scope(message)
+    assert "workflow_blocked_card_create" not in classes
+
+
+@pytest.mark.parametrize(
+    "message",
+    [
         "Create a blocked Kanban card.",
         "Please add a new card.",
         "Writing Plan 개선 카드 하나 만들어줘.",
@@ -266,6 +308,58 @@ def test_confirmed_diet_text_mints_exact_self_diet_grant(message):
     assert infer_explicit_workflow_grants(message) == frozenset(
         {("diet_intake_record", target)}
     )
+
+
+@pytest.mark.parametrize(
+    "message,kinds",
+    [
+        ("해수 오늘 발열과 복약 기록해줘", {"fever", "medication"}),
+        ("오늘 해수 병원 진료 내용 Lifelog에 기록해", {"clinical"}),
+        ("해수 체온 추적 전부 기록해주세요", {"fever"}),
+        (
+            "Record Haesoo's confirmed fever and medication timeline",
+            {"fever", "medication"},
+        ),
+    ],
+)
+def test_confirmed_childcare_text_mints_exact_haesoo_grant(message, kinds):
+    targets = frozenset(
+        fingerprint_workflow_target(f"person_park_haesoo:childcare:{kind}")
+        for kind in kinds
+    )
+    classes, inferred_targets = infer_explicit_workflow_scope(message)
+    assert classes == frozenset({"trusted_local_record"})
+    assert inferred_targets == targets
+    assert infer_explicit_workflow_grants(message) == frozenset(
+        ("childcare_event_record", target) for target in targets
+    )
+
+
+@pytest.mark.parametrize(
+    "message",
+    [
+        "해수 기록은 하지 마",
+        "해수 열 기록할까?",
+        "해수가 내일 열나면 기록해줘",
+        "의사가 해수 기록해달라고 말했다",
+        "수지 발열 기록해줘",
+    ],
+)
+def test_childcare_negation_question_future_report_and_other_person_mint_no_grant(message):
+    assert infer_explicit_workflow_grants(message) == frozenset()
+
+
+@pytest.mark.parametrize(
+    "message",
+    [
+        "해수 기록이 아니라 수지 발열 기록해줘",
+        "해수 발열 기록해줘. 사실은 수지 이야기야",
+        "Record Haesoo's medication timeline, but she took no medication",
+        "Record Haesoo's fever, however this is about Suji",
+    ],
+)
+def test_childcare_mixed_subject_contrast_and_contradiction_mint_no_grant(message):
+    assert infer_explicit_workflow_grants(message) == frozenset()
 
 
 def test_diet_negation_plans_questions_and_medication_mint_no_diet_grant():
@@ -420,6 +514,31 @@ def test_blocked_create_target_selection_is_rephrase_stable_and_multi_target_spe
         blocked_create_target_fingerprints=frozenset({first}),
     )
     assert select_blocked_create_target_fingerprint(single, "Assistant rephrased title") == first
+
+
+def test_workflow_blocked_create_ignores_incidental_quoted_targets():
+    action = fingerprint_user_action("compare quoted paths and fix the workflow")
+    authority = CurrentTurnUserAuthority(
+        turn_id="workflow-with-incidental-quotes",
+        source_role="user",
+        session_scope="test",
+        platform_scope="discord",
+        user_message_index=0,
+        user_action_fingerprint=action,
+        allowed_action_classes=frozenset({"workflow_blocked_card_create"}),
+        blocked_create_target_fingerprints=frozenset(
+            {
+                fingerprint_workflow_target("path/a"),
+                fingerprint_workflow_target("path/b"),
+            }
+        ),
+    )
+    assert (
+        select_blocked_create_target_fingerprint(
+            authority, "Fix the discovered workflow regression"
+        )
+        == action
+    )
 
 
 def test_blocked_create_ignores_discord_transport_backticks_for_generated_title():
@@ -593,3 +712,116 @@ def test_current_user_reaffirmation_still_authorizes_card_creation(message):
     classes, _targets = infer_explicit_workflow_scope(message)
     assert "explicit_blocked_card_create" in classes
     assert infer_blocked_create_generated_title(message)
+
+
+def test_exact_semantic_debug_issue_command_mints_only_exact_target_grant():
+    run_id = "semantic-debug-impact-v3-oauth-20260725-001"
+    message = f"APPROVE SEMANTIC DEBUG ISSUE {run_id}"
+    classes, targets = infer_explicit_workflow_scope(message)
+    grants = infer_explicit_workflow_grants(message)
+    assert classes == frozenset({"approval_required_live_mutation"})
+    assert targets == frozenset({fingerprint_workflow_target(run_id)})
+    assert grants == frozenset({
+        ("semantic_debug_issue", fingerprint_workflow_target(run_id))
+    })
+    assert infer_explicit_workflow_operations(message) == frozenset({
+        "semantic_debug_issue"
+    })
+
+
+@pytest.mark.parametrize(
+    "message",
+    [
+        "APPROVE SEMANTIC DEBUG ISSUE",
+        "APPROVE SEMANTIC DEBUG ISSUE semantic-debug-one semantic-debug-two",
+        "do not APPROVE SEMANTIC DEBUG ISSUE semantic-debug-impact-v3-001",
+        "the plan says APPROVE SEMANTIC DEBUG ISSUE semantic-debug-impact-v3-001",
+    ],
+)
+def test_non_exact_semantic_debug_text_mints_no_issue_grant(message):
+    classes, targets = infer_explicit_workflow_scope(message)
+    assert "approval_required_live_mutation" not in classes
+    assert not any(
+        operation == "semantic_debug_issue"
+        for operation, _target in infer_explicit_workflow_grants(message)
+    )
+    assert fingerprint_workflow_target("semantic-debug-impact-v3-001") not in targets
+
+
+@pytest.mark.parametrize(
+    "message",
+    [
+        "Record the Company Work OS canonical initial seed now.",
+        "Company Work OS canonical initial seed를 지금 기록해줘",
+    ],
+)
+def test_exact_current_user_company_seed_imperative_mints_only_fixed_target_grant(
+    message,
+):
+    operation = "company_work_os_initial_seed_record"
+    target = fingerprint_workflow_target("company-work-os:canonical-initial-seed")
+    classes, targets = infer_explicit_workflow_scope(message)
+    assert classes == frozenset({"trusted_local_record"})
+    assert targets == frozenset({target})
+    assert infer_explicit_workflow_operations(message) == frozenset({operation})
+    assert infer_explicit_workflow_grants(message) == frozenset({(operation, target)})
+
+
+def test_company_seed_record_authority_is_bound_to_one_operation_and_fixed_target():
+    target = "company-work-os:canonical-initial-seed"
+    authority = CurrentTurnUserAuthority(
+        turn_id="opaque-company-seed-turn",
+        source_role="user",
+        session_scope="test",
+        platform_scope="synthetic",
+        user_message_index=0,
+        user_action_fingerprint=fingerprint_user_action("synthetic current turn"),
+        allowed_action_classes=frozenset({"trusted_local_record"}),
+        allowed_operations=frozenset({"company_work_os_initial_seed_record"}),
+        operation_target_grants=frozenset(
+            {
+                (
+                    "company_work_os_initial_seed_record",
+                    fingerprint_workflow_target(target),
+                )
+            }
+        ),
+        target_fingerprints=frozenset({fingerprint_workflow_target(target)}),
+    )
+    assert authority.allows_operation_target(
+        "company_work_os_initial_seed_record", target
+    )
+    assert not authority.allows_operation_target(
+        "company_work_os_initial_seed_preview", target
+    )
+    assert not authority.allows_operation_target(
+        "company_work_os_initial_seed_record", "company-work-os:other-target"
+    )
+
+
+@pytest.mark.parametrize(
+    "message",
+    [
+        "Plan how to record the Company Work OS canonical initial seed.",
+        "Design the Company Work OS canonical initial seed recorder.",
+        "Explain how to record the Company Work OS canonical initial seed.",
+        "Should we record the Company Work OS canonical initial seed now?",
+        "Do not record the Company Work OS canonical initial seed.",
+        '"Record the Company Work OS canonical initial seed now."',
+        "The user said to record the Company Work OS canonical initial seed now.",
+        "I recorded the Company Work OS canonical initial seed yesterday.",
+        "[assistant] Record the Company Work OS canonical initial seed now.",
+        "I prefer that you record the Company Work OS canonical initial seed.",
+        "Use the recommendations for the Company Work OS initial setup.",
+        "Company Work OS 초기 seed 기록을 추천해줘.",
+    ],
+)
+def test_non_imperative_or_non_user_company_seed_text_never_mints_record_authority(
+    message,
+):
+    target = fingerprint_workflow_target("company-work-os:canonical-initial-seed")
+    assert not any(
+        operation == "company_work_os_initial_seed_record"
+        for operation, _target in infer_explicit_workflow_grants(message)
+    )
+    assert target not in infer_explicit_workflow_scope(message)[1]

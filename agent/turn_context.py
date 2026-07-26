@@ -35,7 +35,7 @@ from agent.model_metadata import (
     estimate_request_tokens_rough,
 )
 from tools.workflow_authority import (
-    CurrentTurnUserAuthority,
+    _mint_host_current_turn_user_authority,
     bind_active_workflow_turn,
     bind_current_turn_user_authority,
     clear_current_turn_user_authority,
@@ -426,7 +426,7 @@ def build_turn_context(
         operation_target_grants = infer_explicit_workflow_grants(
             authority_user_message
         )
-        authority = CurrentTurnUserAuthority(
+        authority = _mint_host_current_turn_user_authority(
             turn_id=turn_id,
             source_role="user",
             session_scope=str(agent.session_id or "session"),

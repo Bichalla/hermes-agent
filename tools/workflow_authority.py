@@ -17,8 +17,12 @@ from contextvars import ContextVar, Token
 from dataclasses import dataclass, replace
 
 _FINGERPRINT_RE = re.compile(r"^[a-f0-9]{64}$")
+_HOST_AUTHORITY_KEY = secrets.token_bytes(32)
 _TASK_ID_RE = re.compile(r"(?<![a-z0-9])t_[a-z0-9]{6,64}(?![a-z0-9])", re.IGNORECASE)
 _PENDING_ID_RE = re.compile(r"(?<![a-f0-9])kp_[a-f0-9]{16}(?![a-f0-9])")
+_SEMANTIC_DEBUG_APPROVAL_RE = re.compile(
+    r"^approve semantic debug issue (semantic-debug-[a-z0-9][a-z0-9-]{4,100})$"
+)
 _QUOTED_TARGET_RE = re.compile(
     r'''(?:"([^"]{1,200})"|'([^']{1,200})'|`([^`]{1,200})`|“([^”]{1,200})”|‘([^’]{1,200})’)'''
 )
@@ -31,22 +35,31 @@ _TRIGGER_METADATA_PREFIX_RE = re.compile(
     r"^\[Triggering message id:.*?\]\s*", re.IGNORECASE | re.DOTALL
 )
 _SENDER_PREFIX_RE = re.compile(r"^\[[^\]\n]{1,80}\]\s*")
+_NON_USER_SENDER_PREFIX_RE = re.compile(
+    r"^\[(?:assistant|bot|system|tool)\]\s*", re.IGNORECASE
+)
 _SENDER_BLOCK_RE = re.compile(r"(?m)^\[([^\]\n]{1,80})\]\s+")
 _ALLOWED_ACTION_CLASSES = frozenset(
     {
         "status_memory",
         "explicit_blocked_card_create",
+        "workflow_blocked_card_create",
         "registered_soft_delete",
         "trusted_local_record",
+        "approval_required_live_mutation",
     }
 )
 _ALLOWED_OPERATIONS = frozenset(
     {
+        "company_work_os_initial_seed_preview",
+        "company_work_os_initial_seed_record",
         "pending_read",
         "pending_soft_delete",
         "pending_restore",
         "kanban_status_memory_comment",
+        "childcare_event_record",
         "diet_intake_record",
+        "semantic_debug_issue",
     }
 )
 
@@ -105,6 +118,18 @@ _REPORTED_SPEECH_TOKENS = (
     "보고했다",
     "was reported",
     " saying ",
+    "plan says",
+    "the plan says",
+    "example command",
+    "only an example",
+    "for example",
+    "그가 한 말",
+    "그녀가 한 말",
+    "계획에는",
+    "계획에 따르면",
+    "예시 명령",
+    "문서에 적혀",
+    "문서에 써",
 )
 
 
@@ -138,6 +163,9 @@ def _foreground_user_text_for_target_inference(user_message: str) -> str:
     if has_trigger_boundary and user_message.lstrip().casefold().startswith(
         ("[context around", "[recent channel messages")
     ):
+        return ""
+
+    if _NON_USER_SENDER_PREFIX_RE.match(user_message):
         return ""
 
     sender_matches = tuple(_SENDER_BLOCK_RE.finditer(user_message))
@@ -200,6 +228,57 @@ def infer_blocked_create_generated_title(user_message: str) -> str:
         return ""
 
 
+def _is_user_requested_workflow(normalized: str) -> bool:
+    """Recognize a foreground request that starts or continues real work.
+
+    This grants only one idempotent blocked follow-up card. It does not grant
+    dispatch, lifecycle transitions, public actions, or arbitrary writes.
+    """
+    if (
+        not normalized
+        or _has_negation(normalized)
+        or any(token in normalized for token in _REPORTED_SPEECH_TOKENS)
+    ):
+        return False
+
+    english_request = re.compile(
+        r"^(?:please\s+)?"
+        r"(?:(?:can|could|would|will)\s+you\s+)?"
+        r"(?:investigate|fix|debug|repair|resolve|implement|review|test|verify|"
+        r"build|configure|set\s+up|update|refactor|register|continue|finish|run)\b"
+    )
+    korean_request_ending = re.compile(
+        r"(?:"
+        r"고쳐(?:줘|주세요)?|수정해(?:줘|주세요)?|구현해(?:줘|주세요)?|"
+        r"진행해(?:줘|주세요|봐)?|처리해(?:줘|주세요)?|해결해(?:줘|주세요)?|"
+        r"검토해(?:줘|주세요)?|조사해(?:줘|주세요)?|검증해(?:줘|주세요)?|"
+        r"등록해(?:줘|주세요)?|정리해(?:줘|주세요)?|완화해(?:줘|주세요|버려)?|"
+        r"계속해(?:줘|주세요)?|이어(?:서\s+)?(?:진행)?해(?:줘|주세요)?|"
+        r"해볼래|해봐"
+        r")$"
+    )
+    english_completion = re.compile(
+        r"^(?=.*\b(?:gateway|service|install|setup|test|verification|restart|update|approval)\b)"
+        r".*\b(?:complete|completed|done|ready)$"
+    )
+    korean_completion = re.compile(
+        r"^(?=.*(?:게이트웨이|서비스|설치|설정|테스트|검증|재시작|업데이트|승인|준비))"
+        r".*(?:완료|끝냈어|끝남|됐어)$"
+    )
+    clauses = tuple(
+        clause.strip()
+        for clause in re.split(r"[.!?。！？\n]+", normalized)
+        if clause.strip()
+    )
+    return any(
+        english_request.search(clause)
+        or korean_request_ending.search(clause)
+        or english_completion.search(clause)
+        or korean_completion.search(clause)
+        for clause in clauses
+    )
+
+
 def infer_explicit_workflow_scope(
     user_message: str,
 ) -> tuple[frozenset[str], frozenset[str]]:
@@ -213,8 +292,16 @@ def infer_explicit_workflow_scope(
         classes.add("status_memory")
     if "diet_intake_record" in grant_operations:
         classes.add("trusted_local_record")
+    if "childcare_event_record" in grant_operations:
+        classes.add("trusted_local_record")
+    if "semantic_debug_issue" in grant_operations:
+        classes.add("approval_required_live_mutation")
+    if "company_work_os_initial_seed_record" in grant_operations:
+        classes.add("trusted_local_record")
     if _is_direct_blocked_create_command(normalized):
         classes.add("explicit_blocked_card_create")
+    elif _is_user_requested_workflow(normalized):
+        classes.add("workflow_blocked_card_create")
 
     pending_ids = tuple(_PENDING_ID_RE.finditer(normalized))
     if pending_ids and any(
@@ -227,6 +314,22 @@ def infer_explicit_workflow_scope(
     }
     if "diet_intake_record" in grant_operations:
         targets.add(fingerprint_workflow_target("person_park_sanghyun:diet"))
+    if "childcare_event_record" in grant_operations:
+        targets.update(
+            target
+            for operation, target in grants
+            if operation == "childcare_event_record"
+        )
+    if "semantic_debug_issue" in grant_operations:
+        targets.update(
+            target
+            for operation, target in grants
+            if operation == "semantic_debug_issue"
+        )
+    if "company_work_os_initial_seed_record" in grant_operations:
+        targets.add(
+            fingerprint_workflow_target("company-work-os:canonical-initial-seed")
+        )
     return frozenset(classes), frozenset(targets)
 
 
@@ -525,6 +628,101 @@ def _is_confirmed_diet_intake(normalized: str) -> bool:
     return explicit_record or consumed or meal_prefix
 
 
+def _confirmed_childcare_fact_targets(normalized: str) -> frozenset[str]:
+    forbidden = (
+        "아니라",
+        "사실은",
+        " but ",
+        "however",
+        "no medication",
+        "did not",
+        "didn't",
+        "없었",
+        "안 먹",
+        "않았",
+    )
+    other_subjects = (
+        "수지",
+        "suji",
+        "상현",
+        "sanghyun",
+        "엄마",
+        "아빠",
+        "mother",
+        "father",
+        "wife",
+    )
+    if (
+        not normalized
+        or _has_negation(normalized)
+        or any(token in normalized for token in _NON_COMMAND_TOKENS)
+        or any(token in normalized for token in _REPORTED_SPEECH_TOKENS)
+        or any(token in normalized for token in forbidden)
+        or any(token in normalized for token in other_subjects)
+        or any(
+            token in normalized
+            for token in ("내일", "예정", "계획", "할 경우", "if haesoo", "tomorrow")
+        )
+    ):
+        return frozenset()
+    clauses = tuple(
+        clause.strip()
+        for clause in re.split(r"[.!?。！？\n]+", normalized)
+        if clause.strip()
+    )
+    command_clauses = tuple(
+        clause
+        for clause in clauses
+        if any(token in clause for token in ("해수", "haesoo"))
+        and (
+            re.search(
+                r"기록(?:도|은|을|를|이|가)?\s*(?:해|해주세요|해줘|남겨|등록)",
+                clause,
+            )
+            is not None
+            or clause.startswith("record ")
+        )
+    )
+    if len(command_clauses) != 1:
+        return frozenset()
+    clause = command_clauses[0]
+    targets: set[str] = set()
+    if any(token in clause for token in ("발열", "체온", "열", "fever", "temperature")):
+        targets.add("person_park_haesoo:childcare:fever")
+    if any(token in clause for token in ("복약", "투약", "약", "medication")):
+        targets.add("person_park_haesoo:childcare:medication")
+    if any(
+        token in clause
+        for token in (
+            "진료",
+            "병원",
+            "의사",
+            "처방",
+            "구내염",
+            "수족구",
+            "clinic",
+            "doctor",
+            "prescription",
+            "diagnosis",
+        )
+    ):
+        targets.add("person_park_haesoo:childcare:clinical")
+    return frozenset(targets)
+
+
+def _company_work_os_initial_seed_operation(normalized: str) -> str | None:
+    """Recognize only the closed current-user imperative for the fixed seed."""
+    if re.fullmatch(
+        r"record the company work os canonical initial seed now[.]?",
+        normalized,
+    ) or re.fullmatch(
+        r"company work os canonical initial seed를 지금 기록해줘[.]?",
+        normalized,
+    ):
+        return "company_work_os_initial_seed_record"
+    return None
+
+
 def infer_explicit_workflow_grants(
     user_message: str,
 ) -> frozenset[tuple[str, str]]:
@@ -538,6 +736,32 @@ def infer_explicit_workflow_grants(
     user_text = _foreground_user_text_for_target_inference(user_message)
     normalized = unicodedata.normalize("NFKC", user_text).strip().casefold()
     grants: set[tuple[str, str]] = set()
+    company_seed_operation = _company_work_os_initial_seed_operation(normalized)
+    if company_seed_operation is not None:
+        return frozenset(
+            {
+                (
+                    company_seed_operation,
+                    fingerprint_workflow_target(
+                        "company-work-os:canonical-initial-seed"
+                    ),
+                )
+            }
+        )
+    semantic_debug_match = _SEMANTIC_DEBUG_APPROVAL_RE.fullmatch(normalized)
+    if semantic_debug_match is not None:
+        run_id = semantic_debug_match.group(1)
+        grants.add(
+            ("semantic_debug_issue", fingerprint_workflow_target(run_id))
+        )
+        return frozenset(grants)
+    for target in _confirmed_childcare_fact_targets(normalized):
+        grants.add(
+            (
+                "childcare_event_record",
+                fingerprint_workflow_target(target),
+            )
+        )
     if _is_confirmed_diet_intake(normalized):
         grants.add(
             (
@@ -666,6 +890,7 @@ class CurrentTurnUserAuthority:
     blocked_create_target_fingerprints: frozenset[str] = frozenset()
     blocked_create_generated_title: str = ""
     coarse_estimate_authorized: bool = False
+    host_seal: str = ""
 
     def __post_init__(self) -> None:
         if self.source_role != "user":
@@ -688,6 +913,8 @@ class CurrentTurnUserAuthority:
             raise ValueError("allowed_operations contains an unknown operation")
         if type(self.coarse_estimate_authorized) is not bool:
             raise ValueError("coarse_estimate_authorized must be bool")
+        if self.host_seal and not _FINGERPRINT_RE.fullmatch(self.host_seal):
+            raise ValueError("host_seal must be a SHA-256 token")
         for grant in self.operation_target_grants:
             if (
                 type(grant) is not tuple
@@ -733,10 +960,58 @@ class CurrentTurnUserAuthority:
         ) in self.operation_target_grants
 
 
+def _host_authority_payload(authority: CurrentTurnUserAuthority) -> bytes:
+    values = (
+        authority.turn_id,
+        authority.source_role,
+        authority.session_scope,
+        authority.platform_scope,
+        str(authority.user_message_index),
+        authority.user_action_fingerprint,
+        authority.source_event_fingerprint,
+        "\x1f".join(sorted(authority.allowed_action_classes)),
+        "\x1f".join(sorted(authority.allowed_operations)),
+        "\x1f".join(
+            f"{operation}\x1e{target}"
+            for operation, target in sorted(authority.operation_target_grants)
+        ),
+        "\x1f".join(sorted(authority.target_fingerprints)),
+        "\x1f".join(sorted(authority.blocked_create_target_fingerprints)),
+        authority.blocked_create_generated_title,
+        "1" if authority.coarse_estimate_authorized else "0",
+    )
+    return "\0".join(values).encode("utf-8")
+
+
+def _mint_host_current_turn_user_authority(**kwargs) -> CurrentTurnUserAuthority:
+    """Mint authority inside the trusted turn prologue, never from tool input."""
+    authority = CurrentTurnUserAuthority(**kwargs)
+    seal = hmac.new(
+        _HOST_AUTHORITY_KEY, _host_authority_payload(authority), hashlib.sha256
+    ).hexdigest()
+    return replace(authority, host_seal=seal)
+
+
+def is_host_issued_current_turn_authority(
+    authority: CurrentTurnUserAuthority | None,
+) -> bool:
+    if authority is None or not authority.host_seal:
+        return False
+    expected = hmac.new(
+        _HOST_AUTHORITY_KEY, _host_authority_payload(authority), hashlib.sha256
+    ).hexdigest()
+    return hmac.compare_digest(authority.host_seal, expected)
+
+
 def select_blocked_create_target_fingerprint(
     authority: CurrentTurnUserAuthority, proposed_title: str
 ) -> str:
     """Select a user-derived discriminator without hashing assistant prose."""
+    if (
+        authority.allows("workflow_blocked_card_create")
+        and not authority.allows("explicit_blocked_card_create")
+    ):
+        return authority.user_action_fingerprint
     candidates = authority.blocked_create_target_fingerprints
     if not candidates:
         return authority.user_action_fingerprint
@@ -794,7 +1069,11 @@ def extend_current_turn_user_authority_from_interactive_response(
     classes, targets = infer_explicit_workflow_scope(user_response)
     grants = infer_explicit_workflow_grants(user_response)
     operations = infer_explicit_workflow_operations(user_response)
-    create_targets = infer_explicit_blocked_create_targets(user_response)
+    create_targets = (
+        infer_explicit_blocked_create_targets(user_response)
+        if "explicit_blocked_card_create" in classes
+        else frozenset()
+    )
     generated_title = infer_blocked_create_generated_title(user_response)
     if not (classes or targets or grants or operations or create_targets or generated_title):
         return current
@@ -822,6 +1101,14 @@ def extend_current_turn_user_authority_from_interactive_response(
             or infer_coarse_estimate_authority(user_response)
         ),
     )
+    if is_host_issued_current_turn_authority(current):
+        updated = _mint_host_current_turn_user_authority(
+            **{
+                field: getattr(updated, field)
+                for field in CurrentTurnUserAuthority.__dataclass_fields__
+                if field != "host_seal"
+            }
+        )
     bind_current_turn_user_authority(updated)
     return updated
 

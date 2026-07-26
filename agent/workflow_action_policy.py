@@ -20,6 +20,7 @@ class WorkflowActionClass(StrEnum):
     READ_ONLY = "read_only"
     STATUS_MEMORY = "status_memory"
     EXPLICIT_BLOCKED_CARD_CREATE = "explicit_blocked_card_create"
+    WORKFLOW_BLOCKED_CARD_CREATE = "workflow_blocked_card_create"
     TRUSTED_LOCAL_RECORD = "trusted_local_record"
     APPROVAL_REQUIRED_LIVE_MUTATION = "approval_required_live_mutation"
     DESTRUCTIVE_OR_PUBLIC = "destructive_or_public"
@@ -78,9 +79,12 @@ _SCHEMA_ID_RE = re.compile(r"^[a-z][a-z0-9-]*/v[1-9][0-9]*$")
 _ADAPTER_ID_RE = re.compile(r"^[a-z][a-z0-9-]*$")
 _ADAPTER_IDS = frozenset(
     {
+        "company-work-os-initial-seed",
         "kanban-status-memory",
         "kanban-intake-pending",
+        "lifelog-childcare-recorder",
         "lifelog-diet-recorder",
+        "lifelog-semantic-debug-issuer",
         "review-ledger-controller",
     }
 )
@@ -133,6 +137,33 @@ def validate_registered_capability(capability: RegisteredCapability) -> None:
 
 _REGISTERED_CAPABILITIES: Mapping[str, RegisteredCapability] = MappingProxyType(
     {
+        "company-work-os.initial-seed-preview.v1": RegisteredCapability(
+            capability_id="company-work-os.initial-seed-preview.v1",
+            effects=frozenset({WorkflowEffect.READ}),
+            authority_modes=frozenset(
+                {
+                    AuthorityMode.FOREGROUND_CURRENT_TURN,
+                    AuthorityMode.LOCAL_READ_BOUNDARY,
+                }
+            ),
+            adapter_id="company-work-os-initial-seed",
+            input_schema_id="company-work-os-initial-seed-preview/v1",
+            result_schema_id="company-work-os-initial-seed-preview-result/v1",
+            idempotency=IdempotencyMode.READ_ONLY,
+            readback_required=True,
+            soft_delete_restore_required=False,
+        ),
+        "company-work-os.initial-seed-record.v1": RegisteredCapability(
+            capability_id="company-work-os.initial-seed-record.v1",
+            effects=frozenset({WorkflowEffect.CREATE}),
+            authority_modes=frozenset({AuthorityMode.FOREGROUND_CURRENT_TURN}),
+            adapter_id="company-work-os-initial-seed",
+            input_schema_id="company-work-os-initial-seed-record/v1",
+            result_schema_id="company-work-os-initial-seed-record-result/v1",
+            idempotency=IdempotencyMode.DETERMINISTIC_REPLAY,
+            readback_required=True,
+            soft_delete_restore_required=False,
+        ),
         "kanban.status-memory.v1": RegisteredCapability(
             capability_id="kanban.status-memory.v1",
             effects=frozenset({WorkflowEffect.CREATE, WorkflowEffect.READ}),
@@ -184,10 +215,32 @@ _REGISTERED_CAPABILITIES: Mapping[str, RegisteredCapability] = MappingProxyType(
             readback_required=True,
             soft_delete_restore_required=False,
         ),
+        "lifelog.childcare-event.v1": RegisteredCapability(
+            capability_id="lifelog.childcare-event.v1",
+            effects=frozenset({WorkflowEffect.CREATE}),
+            authority_modes=frozenset({AuthorityMode.FOREGROUND_CURRENT_TURN}),
+            adapter_id="lifelog-childcare-recorder",
+            input_schema_id="lifelog-childcare-event/v1",
+            result_schema_id="registered-recorder-result/v1",
+            idempotency=IdempotencyMode.DETERMINISTIC_REPLAY,
+            readback_required=True,
+            soft_delete_restore_required=False,
+        ),
+        "lifelog.semantic-debug-issue.v1": RegisteredCapability(
+            capability_id="lifelog.semantic-debug-issue.v1",
+            effects=frozenset({WorkflowEffect.CREATE}),
+            authority_modes=frozenset({AuthorityMode.FOREGROUND_CURRENT_TURN}),
+            adapter_id="lifelog-semantic-debug-issuer",
+            input_schema_id="lifelog-semantic-debug-issue/v1",
+            result_schema_id="lifelog-semantic-debug-issue-result/v1",
+            idempotency=IdempotencyMode.OWNER_ATOMIC,
+            readback_required=True,
+            soft_delete_restore_required=False,
+        ),
         "review-ledger.history.v1": RegisteredCapability(
             capability_id="review-ledger.history.v1",
             effects=frozenset(
-                {WorkflowEffect.CREATE, WorkflowEffect.UPDATE, WorkflowEffect.READ}
+                {WorkflowEffect.CREATE, WorkflowEffect.READ, WorkflowEffect.UPDATE}
             ),
             authority_modes=frozenset({AuthorityMode.MAIN_CONTROLLER}),
             adapter_id="review-ledger-controller",
@@ -202,6 +255,14 @@ _REGISTERED_CAPABILITIES: Mapping[str, RegisteredCapability] = MappingProxyType(
 
 _REGISTERED_OPERATIONS: Mapping[tuple[str, str], WorkflowEffect] = MappingProxyType(
     {
+        (
+            "company-work-os.initial-seed-preview.v1",
+            "company_work_os_initial_seed_preview",
+        ): WorkflowEffect.READ,
+        (
+            "company-work-os.initial-seed-record.v1",
+            "company_work_os_initial_seed_record",
+        ): WorkflowEffect.CREATE,
         ("kanban.status-memory.v1", "kanban_status_memory_comment"): WorkflowEffect.CREATE,
         ("kanban.status-memory.v1", "list_comments"): WorkflowEffect.READ,
 
@@ -209,6 +270,8 @@ _REGISTERED_OPERATIONS: Mapping[tuple[str, str], WorkflowEffect] = MappingProxyT
         ("kanban-intake.pending-soft-delete.v1", "pending_soft_delete"): WorkflowEffect.SOFT_DELETE,
         ("kanban-intake.pending-soft-delete.v1", "pending_restore"): WorkflowEffect.RESTORE,
         ("lifelog.diet-intake.v1", "diet_intake_record"): WorkflowEffect.CREATE,
+        ("lifelog.childcare-event.v1", "childcare_event_record"): WorkflowEffect.CREATE,
+        ("lifelog.semantic-debug-issue.v1", "semantic_debug_issue"): WorkflowEffect.CREATE,
         ("review-ledger.history.v1", "freeze"): WorkflowEffect.CREATE,
         ("review-ledger.history.v1", "start_attempt"): WorkflowEffect.CREATE,
         ("review-ledger.history.v1", "record_result"): WorkflowEffect.UPDATE,
@@ -220,6 +283,19 @@ _REGISTERED_OPERATION_AUTHORITIES: Mapping[
     tuple[str, str], frozenset[AuthorityMode]
 ] = MappingProxyType(
     {
+        (
+            "company-work-os.initial-seed-preview.v1",
+            "company_work_os_initial_seed_preview",
+        ): frozenset(
+            {
+                AuthorityMode.FOREGROUND_CURRENT_TURN,
+                AuthorityMode.LOCAL_READ_BOUNDARY,
+            }
+        ),
+        (
+            "company-work-os.initial-seed-record.v1",
+            "company_work_os_initial_seed_record",
+        ): frozenset({AuthorityMode.FOREGROUND_CURRENT_TURN}),
         ("kanban.status-memory.v1", "kanban_status_memory_comment"): frozenset(
             {
                 AuthorityMode.FOREGROUND_CURRENT_TURN,
@@ -246,6 +322,12 @@ _REGISTERED_OPERATION_AUTHORITIES: Mapping[
             {AuthorityMode.FOREGROUND_CURRENT_TURN}
         ),
         ("lifelog.diet-intake.v1", "diet_intake_record"): frozenset(
+            {AuthorityMode.FOREGROUND_CURRENT_TURN}
+        ),
+        ("lifelog.childcare-event.v1", "childcare_event_record"): frozenset(
+            {AuthorityMode.FOREGROUND_CURRENT_TURN}
+        ),
+        ("lifelog.semantic-debug-issue.v1", "semantic_debug_issue"): frozenset(
             {AuthorityMode.FOREGROUND_CURRENT_TURN}
         ),
         ("review-ledger.history.v1", "freeze"): frozenset(
@@ -331,6 +413,7 @@ class WorkflowAction:
     unknown_db_action: bool = False
     read_only: bool = False
     explicit_blocked_card_create: bool = False
+    workflow_blocked_card_create: bool = False
     deterministic_idempotency_key: bool = False
     registered_recorder: bool = False
     confirmed_fact: bool = False
@@ -415,6 +498,11 @@ def classify_workflow_action(action: WorkflowAction) -> WorkflowActionClass:
     if action.explicit_blocked_card_create:
         if action.deterministic_idempotency_key:
             return WorkflowActionClass.EXPLICIT_BLOCKED_CARD_CREATE
+        return WorkflowActionClass.APPROVAL_REQUIRED_LIVE_MUTATION
+
+    if action.workflow_blocked_card_create:
+        if action.deterministic_idempotency_key:
+            return WorkflowActionClass.WORKFLOW_BLOCKED_CARD_CREATE
         return WorkflowActionClass.APPROVAL_REQUIRED_LIVE_MUTATION
 
     if action.registered_recorder:

@@ -20,6 +20,7 @@ Public API (signatures preserved from the original 2,400-line version):
     check_tool_availability(quiet) -> tuple
 """
 
+import copy
 import os
 import json
 import re
@@ -330,9 +331,10 @@ def get_tool_definitions(
             # consistent state even on a cache hit.
             global _last_resolved_tool_names
             _last_resolved_tool_names = [t["function"]["name"] for t in cached]
-            # Return a shallow copy of the list but share the dict references —
-            # schemas are treated as read-only by all known callers.
-            return list(cached)
+            # Tool schemas pass through several provider/export adapters. Keep
+            # the cached canonical copy isolated so an in-place nested edit by
+            # one caller cannot erase parameters for later sessions.
+            return copy.deepcopy(cached)
 
     result = _compute_tool_definitions(enabled_toolsets, disabled_toolsets, quiet_mode,
                                        skip_tool_search_assembly=skip_tool_search_assembly)
@@ -349,7 +351,10 @@ def get_tool_definitions(
         # toolset/config fingerprints it sees over its lifetime (#19251).
         if len(_tool_defs_cache) >= _TOOL_DEFS_CACHE_MAX:
             _tool_defs_cache.pop(next(iter(_tool_defs_cache)))  # evict oldest
-        _tool_defs_cache[cache_key] = result
+        # Store an isolated canonical copy. The freshly computed ``result`` is
+        # returned to this caller below and may be mutated by downstream
+        # provider/export adapters.
+        _tool_defs_cache[cache_key] = copy.deepcopy(result)
         return list(result)
     return result
 

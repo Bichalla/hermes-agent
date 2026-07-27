@@ -284,6 +284,42 @@ def test_diet_negation_plans_questions_and_medication_mint_no_diet_grant():
     assert infer_coarse_estimate_authority("영양 추정하지 마") is False
 
 
+def test_social_record_command_mints_exact_fixed_grant():
+    target = fingerprint_workflow_target(
+        "person_park_sanghyun:social-conversation"
+    )
+    for message in (
+        "내가 유준님과 나눈 대화를 라이프로그에 기록해줘",
+        "Record the conversation I had in my lifelog",
+    ):
+        classes, targets = infer_explicit_workflow_scope(message)
+        assert classes == frozenset({"trusted_local_record"})
+        assert targets == frozenset({target})
+        assert infer_explicit_workflow_grants(message) == frozenset(
+            {("social_conversation_record", target)}
+        )
+
+
+@pytest.mark.parametrize(
+    "message",
+    [
+        "내가 유준님과 나눈 대화를 라이프로그에 기록하지 마",
+        "내가 유준님과 나눈 대화를 라이프로그에 기록할까?",
+        "내가 유준님과 나눈 대화를 나중에 기록할 계획이야",
+        "그는 내 대화를 라이프로그에 기록해달라고 말했다",
+        "예시: 내가 유준님과 나눈 대화를 라이프로그에 기록해줘",
+        "해수와 수지의 대화를 라이프로그에 기록해줘",
+        "철수와 영희가 나눈 대화를 라이프로그에 기록해줘. 내가 검토할게",
+        '"내가 유준님과 나눈 대화를 라이프로그에 기록해줘" 문장을 파서 입력으로 사용해',
+        "typed social_conversation_record owner action을 구현해줘",
+    ],
+)
+def test_social_record_negation_plan_question_report_example_and_other_subject_mint_none(
+    message,
+):
+    assert infer_explicit_workflow_grants(message) == frozenset()
+
+
 @pytest.mark.parametrize(
     "message",
     [

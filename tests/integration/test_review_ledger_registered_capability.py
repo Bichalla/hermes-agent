@@ -1,4 +1,4 @@
-"""Phase 1 excludes review-ledger from the registered capability catalog."""
+"""Legacy review-ledger controller action names remain unregistered."""
 
 from __future__ import annotations
 
@@ -20,8 +20,8 @@ from agent.workflow_action_policy import (
         ("record-or-reconcile", WorkflowEffect.UPDATE),
     ],
 )
-def test_review_ledger_controller_actions_are_not_registered_in_phase1(action, effect):
-    assert "review-ledger.history.v1" not in registered_capability_catalog()
+def test_legacy_review_ledger_controller_actions_are_not_registered(action, effect):
+    assert "review-ledger.history.v1" in registered_capability_catalog()
     assert evaluate_registered_capability(
         "review-ledger.history.v1",
         action,

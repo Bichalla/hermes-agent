@@ -22,6 +22,7 @@ def test_initial_catalog_is_closed_and_versioned():
         "kanban.status-memory.v1",
         "kanban-intake.pending-soft-delete.v1",
         "lifelog.diet-intake.v1",
+        "lifelog.social-conversation.v1",
         "review-ledger.history.v1",
     }
     assert catalog["kanban-intake.pending-soft-delete.v1"].effects == frozenset(
@@ -70,6 +71,27 @@ def test_status_memory_uses_wired_operation_name_and_exact_authority_modes():
         WorkflowEffect.CREATE,
         schema_valid=True,
         authority_mode=AuthorityMode.LOCAL_READ_BOUNDARY,
+        owner_ready=True,
+        target_valid=True,
+    ) is CapabilityDecision.DENY_AUTHORITY_MISSING
+
+
+def test_social_capability_is_foreground_create_only():
+    assert evaluate_registered_capability(
+        "lifelog.social-conversation.v1",
+        "social_conversation_record",
+        WorkflowEffect.CREATE,
+        schema_valid=True,
+        authority_mode=AuthorityMode.FOREGROUND_CURRENT_TURN,
+        owner_ready=True,
+        target_valid=True,
+    ) is CapabilityDecision.ALLOW
+    assert evaluate_registered_capability(
+        "lifelog.social-conversation.v1",
+        "social_conversation_record",
+        WorkflowEffect.CREATE,
+        schema_valid=True,
+        authority_mode=AuthorityMode.EXISTING_DISPATCHER_WORKER,
         owner_ready=True,
         target_valid=True,
     ) is CapabilityDecision.DENY_AUTHORITY_MISSING

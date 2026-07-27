@@ -15557,6 +15557,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         _async_delivery = getattr(_adapter, "supports_async_delivery", True)
         return set_session_vars(
             platform=context.source.platform.value,
+            scope_id=str(context.source.scope_id or context.source.guild_id or ""),
             chat_id=context.source.chat_id,
             chat_name=context.source.chat_name or "",
             thread_id=str(context.source.thread_id) if context.source.thread_id else "",

@@ -47,6 +47,7 @@ _ALLOWED_OPERATIONS = frozenset(
         "pending_restore",
         "kanban_status_memory_comment",
         "diet_intake_record",
+        "social_conversation_record",
     }
 )
 
@@ -213,6 +214,8 @@ def infer_explicit_workflow_scope(
         classes.add("status_memory")
     if "diet_intake_record" in grant_operations:
         classes.add("trusted_local_record")
+    if "social_conversation_record" in grant_operations:
+        classes.add("trusted_local_record")
     if _is_direct_blocked_create_command(normalized):
         classes.add("explicit_blocked_card_create")
 
@@ -227,6 +230,12 @@ def infer_explicit_workflow_scope(
     }
     if "diet_intake_record" in grant_operations:
         targets.add(fingerprint_workflow_target("person_park_sanghyun:diet"))
+    if "social_conversation_record" in grant_operations:
+        targets.add(
+            fingerprint_workflow_target(
+                "person_park_sanghyun:social-conversation"
+            )
+        )
     return frozenset(classes), frozenset(targets)
 
 
@@ -525,6 +534,51 @@ def _is_confirmed_diet_intake(normalized: str) -> bool:
     return explicit_record or consumed or meal_prefix
 
 
+def _is_direct_self_social_conversation_record(normalized: str) -> bool:
+    """Recognize one complete direct clause recording the user's own conversation."""
+    if not _is_affirmative_command(normalized):
+        return False
+    if any(
+        token in normalized
+        for token in (
+            "예시",
+            "example",
+            "계획",
+            "예정",
+            "나중에",
+            "구현",
+            "테스트",
+            "typed",
+            "owner action",
+            "social_conversation_record",
+            "파서",
+            "parser",
+            "입력으로",
+        )
+    ):
+        return False
+    clause = normalized.strip().rstrip(".!?").strip()
+    korean_partner_clause = re.fullmatch(
+        r"(?:내가|제가)\s+[^.!?\n;:]{1,80}(?:과|와)\s+나눈\s+대화를\s+"
+        r"(?:내\s+)?라이프로그에\s+(?:기록해\s*줘|기록해\s*주세요|남겨\s*줘)",
+        clause,
+    )
+    korean_self_clause = re.fullmatch(
+        r"(?:내|나의)\s+대화를\s+(?:내\s+)?라이프로그에\s+"
+        r"(?:기록해\s*줘|기록해\s*주세요|남겨\s*줘)",
+        clause,
+    )
+    english_clause = re.fullmatch(
+        r"(?:please\s+)?record\s+(?:the\s+)?conversation\s+i\s+had\s+"
+        r"in\s+my\s+lifelog",
+        clause,
+    )
+    return any(
+        match is not None
+        for match in (korean_partner_clause, korean_self_clause, english_clause)
+    )
+
+
 def infer_explicit_workflow_grants(
     user_message: str,
 ) -> frozenset[tuple[str, str]]:
@@ -543,6 +597,15 @@ def infer_explicit_workflow_grants(
             (
                 "diet_intake_record",
                 fingerprint_workflow_target("person_park_sanghyun:diet"),
+            )
+        )
+    if _is_direct_self_social_conversation_record(normalized):
+        grants.add(
+            (
+                "social_conversation_record",
+                fingerprint_workflow_target(
+                    "person_park_sanghyun:social-conversation"
+                ),
             )
         )
     if not _is_affirmative_command(normalized):

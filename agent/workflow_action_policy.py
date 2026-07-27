@@ -81,6 +81,7 @@ _ADAPTER_IDS = frozenset(
         "kanban-status-memory",
         "kanban-intake-pending",
         "lifelog-diet-recorder",
+        "lifelog-social-conversation-recorder",
         "review-ledger-controller",
     }
 )
@@ -184,6 +185,17 @@ _REGISTERED_CAPABILITIES: Mapping[str, RegisteredCapability] = MappingProxyType(
             readback_required=True,
             soft_delete_restore_required=False,
         ),
+        "lifelog.social-conversation.v1": RegisteredCapability(
+            capability_id="lifelog.social-conversation.v1",
+            effects=frozenset({WorkflowEffect.CREATE}),
+            authority_modes=frozenset({AuthorityMode.FOREGROUND_CURRENT_TURN}),
+            adapter_id="lifelog-social-conversation-recorder",
+            input_schema_id="lifelog-social-conversation/v1",
+            result_schema_id="registered-recorder-result/v1",
+            idempotency=IdempotencyMode.DETERMINISTIC_REPLAY,
+            readback_required=True,
+            soft_delete_restore_required=False,
+        ),
         "review-ledger.history.v1": RegisteredCapability(
             capability_id="review-ledger.history.v1",
             effects=frozenset(
@@ -209,6 +221,10 @@ _REGISTERED_OPERATIONS: Mapping[tuple[str, str], WorkflowEffect] = MappingProxyT
         ("kanban-intake.pending-soft-delete.v1", "pending_soft_delete"): WorkflowEffect.SOFT_DELETE,
         ("kanban-intake.pending-soft-delete.v1", "pending_restore"): WorkflowEffect.RESTORE,
         ("lifelog.diet-intake.v1", "diet_intake_record"): WorkflowEffect.CREATE,
+        (
+            "lifelog.social-conversation.v1",
+            "social_conversation_record",
+        ): WorkflowEffect.CREATE,
         ("review-ledger.history.v1", "freeze"): WorkflowEffect.CREATE,
         ("review-ledger.history.v1", "start_attempt"): WorkflowEffect.CREATE,
         ("review-ledger.history.v1", "record_result"): WorkflowEffect.UPDATE,
@@ -248,6 +264,10 @@ _REGISTERED_OPERATION_AUTHORITIES: Mapping[
         ("lifelog.diet-intake.v1", "diet_intake_record"): frozenset(
             {AuthorityMode.FOREGROUND_CURRENT_TURN}
         ),
+        (
+            "lifelog.social-conversation.v1",
+            "social_conversation_record",
+        ): frozenset({AuthorityMode.FOREGROUND_CURRENT_TURN}),
         ("review-ledger.history.v1", "freeze"): frozenset(
             {AuthorityMode.MAIN_CONTROLLER}
         ),

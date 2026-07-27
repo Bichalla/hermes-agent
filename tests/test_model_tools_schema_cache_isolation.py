@@ -102,5 +102,5 @@ def test_registered_workflow_schema_survives_cache_and_codex_conversion(monkeypa
     responses_schema = converted[0]["parameters"]
 
     assert responses_schema["required"] == ["action"]
-    assert "childcare_event_record" in responses_schema["properties"]["action"]["enum"]
+    assert "social_conversation_record" in responses_schema["properties"]["action"]["enum"]
     assert "payload_name" in responses_schema["properties"]

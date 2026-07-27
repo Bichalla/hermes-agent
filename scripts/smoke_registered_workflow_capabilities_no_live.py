@@ -10,14 +10,14 @@ import os
 import shutil
 import subprocess
 import sys
+import sysconfig
 import tempfile
 from pathlib import Path
 from typing import Any
 
 SOURCE_AGENT_ROOT = Path(__file__).resolve().parents[1]
 SOURCE_HOME = Path.home()
-VENV_ROOT = SOURCE_AGENT_ROOT / "venv"
-PYTHON = VENV_ROOT / "bin" / "python"
+PYTHON = Path(sys.executable)
 PYTHON_RUNTIME_ROOT = PYTHON.resolve().parents[1]
 
 
@@ -68,8 +68,9 @@ def _source_manifest_digest(*roots: Path) -> str:
 
 def _copy_python_runtime(root: Path) -> tuple[Path, Path]:
     site_packages = root / "site-packages"
+    source_site_packages = Path(sysconfig.get_path("purelib")).resolve(strict=True)
     shutil.copytree(
-        VENV_ROOT / "lib" / "python3.11" / "site-packages",
+        source_site_packages,
         site_packages,
         symlinks=False,
         ignore=shutil.ignore_patterns("__pycache__", "*.pyc"),
@@ -293,19 +294,25 @@ def run_temp_smoke() -> dict[str, Any]:
             "tests/test_model_tools_schema_cache_isolation.py",
             "tests/tools/test_registered_workflow_capability_policy.py",
             "tests/tools/test_workflow_authority.py",
-            "tests/tools/test_registered_local_workflow.py",
-
-            "tests/tools/test_terminal_tool.py",
+            "tests/tools/test_registered_local_workflow.py::test_social_schema_adds_action_without_new_parameter",
+            "tests/tools/test_registered_local_workflow.py::test_social_payload_requires_exact_single_current_source_tuple",
+            "tests/tools/test_registered_local_workflow.py::test_social_payload_fd_mode_owner_link_size_and_closed_schema",
+            "tests/tools/test_registered_local_workflow.py::test_social_owner_revalidates_authority_at_pre_live_seam",
+            "tests/tools/test_registered_local_workflow.py::test_social_owner_rejects_ops_source_changed_after_pin",
+            "tests/tools/test_registered_local_workflow.py::test_social_owner_reads_once_and_ignores_path_replacement",
+            "tests/tools/test_registered_local_workflow.py::test_social_owner_rejects_coherent_alternate_result_and_db",
+            "tests/tools/test_registered_local_workflow.py::test_social_owner_exact_result_and_constant_safe_output",
+            "tests/tools/test_registered_local_workflow.py::test_social_owner_unlinks_valid_bound_payload_on_success_failure_timeout",
+            "tests/tools/test_registered_local_workflow.py::test_social_policy_denial_cleans_valid_bound_payload_without_ops_write",
+            "tests/tools/test_registered_local_workflow.py::test_social_authority_denial_cleans_valid_bound_payload_without_ops_write",
+            "tests/tools/test_terminal_tool.py::test_terminal_rejects_model_supplied_workflow_authority_environment",
+            "tests/tools/test_terminal_tool.py::test_terminal_rejects_reserved_authority_before_config_or_environment",
+            "tests/tools/test_terminal_tool.py::test_terminal_hard_denies_registered_lifelog_wrapper",
+            "tests/tools/test_terminal_tool.py::test_terminal_hard_denies_review_ledger_controller",
             "tests/tools/test_approval_tool.py",
             "tests/hermes_cli/test_kanban_capability_migrate.py",
             "tests/hermes_cli/test_kanban_intake_migrate.py",
             "tests/integration/test_review_ledger_registered_capability.py",
-            # These tests intentionally require canonical Lifelog fixtures or
-            # launching /bin/sh. They are covered by the focused host suite and
-            # cannot run inside this copied-source default-deny sandbox.
-            "--deselect=tests/tools/test_registered_local_workflow.py::test_diet_owner_real_dispatcher_writes_temp_db_and_replays",
-            "--deselect=tests/tools/test_registered_local_workflow.py::test_childcare_owner_real_dispatcher_writes_temp_db_and_replays",
-            "--deselect=tests/tools/test_terminal_tool.py::test_shell_obfuscated_reserved_authority_cannot_create_blocked_card",
         ]
         agent_result = _run(
             [

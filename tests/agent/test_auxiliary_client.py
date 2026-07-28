@@ -5106,7 +5106,10 @@ class TestCodexAuxiliaryAdapterNullOutputRecovery:
                 "type": "response.output_item.done",
                 "item": {
                     "type": "message",
-                    "content": [{"type": "output_text", "text": "sdk raw survived"}],
+                    "content": [{
+                        "type": "output_text",
+                        "text": {"value": "sdk raw survived"},
+                    }],
                 },
             },
             {

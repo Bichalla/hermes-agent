@@ -1299,7 +1299,13 @@ class _CodexCompletionsAdapter:
                     for part in (_item_get(item, "content") or []):
                         ptype = _item_get(part, "type")
                         if ptype in {"output_text", "text"}:
-                            text_parts.append(_item_get(part, "text", ""))
+                            text_value = _item_get(part, "text", "")
+                            if isinstance(text_value, dict):
+                                text_value = text_value.get("value", "")
+                            elif not isinstance(text_value, str):
+                                text_value = getattr(text_value, "value", "")
+                            if isinstance(text_value, str):
+                                text_parts.append(text_value)
                 elif item_type == "function_call":
                     tool_calls_raw.append(SimpleNamespace(
                         id=_item_get(item, "call_id", ""),

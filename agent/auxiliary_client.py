@@ -1293,18 +1293,29 @@ class _CodexCompletionsAdapter:
                     val = obj.get(key, default)
                 return val if val is not None else default
 
-            for item in (getattr(final, "output", None) or []):
-                item_type = _item_get(item, "type")
+            def _string_value(value: Any) -> str | None:
+                if isinstance(value, str):
+                    return value
+                if isinstance(value, dict):
+                    value = value.get("value")
+                else:
+                    value = getattr(value, "value", None)
+                return value if isinstance(value, str) else None
+
+            final_output = getattr(final, "output", None)
+            if not isinstance(final_output, (list, tuple)):
+                final_output = ()
+            for item in final_output:
+                item_type = _string_value(_item_get(item, "type"))
                 if item_type == "message":
-                    for part in (_item_get(item, "content") or []):
-                        ptype = _item_get(part, "type")
+                    item_content = _item_get(item, "content")
+                    if not isinstance(item_content, (list, tuple)):
+                        item_content = ()
+                    for part in item_content:
+                        ptype = _string_value(_item_get(part, "type"))
                         if ptype in {"output_text", "text"}:
-                            text_value = _item_get(part, "text", "")
-                            if isinstance(text_value, dict):
-                                text_value = text_value.get("value", "")
-                            elif not isinstance(text_value, str):
-                                text_value = getattr(text_value, "value", "")
-                            if isinstance(text_value, str):
+                            text_value = _string_value(_item_get(part, "text"))
+                            if text_value is not None:
                                 text_parts.append(text_value)
                 elif item_type == "function_call":
                     tool_calls_raw.append(SimpleNamespace(

@@ -5107,7 +5107,7 @@ class TestCodexAuxiliaryAdapterNullOutputRecovery:
                 "item": {
                     "type": "message",
                     "content": [{
-                        "type": "output_text",
+                        "type": {"value": "output_text"},
                         "text": {"value": "sdk raw survived"},
                     }],
                 },

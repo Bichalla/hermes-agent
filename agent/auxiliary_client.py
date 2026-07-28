@@ -1215,7 +1215,38 @@ class _CodexCompletionsAdapter:
                 # cadence the old in-line ``_check_cancelled()`` used.
                 _check_cancelled()
 
-            event_stream = self._client.responses.create(**stream_kwargs)
+            # The generated ``responses.create(stream=True)`` path casts each
+            # SSE frame to ``ResponseStreamEvent`` before yielding it.  The
+            # consumer Codex backend can legally emit a terminal response with
+            # ``output: null``; that typed cast raises TypeError before our raw
+            # event consumer can recover the already-streamed items and usage.
+            # Use the same OpenAI client's low-level POST with ``object`` casting
+            # so authentication, headers, proxying, and retry policy stay
+            # unchanged while wire-shape drift remains observable as raw JSON.
+            direct_post = getattr(self._client, "post", None)
+            if isinstance(self._client, _load_openai_cls()) and callable(direct_post):
+                from openai import Stream
+                from openai._base_client import make_request_options
+
+                request_body = dict(stream_kwargs)
+                request_timeout = request_body.pop("timeout", None)
+                request_options = (
+                    make_request_options(timeout=request_timeout)
+                    if request_timeout is not None
+                    else make_request_options()
+                )
+                event_stream = direct_post(
+                    "/responses",
+                    body=request_body,
+                    options=request_options,
+                    cast_to=object,
+                    stream=True,
+                    stream_cls=Stream[object],
+                )
+            else:
+                # Compatibility path for light-weight test/third-party clients
+                # that expose only the generated Responses resource.
+                event_stream = self._client.responses.create(**stream_kwargs)
             try:
                 final = _consume_codex_event_stream(
                     event_stream,

@@ -4987,6 +4987,137 @@ class TestCodexAuxiliaryAdapterNullOutputRecovery:
 
         assert response.choices[0].message.content == "aux survived"
 
+    def test_uses_untyped_post_stream_to_avoid_sdk_terminal_null_output_cast(
+        self, monkeypatch,
+    ):
+        """The generated Responses stream casts terminal events before iteration.
+
+        Codex can emit ``response.completed.response.output = null``.  The
+        generated typed stream raises TypeError before our event consumer sees
+        the terminal frame, losing usage and the otherwise complete response.
+        The adapter must request a dict-cast stream from the same OpenAI client.
+        """
+        events = [
+            {
+                "type": "response.output_item.done",
+                "item": {
+                    "type": "message",
+                    "content": [{"type": "output_text", "text": "raw survived"}],
+                },
+            },
+            {
+                "type": "response.completed",
+                "response": {
+                    "status": "completed",
+                    "id": "resp_raw_null_output",
+                    "model": "gpt-5.6-sol",
+                    "output": None,
+                    "usage": {
+                        "input_tokens": 11,
+                        "output_tokens": 7,
+                        "total_tokens": 18,
+                    },
+                },
+            },
+        ]
+
+        class _RawDictStream:
+            def __iter__(self): return iter(events)
+            def close(self): pass
+
+        class _TypedResponses:
+            def create(self, **kwargs):
+                raise TypeError("typed terminal event tried to iterate null output")
+
+        class _Client:
+            base_url = "https://chatgpt.com/backend-api/codex"
+            responses = _TypedResponses()
+
+            def __init__(self):
+                self.post_calls = []
+
+            def post(self, path, **kwargs):
+                self.post_calls.append((path, kwargs))
+                return _RawDictStream()
+
+        client = _Client()
+        monkeypatch.setattr("agent.auxiliary_client._load_openai_cls", lambda: _Client)
+        adapter = _CodexCompletionsAdapter(client, "gpt-5.6-sol")
+
+        response = adapter.create(
+            messages=[{"role": "user", "content": "summarize"}], timeout=60.0,
+        )
+
+        assert response.choices[0].message.content == "raw survived"
+        assert response.usage.prompt_tokens == 11
+        assert response.usage.completion_tokens == 7
+        assert len(client.post_calls) == 1
+        path, kwargs = client.post_calls[0]
+        assert path == "/responses"
+        assert kwargs["cast_to"] is object
+        assert kwargs["stream"] is True
+        assert "timeout" not in kwargs["body"]
+        assert kwargs["options"]["timeout"] == 60.0
+
+    def test_real_openai_sdk_object_stream_preserves_null_output_terminal(self):
+        """Exercise OpenAI 2.x deserialization instead of a fake ``post``."""
+        import httpx
+        from openai import OpenAI
+
+        events = [
+            {
+                "type": "response.output_item.done",
+                "item": {
+                    "type": "message",
+                    "content": [{"type": "output_text", "text": "sdk raw survived"}],
+                },
+            },
+            {
+                "type": "response.completed",
+                "response": {
+                    "status": "completed",
+                    "id": "resp_sdk_raw",
+                    "model": "gpt-5.6-sol",
+                    "output": None,
+                    "usage": {
+                        "input_tokens": 13,
+                        "output_tokens": 5,
+                        "total_tokens": 18,
+                    },
+                },
+            },
+        ]
+        sse = "".join(f"data: {json.dumps(event)}\n\n" for event in events)
+        sse += "data: [DONE]\n\n"
+        seen = {}
+
+        def _handler(request):
+            seen["body"] = json.loads(request.content)
+            return httpx.Response(
+                200,
+                headers={"content-type": "text/event-stream"},
+                text=sse,
+            )
+
+        http_client = httpx.Client(transport=httpx.MockTransport(_handler))
+        client = OpenAI(
+            api_key="offline-test-key",
+            base_url="https://offline.invalid/v1",
+            http_client=http_client,
+        )
+        try:
+            adapter = _CodexCompletionsAdapter(client, "gpt-5.6-sol")
+            response = adapter.create(
+                messages=[{"role": "user", "content": "summarize"}], timeout=60.0,
+            )
+        finally:
+            client.close()
+
+        assert seen["body"]["stream"] is True
+        assert response.choices[0].message.content == "sdk raw survived"
+        assert response.usage.prompt_tokens == 13
+        assert response.usage.completion_tokens == 5
+
     def test_handles_final_output_is_none_after_consumer(self):
         """Regression for #33368 — defense against ``final.output`` being ``None``.
 

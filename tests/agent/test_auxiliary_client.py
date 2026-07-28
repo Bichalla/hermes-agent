@@ -5059,6 +5059,43 @@ class TestCodexAuxiliaryAdapterNullOutputRecovery:
         assert "timeout" not in kwargs["body"]
         assert kwargs["options"]["timeout"] == 60.0
 
+    @pytest.mark.parametrize(
+        ("failure_stage", "expected_message"),
+        (
+            (
+                "request",
+                "Codex auxiliary Responses request construction type error",
+            ),
+            (
+                "stream",
+                "Codex auxiliary Responses stream decoding type error",
+            ),
+        ),
+    )
+    def test_closes_type_error_at_exact_raw_stream_stage(
+        self, monkeypatch, failure_stage, expected_message,
+    ):
+        class _TypeErrorStream:
+            def __iter__(self):
+                raise TypeError("private stream shape")
+
+            def close(self): pass
+
+        class _Client:
+            base_url = "https://chatgpt.com/backend-api/codex"
+            responses = SimpleNamespace()
+
+            def post(self, _path, **_kwargs):
+                if failure_stage == "request":
+                    raise TypeError("private request shape")
+                return _TypeErrorStream()
+
+        monkeypatch.setattr("agent.auxiliary_client._load_openai_cls", lambda: _Client)
+        adapter = _CodexCompletionsAdapter(_Client(), "gpt-5.6-sol")
+
+        with pytest.raises(RuntimeError, match=f"^{expected_message}$"):
+            adapter.create(messages=[{"role": "user", "content": "summarize"}])
+
     def test_real_openai_sdk_object_stream_preserves_null_output_terminal(self):
         """Exercise OpenAI 2.x deserialization instead of a fake ``post``."""
         import httpx

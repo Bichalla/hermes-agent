@@ -1235,24 +1235,39 @@ class _CodexCompletionsAdapter:
                     if request_timeout is not None
                     else make_request_options()
                 )
-                event_stream = direct_post(
-                    "/responses",
-                    body=request_body,
-                    options=request_options,
-                    cast_to=object,
-                    stream=True,
-                    stream_cls=Stream[object],
-                )
+                try:
+                    event_stream = direct_post(
+                        "/responses",
+                        body=request_body,
+                        options=request_options,
+                        cast_to=object,
+                        stream=True,
+                        stream_cls=Stream[object],
+                    )
+                except TypeError as exc:
+                    raise RuntimeError(
+                        "Codex auxiliary Responses request construction type error"
+                    ) from exc
             else:
                 # Compatibility path for light-weight test/third-party clients
                 # that expose only the generated Responses resource.
-                event_stream = self._client.responses.create(**stream_kwargs)
+                try:
+                    event_stream = self._client.responses.create(**stream_kwargs)
+                except TypeError as exc:
+                    raise RuntimeError(
+                        "Codex auxiliary Responses request construction type error"
+                    ) from exc
             try:
-                final = _consume_codex_event_stream(
-                    event_stream,
-                    model=resp_kwargs.get("model"),
-                    on_event=_on_each_event,
-                )
+                try:
+                    final = _consume_codex_event_stream(
+                        event_stream,
+                        model=resp_kwargs.get("model"),
+                        on_event=_on_each_event,
+                    )
+                except TypeError as exc:
+                    raise RuntimeError(
+                        "Codex auxiliary Responses stream decoding type error"
+                    ) from exc
             finally:
                 close_fn = getattr(event_stream, "close", None)
                 if callable(close_fn):

@@ -1183,6 +1183,8 @@ class _CodexCompletionsAdapter:
                 # new failure mode for auxiliary calls.
                 pass
 
+        provider_started = time.monotonic()
+        failure_stage = "request_dispatch"
         try:
             if total_timeout:
                 assert deadline is not None
@@ -1257,6 +1259,7 @@ class _CodexCompletionsAdapter:
                     raise RuntimeError(
                         "Codex auxiliary Responses request construction type error"
                     ) from exc
+            failure_stage = "stream_consumption"
             try:
                 try:
                     final = _consume_codex_event_stream(
@@ -1276,6 +1279,7 @@ class _CodexCompletionsAdapter:
                     except Exception:
                         pass
 
+            failure_stage = "response_normalization"
             if final is None:
                 raise RuntimeError("Codex auxiliary Responses stream did not return a final response")
             terminal_status = getattr(final, "status", None)
@@ -1338,12 +1342,23 @@ class _CodexCompletionsAdapter:
                         or (resp_usage.get("total_tokens", 0) if isinstance(resp_usage, dict) else 0),
                 )
         except Exception as exc:
+            elapsed_ms = round(
+                max(0.0, (time.monotonic() - provider_started) * 1000.0), 3
+            )
             if timed_out.is_set():
+                logger.debug(
+                    "Codex auxiliary Responses API call failed: "
+                    "category=provider_timeout status_code=None stage=%s "
+                    "elapsed_ms=%s timeout_seconds=%s",
+                    failure_stage, elapsed_ms, total_timeout,
+                )
                 raise TimeoutError(_timeout_message()) from exc
             category, status_code = _closed_provider_error_log_fields(exc)
             logger.debug(
-                "Codex auxiliary Responses API call failed: category=%s status_code=%s",
-                category, status_code,
+                "Codex auxiliary Responses API call failed: "
+                "category=%s status_code=%s stage=%s "
+                "elapsed_ms=%s timeout_seconds=%s",
+                category, status_code, failure_stage, elapsed_ms, total_timeout,
             )
             raise
         finally:

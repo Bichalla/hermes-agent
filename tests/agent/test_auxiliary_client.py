@@ -4494,6 +4494,8 @@ class TestCodexAdapterPromptCacheKey:
         assert "req-sensitive-123" not in caplog.text
         assert "category=provider_http_4xx" in caplog.text
         assert "status_code=400" in caplog.text
+        assert "stage=request_dispatch" in caplog.text
+        assert "elapsed_ms=" in caplog.text
 
     def test_cache_key_stable_across_identical_prefix(self):
         """Same instructions + tools → same key (content-addressed, not per-call)."""
@@ -4768,7 +4770,9 @@ class TestCodexAuxiliaryAdapterTimeout:
         assert fake_client.responses.kwargs["stream"] is True
         assert response.choices[0].message.content == "summary"
 
-    def test_enforces_total_timeout_while_stream_keeps_emitting_events(self):
+    def test_enforces_total_timeout_while_stream_keeps_emitting_events(self, caplog):
+        import logging
+
         emitted = []
 
         class _SlowAliveCreateStream:
@@ -4788,15 +4792,19 @@ class TestCodexAuxiliaryAdapterTimeout:
         adapter = _CodexCompletionsAdapter(fake_client, "gpt-5.5")
 
         started = time.monotonic()
-        with pytest.raises(TimeoutError):
-            adapter.create(
-                messages=[{"role": "user", "content": "summarize this"}],
-                timeout=0.05,
-            )
+        with caplog.at_level(logging.DEBUG, logger="agent.auxiliary_client"):
+            with pytest.raises(TimeoutError):
+                adapter.create(
+                    messages=[{"role": "user", "content": "summarize this"}],
+                    timeout=0.05,
+                )
 
         elapsed = time.monotonic() - started
         assert len(emitted) < 5
         assert elapsed < 0.5
+        assert "category=provider_timeout" in caplog.text
+        assert "stage=stream_consumption" in caplog.text
+        assert "timeout_seconds=0.05" in caplog.text
 
     def test_timeout_client_close_failure_log_is_closed_and_redacted(self, caplog, monkeypatch):
         import logging

@@ -8,7 +8,10 @@ subagent task roles as executable Hermes profiles.
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+import hashlib
+import importlib.util
 import json
+from pathlib import Path
 import re
 from typing import Any, Iterable, Optional
 
@@ -38,6 +41,63 @@ SUBAGENT_TASK_ROLES = {
     "quality_reviewer",
 }
 
+CHANGE_GATE_REASON_CODES = frozenset({
+    "CHANGE_GATE_METADATA_MISSING",
+    "CHANGE_GATE_STAGE_INVALID",
+    "CHANGE_GATE_ROLE_INVALID",
+    "CHANGE_GATE_ARTIFACT_MISSING",
+    "CHANGE_GATE_ARTIFACT_NOT_ATTACHED",
+    "CHANGE_GATE_ARTIFACT_UNSAFE",
+    "CHANGE_GATE_DIGEST_MISMATCH",
+    "CHANGE_GATE_SCHEMA_INVALID",
+    "CHANGE_GATE_POLICY_VERSION_MISMATCH",
+    "CHANGE_GATE_EVIDENCE_INVALID",
+    "CHANGE_GATE_BLOCKING_UNKNOWN",
+    "CHANGE_GATE_TASK_MISMATCH",
+    "CHANGE_GATE_PROFILE_MISMATCH",
+    "CHANGE_GATE_MODEL_MISMATCH",
+    "CHANGE_GATE_EFFORT_MISMATCH",
+    "CHANGE_GATE_BOOTSTRAP_NOT_ALLOWED",
+    "CHANGE_GATE_VALIDATOR_UNAVAILABLE",
+})
+_CANONICAL_CHANGE_GATE_ROOT = Path("/Users/honbul/.hermes")
+_CHANGE_GATE_PACKET_LIMIT = 1024 * 1024
+_MISSING = object()
+_validator_module: Any = None
+
+
+@dataclass(frozen=True)
+class ChangeGateMetadata:
+    """Closed operational pointer carried by an implementation contract."""
+
+    stage: str
+    artifact_ref: str
+    artifact_sha256: str
+    role: str
+    review_outcome: Optional[str] = None
+
+
+@dataclass(frozen=True)
+class ChangeGateReadiness:
+    ok: bool
+    reason_codes: list[str] = field(default_factory=list)
+    bootstrap_active: bool = False
+
+
+class ChangeGateBlocked(RuntimeError):
+    """Bounded claim refusal carrying only stable Change Gate reason codes."""
+
+    def __init__(self, reason_codes: str | Iterable[str]):
+        if isinstance(reason_codes, str):
+            codes = [reason_codes]
+        else:
+            codes = list(reason_codes)
+        safe = [code for code in codes if code in CHANGE_GATE_REASON_CODES]
+        if not safe:
+            safe = ["CHANGE_GATE_SCHEMA_INVALID"]
+        self.reason_codes = list(dict.fromkeys(safe))
+        super().__init__(", ".join(self.reason_codes))
+
 
 @dataclass(frozen=True)
 class LaneRoleContract:
@@ -54,6 +114,7 @@ class LaneRoleContract:
     recommended_skills: list[str] = field(default_factory=list)
     subagent_task_role: Optional[str] = None
     review_source_pointer: Optional[str] = None
+    change_gate: Optional[ChangeGateMetadata] = None
     parseable: bool = True
 
 
@@ -145,6 +206,7 @@ def contract_body_has_signal(body: Any) -> bool:
         "recommended_assignee",
         "recommended_skills",
         "subagent_task_role",
+        "change_gate",
     }
     return any(key in parsed for key in contract_keys)
 
@@ -162,12 +224,53 @@ def _first_text(*values: Any) -> Optional[str]:
     return None
 
 
+def _is_clean_text(value: Any) -> bool:
+    return isinstance(value, str) and bool(value.strip()) and value == value.strip()
+
+
 def parse_contract_body(body: Any) -> LaneRoleContract:
     """Parse top-level or conversational-intake-envelope contract metadata."""
     parsed = _body_to_dict(body)
     if parsed is None:
         return LaneRoleContract(parseable=False)
     payload = _contract_payload(parsed)
+    change_gate = None
+    change_gate_parseable = True
+    raw_change_gate = payload.get("change_gate", _MISSING)
+    if raw_change_gate is not _MISSING:
+        if not isinstance(raw_change_gate, dict):
+            change_gate_parseable = False
+        else:
+            allowed_change_gate = {
+                "stage", "artifact_ref", "artifact_sha256", "role", "review_outcome",
+            }
+            required_change_gate = {"stage", "artifact_ref", "artifact_sha256", "role"}
+            invalid_shape = (
+                bool(set(raw_change_gate) - allowed_change_gate)
+                or not required_change_gate.issubset(raw_change_gate)
+                or any(not _is_clean_text(raw_change_gate.get(key)) for key in required_change_gate)
+                or (
+                    "review_outcome" in raw_change_gate
+                    and not _is_clean_text(raw_change_gate["review_outcome"])
+                )
+                or not re.fullmatch(
+                    r"[0-9a-f]{64}",
+                    raw_change_gate.get("artifact_sha256", ""),
+                )
+            )
+            if invalid_shape:
+                change_gate_parseable = False
+            else:
+                change_gate = ChangeGateMetadata(
+                    stage=raw_change_gate["stage"],
+                    artifact_ref=raw_change_gate["artifact_ref"],
+                    artifact_sha256=raw_change_gate["artifact_sha256"],
+                    role=raw_change_gate["role"],
+                    review_outcome=(
+                        raw_change_gate["review_outcome"]
+                        if "review_outcome" in raw_change_gate else None
+                    ),
+                )
     return LaneRoleContract(
         lane=str(payload["lane"]).strip() if payload.get("lane") else None,
         card_type=str(payload.get("type") or payload.get("card_type") or "").strip() or None,
@@ -190,8 +293,149 @@ def parse_contract_body(body: Any) -> LaneRoleContract:
             payload.get("artifact"),
             parsed.get("source_ref") if isinstance(parsed, dict) else None,
         ),
-        parseable=True,
+        change_gate=change_gate,
+        parseable=change_gate_parseable,
     )
+
+
+def _attachment_value(attachment: Any, name: str) -> Any:
+    if isinstance(attachment, dict):
+        return attachment.get(name)
+    return getattr(attachment, name, None)
+
+
+def _load_change_gate_validator() -> Any:
+    """Load the canonical Phase 1 validator without subprocess or HERMES_HOME."""
+    global _validator_module
+    if _validator_module is not None:
+        return _validator_module
+    path = _CANONICAL_CHANGE_GATE_ROOT / "scripts" / "change_gate_validate.py"
+    spec = importlib.util.spec_from_file_location("hermes_change_gate_validator", path)
+    if spec is None or spec.loader is None:
+        raise ImportError("canonical Change Gate validator unavailable")
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    _validator_module = module
+    return module
+
+
+def _map_validator_failure(code: str, handoff: Optional[dict[str, Any]], task: Any) -> str:
+    if code == "POLICY_VERSION_MISMATCH":
+        return "CHANGE_GATE_POLICY_VERSION_MISMATCH"
+    if code == "BLOCKING_UNKNOWN":
+        return "CHANGE_GATE_BLOCKING_UNKNOWN"
+    if code == "TASK_ID_MISMATCH":
+        return "CHANGE_GATE_TASK_MISMATCH"
+    if code == "ARTIFACT_NOT_FOUND":
+        return "CHANGE_GATE_ARTIFACT_MISSING"
+    if code == "INVALID_STATE":
+        return "CHANGE_GATE_STAGE_INVALID"
+    if code == "ROUTE_MISMATCH" and isinstance(handoff, dict):
+        route = handoff.get("execution_route")
+        if not isinstance(route, dict):
+            return "CHANGE_GATE_SCHEMA_INVALID"
+        if route.get("profile") != _task_get(task, "assignee", None):
+            return "CHANGE_GATE_PROFILE_MISMATCH"
+        if route.get("model") != _task_get(task, "model_override", None):
+            return "CHANGE_GATE_MODEL_MISMATCH"
+        if route.get("reasoning_effort") != "xhigh":
+            return "CHANGE_GATE_EFFORT_MISMATCH"
+    if code in {
+        "SCHEMA_VALIDATION_FAILED", "MALFORMED_JSON", "ROOT_NOT_OBJECT", "INVALID_BOOTSTRAP",
+    }:
+        return "CHANGE_GATE_SCHEMA_INVALID"
+    return "CHANGE_GATE_EVIDENCE_INVALID"
+
+
+def check_change_gate_readiness(
+    task: Any,
+    attachments: Iterable[Any],
+    *,
+    attachment_root: Path,
+) -> ChangeGateReadiness:
+    """Pure/read-only readiness adapter for implementation claim authority."""
+    contract = parse_contract_body(_task_get(task, "body", ""))
+    if contract.lane != "implementation":
+        return ChangeGateReadiness(ok=True)
+    if not contract.parseable or contract.change_gate is None:
+        return ChangeGateReadiness(False, ["CHANGE_GATE_METADATA_MISSING"])
+    metadata = contract.change_gate
+    reasons: list[str] = []
+    if metadata.stage != "PLAN_APPROVED":
+        reasons.append("CHANGE_GATE_STAGE_INVALID")
+    if metadata.role != "EXECUTOR":
+        reasons.append("CHANGE_GATE_ROLE_INVALID")
+    if reasons:
+        return ChangeGateReadiness(False, reasons)
+
+    stored_paths = {
+        _attachment_value(attachment, "stored_path")
+        for attachment in attachments
+    }
+    if not metadata.artifact_ref:
+        return ChangeGateReadiness(False, ["CHANGE_GATE_ARTIFACT_MISSING"])
+    if metadata.artifact_ref not in stored_paths:
+        return ChangeGateReadiness(False, ["CHANGE_GATE_ARTIFACT_NOT_ATTACHED"])
+
+    artifact = Path(metadata.artifact_ref)
+    root = Path(attachment_root).resolve()
+    if artifact.is_symlink():
+        return ChangeGateReadiness(False, ["CHANGE_GATE_ARTIFACT_UNSAFE"])
+    if not artifact.exists():
+        return ChangeGateReadiness(False, ["CHANGE_GATE_ARTIFACT_MISSING"])
+    if not artifact.is_file():
+        return ChangeGateReadiness(False, ["CHANGE_GATE_ARTIFACT_UNSAFE"])
+    try:
+        artifact.resolve().relative_to(root)
+    except ValueError:
+        return ChangeGateReadiness(False, ["CHANGE_GATE_ARTIFACT_UNSAFE"])
+
+    try:
+        raw = artifact.read_bytes()
+    except OSError:
+        return ChangeGateReadiness(False, ["CHANGE_GATE_ARTIFACT_UNSAFE"])
+    if len(raw) > _CHANGE_GATE_PACKET_LIMIT:
+        return ChangeGateReadiness(False, ["CHANGE_GATE_ARTIFACT_UNSAFE"])
+    if hashlib.sha256(raw).hexdigest() != metadata.artifact_sha256:
+        return ChangeGateReadiness(False, ["CHANGE_GATE_DIGEST_MISMATCH"])
+    try:
+        handoff = json.loads(raw.decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError):
+        return ChangeGateReadiness(False, ["CHANGE_GATE_SCHEMA_INVALID"])
+    if not isinstance(handoff, dict):
+        return ChangeGateReadiness(False, ["CHANGE_GATE_SCHEMA_INVALID"])
+
+    validator = None
+    try:
+        validator = _load_change_gate_validator()
+        validator.validate_artifact(
+            "handoff",
+            artifact,
+            canonical_root=_CANONICAL_CHANGE_GATE_ROOT,
+            schema_dir=_CANONICAL_CHANGE_GATE_ROOT / "policies/change-gate",
+            policy_path=_CANONICAL_CHANGE_GATE_ROOT / "policies/change-gate/policy.yaml",
+        )
+    except Exception as exc:
+        validation_error = getattr(validator, "ValidationError", None)
+        if validation_error is not None and isinstance(exc, validation_error):
+            return ChangeGateReadiness(False, [_map_validator_failure(getattr(exc, "code", ""), handoff, task)])
+        return ChangeGateReadiness(False, ["CHANGE_GATE_VALIDATOR_UNAVAILABLE"])
+
+    if handoff.get("task_id") != _task_get(task, "id", None):
+        return ChangeGateReadiness(False, ["CHANGE_GATE_TASK_MISMATCH"])
+    route = handoff.get("execution_route")
+    if not isinstance(route, dict):
+        return ChangeGateReadiness(False, ["CHANGE_GATE_SCHEMA_INVALID"])
+    if route.get("profile") != _task_get(task, "assignee", None):
+        return ChangeGateReadiness(False, ["CHANGE_GATE_PROFILE_MISMATCH"])
+    if route.get("model") != _task_get(task, "model_override", None):
+        return ChangeGateReadiness(False, ["CHANGE_GATE_MODEL_MISMATCH"])
+    if route.get("reasoning_effort") != "xhigh":
+        return ChangeGateReadiness(False, ["CHANGE_GATE_EFFORT_MISMATCH"])
+    bootstrap = handoff.get("bootstrap")
+    if isinstance(bootstrap, dict) and bootstrap.get("active") is True:
+        return ChangeGateReadiness(False, ["CHANGE_GATE_BOOTSTRAP_NOT_ALLOWED"], True)
+    return ChangeGateReadiness(ok=True)
 
 
 def _task_skills(task: Any) -> list[str]:
@@ -255,6 +499,14 @@ def ready_check_task(
         missing.append("lane")
     elif contract.lane not in VIRTUAL_LANES:
         errors.append("invalid_lane")
+    if contract.lane == "implementation":
+        if not contract.parseable or contract.change_gate is None:
+            errors.append("CHANGE_GATE_METADATA_MISSING")
+        else:
+            if contract.change_gate.stage != "PLAN_APPROVED":
+                errors.append("CHANGE_GATE_STAGE_INVALID")
+            if contract.change_gate.role != "EXECUTOR":
+                errors.append("CHANGE_GATE_ROLE_INVALID")
     if not contract.card_type:
         missing.append("type")
     if not contract.risk_class:

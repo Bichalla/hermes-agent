@@ -959,6 +959,9 @@ def _handle_create(args: dict, **kw) -> str:
             "assignee is required — name the profile that should execute this "
             "task (the dispatcher will only spawn tasks with an assignee)"
         )
+    model_override = args.get("model")
+    if model_override is not None and not isinstance(model_override, str):
+        return tool_error("model must be a string when provided")
     body = args.get("body")
     parents = args.get("parents") or []
     tenant = args.get("tenant") or os.environ.get("HERMES_TENANT")
@@ -1085,6 +1088,7 @@ def _handle_create(args: dict, **kw) -> str:
                     if max_runtime_seconds is not None else None
                 ),
                 skills=skills,
+                model_override=model_override,
                 goal_mode=goal_mode,
                 goal_max_turns=(
                     int(goal_max_turns) if goal_max_turns is not None else None
@@ -1098,6 +1102,7 @@ def _handle_create(args: dict, **kw) -> str:
             result_fields = {
                 "task_id": new_tid,
                 "status": new_task.status if new_task else None,
+                "model": new_task.model_override if new_task else model_override,
                 "subscribed": subscribed,
             }
             if str(initial_status) == "blocked":
@@ -1630,6 +1635,10 @@ KANBAN_CREATE_SCHEMA = {
                     "Required — tasks without an assignee are never "
                     "dispatched."
                 ),
+            },
+            "model": {
+                "type": "string",
+                "description": "Optional per-task model override; stored as tasks.model_override.",
             },
             "body": {
                 "type": "string",

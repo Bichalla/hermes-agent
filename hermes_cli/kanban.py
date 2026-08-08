@@ -78,6 +78,7 @@ def _task_to_dict(t: kb.Task) -> dict[str, Any]:
         "result": t.result,
         "skills": list(t.skills) if t.skills else [],
         "max_retries": t.max_retries,
+        "model_override": t.model_override,
         "session_id": t.session_id,
         "workflow_template_id": t.workflow_template_id,
         "current_step_key": t.current_step_key,
@@ -334,6 +335,8 @@ def build_parser(parent_subparsers: argparse._SubParsersAction) -> argparse.Argu
                                "and re-queues the task.")
     p_create.add_argument("--created-by", default="user",
                           help="Author name recorded on the task (default: user)")
+    p_create.add_argument("--model", default=None,
+                          help="Optional per-task model override (stored in tasks.model_override)")
     p_create.add_argument("--skill", action="append", default=[], dest="skills",
                           help="Skill to force-load into the worker "
                                "(repeatable). The kanban lifecycle is already "
@@ -1395,6 +1398,7 @@ def _cmd_create(args: argparse.Namespace) -> int:
             idempotency_key=idempotency_key,
             max_runtime_seconds=max_runtime,
             skills=getattr(args, "skills", None) or None,
+            model_override=getattr(args, "model", None),
             max_retries=max_retries,
             goal_mode=bool(getattr(args, "goal_mode", False)),
             goal_max_turns=getattr(args, "goal_max_turns", None),
@@ -1867,7 +1871,14 @@ def _cmd_unlink(args: argparse.Namespace) -> int:
 
 def _cmd_claim(args: argparse.Namespace) -> int:
     with kb.connect_closing() as conn:
-        task = kb.claim_task(conn, args.task_id, ttl_seconds=args.ttl)
+        try:
+            task = kb.claim_task(conn, args.task_id, ttl_seconds=args.ttl)
+        except kb.ChangeGateBlocked as exc:
+            print(
+                f"cannot claim {args.task_id}: {', '.join(exc.reason_codes)}",
+                file=sys.stderr,
+            )
+            return 1
         if task is None:
             # Report why
             existing = kb.get_task(conn, args.task_id)
@@ -2228,6 +2239,7 @@ def _cmd_dispatch(args: argparse.Namespace) -> int:
             ],
             "skipped_unassigned": res.skipped_unassigned,
             "skipped_nonspawnable": res.skipped_nonspawnable,
+            "skipped_change_gate": res.skipped_change_gate,
             "skipped_per_profile_capped": [
                 {"task_id": tid, "assignee": who, "current": current}
                 for (tid, who, current) in res.skipped_per_profile_capped
@@ -2270,6 +2282,12 @@ def _cmd_dispatch(args: argparse.Namespace) -> int:
             f"Skipped (non-spawnable assignee — terminal lane, OK): "
             f"{', '.join(res.skipped_nonspawnable)}"
         )
+    if res.skipped_change_gate:
+        for item in res.skipped_change_gate:
+            print(
+                f"Skipped (Change Gate): {item['task_id']} "
+                f"({', '.join(item['reason_codes'])})"
+            )
     return 0
 
 

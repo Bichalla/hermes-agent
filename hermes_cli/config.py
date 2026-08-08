@@ -973,6 +973,9 @@ def _ensure_hermes_home_managed(home: Path):
 # Config loading/saving
 # =============================================================================
 
+KANBAN_REPO_WRITER_MODES = frozenset({"off", "single_writer"})
+
+
 DEFAULT_CONFIG = {
     "model": "",
     "providers": {},
@@ -1537,8 +1540,6 @@ DEFAULT_CONFIG = {
             "default_status": "blocked",
             "proposal_ttl_seconds": 1800,
             "max_pending_per_session": 1,
-            "short_approval_phrases": ["승인", "ㅇㅇ", "고고", "그렇게 해", "좋아", "진행"],
-            "deny_phrases": ["취소", "ㄴㄴ", "하지마", "보류"],
             "detector": "heuristic",
             "auxiliary_detector_enabled": False,
             "redact_before_auxiliary": True,
@@ -2808,6 +2809,11 @@ DEFAULT_CONFIG = {
     # each claimable ready task. One dispatcher per profile is sufficient;
     # running more than one on the same kanban.db will race for claims.
     "kanban": {
+        # Repository-write topology for project-linked tasks. ``off`` preserves
+        # the historical per-task worktree default. ``single_writer`` makes an
+        # omitted workspace use the project's primary checkout; lock activation
+        # and persisted repository identity are separate, explicit concerns.
+        "repo_writer_mode": "off",
         # Run the dispatcher inside the gateway process. On by default —
         # the cost is ~300µs every `dispatch_interval_seconds` when idle,
         # and gateway is the supervisor users already have. Set to false
@@ -5375,6 +5381,22 @@ def validate_config_structure(config: Optional[Dict[str, Any]] = None) -> List["
             return [ConfigIssue("error", "Could not load config.yaml", "Run 'hermes setup' to create a valid config")]
 
     issues: List[ConfigIssue] = []
+
+    # ── kanban.repo_writer_mode is a closed behavioral enum ──────────────
+    kanban_cfg = config.get("kanban")
+    if isinstance(kanban_cfg, dict) and "repo_writer_mode" in kanban_cfg:
+        raw_repo_writer_mode = kanban_cfg.get("repo_writer_mode")
+        normalized_repo_writer_mode = (
+            str(raw_repo_writer_mode).strip().lower()
+            if isinstance(raw_repo_writer_mode, str)
+            else ""
+        )
+        if normalized_repo_writer_mode not in KANBAN_REPO_WRITER_MODES:
+            issues.append(ConfigIssue(
+                "error",
+                "kanban.repo_writer_mode must be one of: off, single_writer",
+                "Set kanban.repo_writer_mode to 'off' or 'single_writer'",
+            ))
 
     # ── custom_providers must be a list, not a dict ──────────────────────
     cp = config.get("custom_providers")

@@ -109,6 +109,35 @@ def _release_singleton_lock(handle) -> None:
         pass
 
 
+def _repo_busy_task_ids(result: Optional[object]) -> set[str]:
+    """Return only task ids from a board-local repo-busy dispatch result."""
+    if result is None:
+        return set()
+    return {
+        str(item[0])
+        for item in (getattr(result, "skipped_repo_busy", None) or ())
+        if isinstance(item, (tuple, list)) and len(item) >= 1
+    }
+
+
+def _board_has_spawnable_work(kb_module, conn, result: Optional[object]) -> bool:
+    """Classify pending work after excluding this board's repo-busy tasks."""
+    excluded = _repo_busy_task_ids(result)
+    return bool(
+        kb_module.has_spawnable_ready(conn, excluded_task_ids=excluded)
+        or kb_module.has_spawnable_review(conn, excluded_task_ids=excluded)
+    )
+
+
+def _repo_busy_log_summary(
+    board_slug: str,
+    result: Optional[object],
+) -> Optional[tuple[str, int]]:
+    """Return a path-free, bounded per-board repo-busy log summary."""
+    count = len(getattr(result, "skipped_repo_busy", None) or ())
+    return (board_slug, count) if count else None
+
+
 class GatewayKanbanWatchersMixin:
     """Kanban watcher / notifier / dispatcher loops for GatewayRunner."""
 
@@ -1077,7 +1106,9 @@ class GatewayKanbanWatchersMixin:
                 out.append((slug, _tick_once_for_board(slug)))
             return out
 
-        def _ready_nonempty() -> bool:
+        def _ready_nonempty(
+            results: "list[tuple[str, Optional[object]]]",
+        ) -> bool:
             """Cheap probe: is there at least one ready+assigned+unclaimed
             task on ANY board whose assignee maps to a real Hermes profile
             (i.e. one the dispatcher would actually spawn for)?
@@ -1093,14 +1124,15 @@ class GatewayKanbanWatchersMixin:
                 boards = _kb.list_boards(include_archived=False)
             except Exception:
                 boards = [_kb.read_board_metadata(_kb.DEFAULT_BOARD)]
+            result_by_slug = {slug: result for slug, result in (results or [])}
             for b in boards:
                 slug = b.get("slug") or _kb.DEFAULT_BOARD
                 conn = None
                 try:
                     conn = _kb.connect(board=slug)
-                    if _kb.has_spawnable_ready(conn):
-                        return True
-                    if _kb.has_spawnable_review(conn):
+                    if _board_has_spawnable_work(
+                        _kb, conn, result_by_slug.get(slug),
+                    ):
                         return True
                 except Exception:
                     continue
@@ -1250,8 +1282,16 @@ class GatewayKanbanWatchersMixin:
                             res.promoted,
                             len(res.auto_blocked) if hasattr(res.auto_blocked, "__len__") else 0,
                         )
+                    repo_busy_summary = _repo_busy_log_summary(slug, res)
+                    if repo_busy_summary is not None:
+                        busy_board, busy_count = repo_busy_summary
+                        logger.debug(
+                            "kanban dispatcher [%s]: skipped_repo_busy=%d",
+                            busy_board,
+                            busy_count,
+                        )
                 # Health telemetry (aggregate across boards)
-                ready_pending = await asyncio.to_thread(_ready_nonempty)
+                ready_pending = await asyncio.to_thread(_ready_nonempty, results)
                 if ready_pending and not any_spawned:
                     bad_ticks += 1
                 else:

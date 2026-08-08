@@ -71,6 +71,7 @@ new locking.
 from __future__ import annotations
 
 import contextlib
+import errno
 import hashlib
 import json
 import os
@@ -91,6 +92,7 @@ from typing import Any, Iterable, Optional
 
 from hermes_cli.sqlite_util import add_column_if_missing as _add_column_if_missing
 from toolsets import get_toolset_names
+from hermes_cli.repo_writer_context import REPO_WRITER_CONTEXT_ENV
 
 _log = logging.getLogger(__name__)
 
@@ -133,6 +135,8 @@ VALID_BLOCK_KINDS = {"dependency", "needs_input", "capability", "transient"}
 # not dispatcher spawn/crash/timeout failures.
 BLOCK_RECURRENCE_LIMIT = 2
 VALID_WORKSPACE_KINDS = {"scratch", "worktree", "dir"}
+_WORKSPACE_KIND_OMITTED = object()
+REPO_BUSY_REASON = "repo_busy"
 KNOWN_TOOLSET_NAMES = frozenset(name.casefold() for name in get_toolset_names())
 _IS_WINDOWS = sys.platform == "win32"
 KANBAN_ATTACHMENT_MAX_BYTES = 25 * 1024 * 1024
@@ -159,6 +163,10 @@ class StatusMemoryCapabilityError(RuntimeError):
 
 class StatusMemoryIdempotencyConflict(ValueError):
     """An idempotency key was replayed with a different immutable scope."""
+
+
+class RepoBusyError(RuntimeError):
+    """A repository-bound claim cannot safely proceed right now."""
 
 
 def _fire_kanban_lifecycle_hook(event: str, task_id: str, **fields: Any) -> None:
@@ -256,6 +264,22 @@ DEFAULT_CRASH_GRACE_SECONDS = 30
 # conventional "temporary failure, retry later" code, and well clear of the
 # 0/1/2 codes the worker uses for success / generic failure / usage error.
 KANBAN_RATE_LIMIT_EXIT_CODE = 75
+
+# Stable worker sentinel for "the exact repository writer lock was already
+# held". 76 is BSD ``EX_PROTOCOL`` and is deliberately distinct from the
+# worker's 0/1/2 exits and the rate-limit ``EX_TEMPFAIL`` sentinel above.
+KANBAN_REPO_BUSY_EXIT_CODE = 76
+
+# Constant-safe early-startup denial. This is intentionally distinct from the
+# provider rate-limit (75), repository contention (76), and ordinary CLI codes.
+KANBAN_REPO_BOOTSTRAP_DENIED_EXIT_CODE = 77
+
+# Constant-safe results from ``release_worker_for_repo_busy``. Callers can
+# distinguish a newly committed transition from a durable replay without
+# learning which exact precondition rejected a stale/foreign tuple.
+REPO_BUSY_RELEASE_APPLIED = "applied"
+REPO_BUSY_RELEASE_ALREADY_APPLIED = "already_applied"
+REPO_BUSY_RELEASE_REJECTED = "rejected"
 
 
 def _resolve_crash_grace_seconds() -> int:
@@ -880,6 +904,7 @@ class Task:
     tenant: Optional[str]
     branch_name: Optional[str] = None
     project_id: Optional[str] = None
+    repo_identity: Optional[str] = None
     result: Optional[str] = None
     idempotency_key: Optional[str] = None
     # Unified non-success counter. Incremented on any of:
@@ -966,6 +991,9 @@ class Task:
             workspace_path=row["workspace_path"],
             branch_name=row["branch_name"] if "branch_name" in keys else None,
             project_id=row["project_id"] if "project_id" in keys else None,
+            repo_identity=(
+                row["repo_identity"] if "repo_identity" in keys else None
+            ),
             claim_lock=row["claim_lock"],
             claim_expires=row["claim_expires"],
             tenant=row["tenant"] if "tenant" in keys else None,
@@ -1135,6 +1163,9 @@ CREATE TABLE IF NOT EXISTS tasks (
     -- the task's worktree is anchored under the project's primary repo with a
     -- deterministic branch name instead of a random wt/<task-id> fallback.
     project_id           TEXT,
+    -- Stable repository identity supplied by an internal caller. NULL when the
+    -- task is not repository-bound or predates repository writer coordination.
+    repo_identity        TEXT,
     claim_lock           TEXT,
     claim_expires        INTEGER,
     tenant               TEXT,
@@ -1887,6 +1918,10 @@ def _migrate_add_optional_columns(conn: sqlite3.Connection) -> None:
         _add_column_if_missing(conn, "tasks", "branch_name", "branch_name TEXT")
     if "project_id" not in cols:
         _add_column_if_missing(conn, "tasks", "project_id", "project_id TEXT")
+    if "repo_identity" not in cols:
+        _add_column_if_missing(
+            conn, "tasks", "repo_identity", "repo_identity TEXT"
+        )
     if "idempotency_key" not in cols:
         _add_column_if_missing(
             conn, "tasks", "idempotency_key", "idempotency_key TEXT"
@@ -2407,6 +2442,18 @@ def _canonical_assignee(assignee: Optional[str]) -> Optional[str]:
     return normalize_profile_name(assignee)
 
 
+def _repo_writer_mode() -> str:
+    """Return the closed, fail-safe repository writer mode from config.yaml."""
+    try:
+        from hermes_cli.config import KANBAN_REPO_WRITER_MODES, load_config
+
+        raw = load_config().get("kanban", {}).get("repo_writer_mode", "off")
+        mode = str(raw).strip().lower() if isinstance(raw, str) else "off"
+        return mode if mode in KANBAN_REPO_WRITER_MODES else "off"
+    except Exception:
+        return "off"
+
+
 def create_task(
     conn: sqlite3.Connection,
     *,
@@ -2414,7 +2461,7 @@ def create_task(
     body: Optional[str] = None,
     assignee: Optional[str] = None,
     created_by: Optional[str] = None,
-    workspace_kind: str = "scratch",
+    workspace_kind: str | None | object = _WORKSPACE_KIND_OMITTED,
     workspace_path: Optional[str] = None,
     branch_name: Optional[str] = None,
     tenant: Optional[str] = None,
@@ -2431,6 +2478,7 @@ def create_task(
     session_id: Optional[str] = None,
     board: Optional[str] = None,
     project_id: Optional[str] = None,
+    repo_identity: Optional[str] = None,
 ) -> str:
     """Create a new task and optionally link it under parent tasks.
 
@@ -2462,6 +2510,14 @@ def create_task(
         raise ValueError(
             f"initial_status must be one of {sorted(VALID_INITIAL_STATUSES)}"
         )
+    workspace_kind_omitted = (
+        workspace_kind is _WORKSPACE_KIND_OMITTED or workspace_kind is None
+    )
+    if workspace_kind_omitted:
+        # Keep omission distinguishable until after an optional Project has
+        # resolved. ``None`` is accepted as the legacy tool-call spelling of
+        # omission; it has never been a member of the public workspace enum.
+        workspace_kind = "scratch"
     if workspace_kind not in VALID_WORKSPACE_KINDS:
         raise ValueError(
             f"workspace_kind must be one of {sorted(VALID_WORKSPACE_KINDS)}, "
@@ -2502,8 +2558,14 @@ def create_task(
             # Canonicalise (a slug may have been passed) and anchor the
             # worktree under the project's primary repo.
             project_id = project_obj.id
-            if workspace_kind == "scratch" and project_obj.primary_path:
-                workspace_kind = "worktree"
+            if workspace_kind_omitted and project_obj.primary_path:
+                if _repo_writer_mode() == "single_writer":
+                    workspace_kind = "dir"
+                    workspace_path = str(project_obj.primary_path)
+                else:
+                    # Default-OFF parity: omitted project work keeps the
+                    # historical deterministic per-task worktree behavior.
+                    workspace_kind = "worktree"
             if (
                 workspace_kind == "worktree"
                 and workspace_path is None
@@ -2664,10 +2726,10 @@ def create_task(
                     INSERT INTO tasks (
                         id, title, body, assignee, status, priority,
                         created_by, created_at, workspace_kind, workspace_path,
-                        branch_name, project_id, tenant, idempotency_key,
+                        branch_name, project_id, repo_identity, tenant, idempotency_key,
                         max_runtime_seconds,
                         skills, max_retries, goal_mode, goal_max_turns, session_id
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     """,
                     (
                         task_id,
@@ -2682,6 +2744,7 @@ def create_task(
                         workspace_path,
                         branch_name,
                         project_id,
+                        repo_identity,
                         tenant,
                         idempotency_key,
                         int(max_runtime_seconds) if max_runtime_seconds is not None else None,
@@ -3360,6 +3423,252 @@ def _append_event(
     )
 
 
+def _append_repo_busy_event_bounded(
+    conn: sqlite3.Connection,
+    task_id: str,
+    repo_identity: str,
+) -> bool:
+    """Append one durable ``repo_busy`` signal per task/identity window.
+
+    Called inside the dispatcher's write transaction. The latest persisted
+    event is the dedup owner, so process restarts cannot reset the bound. A
+    different repository identity is a new condition and emits immediately.
+    Returns whether a row was appended.
+    """
+    now = int(time.time())
+    latest = conn.execute(
+        "SELECT payload, created_at FROM task_events "
+        "WHERE task_id = ? AND kind = 'repo_busy' "
+        "ORDER BY id DESC LIMIT 1",
+        (task_id,),
+    ).fetchone()
+    if latest is not None:
+        try:
+            payload = json.loads(latest["payload"] or "{}")
+        except (TypeError, ValueError, json.JSONDecodeError):
+            payload = {}
+        if (
+            payload.get("repo_identity") == repo_identity
+            and now - int(latest["created_at"] or 0)
+            < REPO_BUSY_EVENT_COOLDOWN_SECONDS
+        ):
+            return False
+    _append_event(
+        conn,
+        task_id,
+        "repo_busy",
+        {"repo_identity": repo_identity},
+    )
+    return True
+
+
+class _RepoBusyReleaseCASMismatch(RuntimeError):
+    """Internal rollback signal for an unexpectedly lost exact CAS."""
+
+
+def _repo_busy_release_inputs_valid(
+    task_id: object,
+    run_id: object,
+    claim_lock: object,
+    repo_identity: object,
+) -> bool:
+    """Validate lifecycle capabilities without coercion or disclosure."""
+    return bool(
+        isinstance(task_id, str)
+        and task_id == task_id.strip()
+        and 0 < len(task_id) <= 256
+        and "\x00" not in task_id
+        and isinstance(run_id, int)
+        and not isinstance(run_id, bool)
+        and run_id > 0
+        and isinstance(claim_lock, str)
+        and claim_lock == claim_lock.strip()
+        and 0 < len(claim_lock) <= 1024
+        and "\x00" not in claim_lock
+        and isinstance(repo_identity, str)
+        and _VALID_REPO_IDENTITY_RE.fullmatch(repo_identity)
+    )
+
+
+def _repo_busy_release_metadata(claim_lock: str, repo_identity: str) -> dict:
+    """Return restart-stable, path-free evidence for an exact release tuple."""
+    claim_digest = hashlib.sha256(claim_lock.encode("utf-8")).hexdigest()
+    return {
+        "reason": REPO_BUSY_REASON,
+        "repo_identity": repo_identity,
+        "claim_lock_sha256": claim_digest,
+    }
+
+
+def _repo_busy_release_already_applied(
+    conn: sqlite3.Connection,
+    *,
+    task_row: sqlite3.Row,
+    run_row: sqlite3.Row,
+    task_id: str,
+    run_id: int,
+    claim_lock: str,
+    repo_identity: str,
+) -> bool:
+    """Recognize only the complete durable state produced by this exact tuple."""
+    if not (
+        task_row["status"] == "ready"
+        and task_row["current_run_id"] is None
+        and task_row["claim_lock"] is None
+        and task_row["claim_expires"] is None
+        and task_row["worker_pid"] is None
+        and task_row["repo_identity"] == repo_identity
+        and run_row["task_id"] == task_id
+        and run_row["status"] == REPO_BUSY_REASON
+        and run_row["outcome"] == REPO_BUSY_REASON
+        and run_row["ended_at"] is not None
+        and run_row["claim_lock"] is None
+        and run_row["claim_expires"] is None
+        and run_row["worker_pid"] is None
+        and run_row["summary"] == REPO_BUSY_REASON
+        and run_row["error"] is None
+    ):
+        return False
+    try:
+        metadata = json.loads(run_row["metadata"] or "null")
+    except (TypeError, ValueError, json.JSONDecodeError):
+        return False
+    if metadata != _repo_busy_release_metadata(claim_lock, repo_identity):
+        return False
+    event_payload = json.dumps(
+        {"reason": REPO_BUSY_REASON, "repo_identity": repo_identity},
+        ensure_ascii=False,
+    )
+    event_count = conn.execute(
+        "SELECT COUNT(*) FROM task_events "
+        "WHERE task_id = ? AND run_id = ? AND kind = 'repo_busy' AND payload = ?",
+        (task_id, run_id, event_payload),
+    ).fetchone()[0]
+    return int(event_count) == 1
+
+
+def _release_worker_for_repo_busy_in_txn(
+    conn: sqlite3.Connection,
+    *,
+    task_id: object,
+    run_id: object,
+    claim_lock: object,
+    repo_identity: object,
+) -> str:
+    """Transaction-local implementation; caller must hold ``BEGIN IMMEDIATE``."""
+    if not _repo_busy_release_inputs_valid(
+        task_id, run_id, claim_lock, repo_identity
+    ):
+        return REPO_BUSY_RELEASE_REJECTED
+    assert isinstance(task_id, str)
+    assert isinstance(run_id, int) and not isinstance(run_id, bool)
+    assert isinstance(claim_lock, str)
+    assert isinstance(repo_identity, str)
+
+    task_row = conn.execute(
+        "SELECT status, current_run_id, claim_lock, claim_expires, worker_pid, "
+        "repo_identity FROM tasks WHERE id = ?",
+        (task_id,),
+    ).fetchone()
+    run_row = conn.execute(
+        "SELECT task_id, status, outcome, ended_at, claim_lock, claim_expires, "
+        "worker_pid, summary, metadata, error FROM task_runs WHERE id = ?",
+        (run_id,),
+    ).fetchone()
+    if task_row is None or run_row is None:
+        return REPO_BUSY_RELEASE_REJECTED
+    if _repo_busy_release_already_applied(
+        conn,
+        task_row=task_row,
+        run_row=run_row,
+        task_id=task_id,
+        run_id=run_id,
+        claim_lock=claim_lock,
+        repo_identity=repo_identity,
+    ):
+        return REPO_BUSY_RELEASE_ALREADY_APPLIED
+
+    if not (
+        task_row["status"] == "running"
+        and task_row["current_run_id"] == run_id
+        and task_row["claim_lock"] == claim_lock
+        and task_row["repo_identity"] == repo_identity
+        and run_row["task_id"] == task_id
+        and run_row["status"] == "running"
+        and run_row["claim_lock"] == claim_lock
+        and run_row["ended_at"] is None
+    ):
+        return REPO_BUSY_RELEASE_REJECTED
+
+    now = int(time.time())
+    metadata_json = json.dumps(
+        _repo_busy_release_metadata(claim_lock, repo_identity),
+        ensure_ascii=False,
+    )
+    run_cur = conn.execute(
+        """
+        UPDATE task_runs
+           SET status = 'repo_busy', outcome = 'repo_busy', ended_at = ?,
+               summary = 'repo_busy', metadata = ?, error = NULL,
+               claim_lock = NULL, claim_expires = NULL, worker_pid = NULL
+         WHERE id = ? AND task_id = ? AND status = 'running'
+           AND claim_lock = ? AND ended_at IS NULL
+        """,
+        (now, metadata_json, run_id, task_id, claim_lock),
+    )
+    if run_cur.rowcount != 1:
+        raise _RepoBusyReleaseCASMismatch
+    task_cur = conn.execute(
+        """
+        UPDATE tasks
+           SET status = 'ready', claim_lock = NULL, claim_expires = NULL,
+               worker_pid = NULL, current_run_id = NULL
+         WHERE id = ? AND status = 'running' AND current_run_id = ?
+           AND claim_lock = ? AND repo_identity = ?
+        """,
+        (task_id, run_id, claim_lock, repo_identity),
+    )
+    if task_cur.rowcount != 1:
+        raise _RepoBusyReleaseCASMismatch
+    _append_event(
+        conn,
+        task_id,
+        "repo_busy",
+        {"reason": REPO_BUSY_REASON, "repo_identity": repo_identity},
+        run_id=run_id,
+    )
+    return REPO_BUSY_RELEASE_APPLIED
+
+
+def release_worker_for_repo_busy(
+    conn: sqlite3.Connection,
+    *,
+    task_id: str,
+    run_id: int,
+    claim_lock: str,
+    repo_identity: str,
+) -> str:
+    """Durably release one exact running worker because its repo is busy.
+
+    Every task/run precondition and both state updates are owned by one
+    ``BEGIN IMMEDIATE`` transaction. Malformed, stale, or foreign tuples all
+    return the same constant-safe rejection without changing rows or events.
+    An exact replay is recognized from hashed claim evidence after restart and
+    returns ``already_applied`` without appending a second event.
+    """
+    try:
+        with write_txn(conn):
+            return _release_worker_for_repo_busy_in_txn(
+                conn,
+                task_id=task_id,
+                run_id=run_id,
+                claim_lock=claim_lock,
+                repo_identity=repo_identity,
+            )
+    except _RepoBusyReleaseCASMismatch:
+        return REPO_BUSY_RELEASE_REJECTED
+
+
 def _end_run(
     conn: sqlite3.Connection,
     task_id: str,
@@ -3614,6 +3923,7 @@ def claim_task(
     *,
     ttl_seconds: Optional[int] = None,
     claimer: Optional[str] = None,
+    _repo_aware: bool = False,
 ) -> Optional[Task]:
     """Atomically transition ``ready -> running``.
 
@@ -3624,6 +3934,8 @@ def claim_task(
     lock = claimer or _claimer_id()
     expires = now + _resolve_claim_ttl_seconds(ttl_seconds)
     with write_txn(conn):
+        if _repo_aware:
+            _deny_repo_busy_claim(conn, task_id, expected_status="ready")
         # Structural invariant: never transition ready -> running while any
         # parent is not yet 'done'. This is the single enforcement point
         # regardless of which writer (create_task, link_tasks, unblock_task,
@@ -3730,12 +4042,36 @@ def claim_task(
     return claimed
 
 
+def claim_task_for_manual_writer(
+    conn: sqlite3.Connection,
+    task_id: str,
+    *,
+    ttl_seconds: Optional[int] = None,
+    claimer: Optional[str] = None,
+) -> Optional[Task]:
+    """Claim manually after the atomic single-writer repository precheck.
+
+    The precheck is part of ``claim_task``'s IMMEDIATE transaction, before its
+    ordinary ready-to-running CAS. The non-blocking process-lock acquisition is
+    availability evidence only; the worker-held transaction lock remains a
+    separate authority boundary.
+    """
+    return claim_task(
+        conn,
+        task_id,
+        ttl_seconds=ttl_seconds,
+        claimer=claimer,
+        _repo_aware=True,
+    )
+
+
 def claim_review_task(
     conn: sqlite3.Connection,
     task_id: str,
     *,
     ttl_seconds: Optional[int] = None,
     claimer: Optional[str] = None,
+    _repo_aware: bool = False,
 ) -> Optional[Task]:
     """Atomically transition ``review -> running``.
 
@@ -3753,6 +4089,8 @@ def claim_review_task(
     lock = claimer or _claimer_id()
     expires = now + _resolve_claim_ttl_seconds(ttl_seconds)
     with write_txn(conn):
+        if _repo_aware:
+            _deny_repo_busy_claim(conn, task_id, expected_status="review")
         cur = conn.execute(
             """
             UPDATE tasks
@@ -6138,6 +6476,12 @@ _RESPAWN_GUARD_SUCCESS_WINDOW = 3600  # 1 hour
 # for operators who want a tighter/looser probe cadence.
 DEFAULT_RATE_LIMIT_COOLDOWN_SECONDS = 300  # 5 minutes
 
+# Repeated dispatcher ticks can observe the same ready task blocked by the
+# same repository writer for hours. Keep that durable signal useful without
+# appending one identical event per tick. A changed identity emits
+# immediately; an unchanged identity may emit again after this bounded window.
+REPO_BUSY_EVENT_COOLDOWN_SECONDS = 300
+
 # Within this window a GitHub PR URL in a comment blocks re-spawn.
 _RESPAWN_GUARD_PR_WINDOW = 86400  # 24 hours
 
@@ -6180,6 +6524,12 @@ class DispatchResult:
     subsequent tick when the assignee has capacity. Separate bucket so
     telemetry / dashboards can show "this profile is busy" vs
     "task is genuinely stuck"."""
+    skipped_repo_busy: list[tuple[str, str]] = field(default_factory=list)
+    """Repository-bound tasks deferred by ``single_writer`` accounting.
+
+    Each stable pair is ``(task_id, repo_identity)``. This is projected in
+    dry-run mode too, but dry runs do not persist identities or emit events.
+    """
     crashed: list[str] = field(default_factory=list)
     """Task ids reclaimed because their worker PID disappeared."""
     auto_blocked: list[str] = field(default_factory=list)
@@ -6258,6 +6608,10 @@ def _classify_worker_exit(pid: int) -> "tuple[str, Optional[int]]":
       provider rate-limited / exhausted quota, NOT because the task failed.
       ``detect_crashed_workers`` releases the task back to ``ready`` without
       counting a failure, so a long quota window can't trip the breaker.
+    * ``"repo_busy"`` — ``WIFEXITED`` with status
+      ``KANBAN_REPO_BUSY_EXIT_CODE``. The bootstrap could not acquire its
+      repository writer lock; the reaper applies the exact durable repo-busy
+      lifecycle transition instead of crash/failure accounting.
     * ``"nonzero_exit"`` — ``WIFEXITED`` with non-zero status. Real error.
     * ``"signaled"`` — ``WIFSIGNALED`` (OOM killer, SIGKILL, etc). Real crash.
     * ``"unknown"`` — pid was not in the reap registry (either reaped by
@@ -6265,8 +6619,8 @@ def _classify_worker_exit(pid: int) -> "tuple[str, Optional[int]]":
       back to existing crashed-counter behavior.
 
     ``code`` is the exit status (for ``clean_exit`` / ``rate_limited`` /
-    ``nonzero_exit``) or the signal number (for ``signaled``), or ``None``
-    for ``unknown``.
+    ``repo_busy`` / ``nonzero_exit``) or the signal number (for ``signaled``),
+    or ``None`` for ``unknown``.
     """
     entry = _recent_worker_exits.get(int(pid))
     if entry is None:
@@ -6279,6 +6633,8 @@ def _classify_worker_exit(pid: int) -> "tuple[str, Optional[int]]":
                 return ("clean_exit", 0)
             if code == KANBAN_RATE_LIMIT_EXIT_CODE:
                 return ("rate_limited", code)
+            if code == KANBAN_REPO_BUSY_EXIT_CODE:
+                return ("repo_busy", code)
             return ("nonzero_exit", code)
         if os.WIFSIGNALED(raw):
             return ("signaled", os.WTERMSIG(raw))
@@ -6903,9 +7259,17 @@ def detect_crashed_workers(conn: sqlite3.Connection) -> list[str]:
     ``check_respawn_guard`` defers their respawn until the window clears.
     The ids are returned via the ``_last_rate_limited`` function attribute
     (the public return stays the crashed-only ``list[str]``).
+
+    Exit 76 is the restart/reaper fallback for a bootstrap that could not
+    acquire the repository writer lock. If the task and current run still
+    carry the exact claim and repository identity, the same durable repo-busy
+    CAS used by bootstrap runs here. It neither becomes a generic crash nor
+    changes failure counters/error history. A bootstrap that already committed
+    the transition left no running PID row, so the reaper is a no-op.
     """
     crashed: list[str] = []
     rate_limited: list[str] = []
+    repo_busy: list[str] = []
     # Per-crash details collected inside the main txn, used after it
     # closes to run ``_record_task_failure`` (which needs its own
     # write_txn so can't nest). ``protocol_violation`` flags the
@@ -6916,7 +7280,8 @@ def detect_crashed_workers(conn: sqlite3.Connection) -> list[str]:
     # (task_id, pid, claimer, protocol_violation, error_text)
     with write_txn(conn):
         rows = conn.execute(
-            "SELECT id, worker_pid, claim_lock, started_at FROM tasks "
+            "SELECT id, worker_pid, claim_lock, started_at, current_run_id, "
+            "repo_identity FROM tasks "
             "WHERE status = 'running' AND worker_pid IS NOT NULL"
         ).fetchall()
         host_prefix = f"{_claimer_id().split(':', 1)[0]}:"
@@ -6938,6 +7303,23 @@ def detect_crashed_workers(conn: sqlite3.Connection) -> list[str]:
 
             pid = int(row["worker_pid"])
             kind, code = _classify_worker_exit(pid)
+            if kind == "repo_busy":
+                release_status = _release_worker_for_repo_busy_in_txn(
+                    conn,
+                    task_id=row["id"],
+                    run_id=row["current_run_id"],
+                    claim_lock=row["claim_lock"],
+                    repo_identity=row["repo_identity"],
+                )
+                if release_status in {
+                    REPO_BUSY_RELEASE_APPLIED,
+                    REPO_BUSY_RELEASE_ALREADY_APPLIED,
+                }:
+                    repo_busy.append(row["id"])
+                    continue
+                # An inconsistent/malformed legacy row cannot satisfy the
+                # exact repo-busy authority. Preserve the historical generic
+                # dead-worker fallback rather than stranding it as running.
             rate_limited_exit = False
             if kind == "clean_exit":
                 # Worker subprocess returned 0 but its task is still
@@ -7143,6 +7525,9 @@ def detect_crashed_workers(conn: sqlite3.Connection) -> list[str]:
     # Same side-channel for rate-limited requeues — these did NOT count a
     # failure and are NOT crashes, so they stay out of the ``crashed`` return.
     detect_crashed_workers._last_rate_limited = rate_limited  # type: ignore[attr-defined]
+    # Repo-busy releases are also neutral, but distinct from provider quota
+    # throttles and ordinary queue-time repo deferrals.
+    detect_crashed_workers._last_repo_busy = repo_busy  # type: ignore[attr-defined]
     return crashed
 
 
@@ -7328,25 +7713,75 @@ def _record_spawn_failure(
     )
 
 
-def _set_worker_pid(conn: sqlite3.Connection, task_id: str, pid: int) -> None:
-    """Record the spawned child's pid + emit a ``spawned`` event.
+class _WorkerPidCASMismatch(RuntimeError):
+    """Internal rollback signal for an unexpectedly lost worker PID CAS."""
 
-    The event's payload carries the pid so a human reading ``hermes kanban
-    tail`` can correlate log lines with OS-level traces without opening
-    the drawer.
+
+def _set_worker_pid(
+    conn: sqlite3.Connection,
+    task_id: str,
+    pid: int,
+    *,
+    run_id: int,
+    claim_lock: str,
+) -> bool:
+    """Record one exact active child's PID on its task and run atomically.
+
+    The claimed task's ``task_id`` / ``current_run_id`` / ``claim_lock`` tuple
+    is the authority. A child may finish or release the run before ``spawn``
+    returns its PID; in that normal race this exact CAS returns ``False`` and
+    leaves the child's terminal lifecycle untouched. Both PID rows and the one
+    run-linked ``spawned`` event commit together or all roll back.
+
+    Authority must come from the exact claim generation that spawned the
+    child. Malformed explicit authority is a no-op; this function never infers
+    authority from whichever generation happens to be current at call time.
     """
-    with write_txn(conn):
-        conn.execute(
-            "UPDATE tasks SET worker_pid = ? WHERE id = ?",
-            (int(pid), task_id),
-        )
-        run_id = _current_run_id(conn, task_id)
-        if run_id is not None:
-            conn.execute(
-                "UPDATE task_runs SET worker_pid = ? WHERE id = ?",
-                (int(pid), run_id),
+    if not (
+        isinstance(run_id, int)
+        and not isinstance(run_id, bool)
+        and run_id > 0
+        and isinstance(claim_lock, str)
+        and bool(claim_lock)
+    ):
+        return False
+    worker_pid = int(pid)
+    try:
+        with write_txn(conn):
+            task_cur = conn.execute(
+                """
+                UPDATE tasks
+                   SET worker_pid = ?
+                 WHERE id = ? AND status = 'running'
+                   AND current_run_id = ? AND claim_lock = ?
+                   AND worker_pid IS NULL
+                """,
+                (worker_pid, task_id, run_id, claim_lock),
             )
-        _append_event(conn, task_id, "spawned", {"pid": int(pid)}, run_id=run_id)
+            if task_cur.rowcount != 1:
+                raise _WorkerPidCASMismatch
+            run_cur = conn.execute(
+                """
+                UPDATE task_runs
+                   SET worker_pid = ?
+                 WHERE id = ? AND task_id = ? AND status = 'running'
+                   AND claim_lock = ? AND ended_at IS NULL
+                   AND worker_pid IS NULL
+                """,
+                (worker_pid, run_id, task_id, claim_lock),
+            )
+            if run_cur.rowcount != 1:
+                raise _WorkerPidCASMismatch
+            _append_event(
+                conn,
+                task_id,
+                "spawned",
+                {"pid": worker_pid},
+                run_id=run_id,
+            )
+    except _WorkerPidCASMismatch:
+        return False
+    return True
 
 
 def _clear_failure_counter(conn: sqlite3.Connection, task_id: str) -> None:
@@ -7506,7 +7941,10 @@ def check_respawn_guard(conn: sqlite3.Connection, task_id: str) -> Optional[str]
     return None
 
 
-def has_spawnable_ready(conn: sqlite3.Connection) -> bool:
+def has_spawnable_ready(
+    conn: sqlite3.Connection,
+    excluded_task_ids: Optional[Iterable[str]] = None,
+) -> bool:
     """Return True iff there is at least one ready+assigned+unclaimed task
     whose assignee maps to a real Hermes profile.
 
@@ -7518,13 +7956,21 @@ def has_spawnable_ready(conn: sqlite3.Connection) -> bool:
 
     Falls back to "any ready+assigned" if ``profile_exists`` is not
     importable (e.g. partial install) — preserves the old behavior so
-    the warning still fires in degraded environments.
+    the warning still fires in degraded environments. ``excluded_task_ids``
+    removes board-local normal deferrals (currently repository-busy tasks)
+    from the health probe; omission preserves the historical query.
     """
-    rows = conn.execute(
+    excluded = sorted({str(task_id) for task_id in (excluded_task_ids or ())})
+    sql = (
         "SELECT DISTINCT assignee FROM tasks "
         "WHERE status = 'ready' AND assignee IS NOT NULL "
         "    AND claim_lock IS NULL"
-    ).fetchall()
+    )
+    params: list[str] = []
+    if excluded:
+        sql += f" AND id NOT IN ({','.join('?' for _ in excluded)})"
+        params.extend(excluded)
+    rows = conn.execute(sql, params).fetchall()
     if not rows:
         return False
     try:
@@ -7538,19 +7984,29 @@ def has_spawnable_ready(conn: sqlite3.Connection) -> bool:
     return False
 
 
-def has_spawnable_review(conn: sqlite3.Connection) -> bool:
+def has_spawnable_review(
+    conn: sqlite3.Connection,
+    excluded_task_ids: Optional[Iterable[str]] = None,
+) -> bool:
     """Return True iff there is at least one review+assigned+unclaimed task
     whose assignee maps to a real Hermes profile.
 
     Mirror of :func:`has_spawnable_ready` for the review column —
     used by the health telemetry to decide whether the dispatcher
-    should have spawned a review agent.
+    should have spawned a review agent. Optional exclusions have the same
+    board-local semantics as the ready probe.
     """
-    rows = conn.execute(
+    excluded = sorted({str(task_id) for task_id in (excluded_task_ids or ())})
+    sql = (
         "SELECT DISTINCT assignee FROM tasks "
         "WHERE status = 'review' AND assignee IS NOT NULL "
         "    AND claim_lock IS NULL"
-    ).fetchall()
+    )
+    params: list[str] = []
+    if excluded:
+        sql += f" AND id NOT IN ({','.join('?' for _ in excluded)})"
+        params.extend(excluded)
+    rows = conn.execute(sql, params).fetchall()
     if not rows:
         return False
     try:
@@ -7561,6 +8017,738 @@ def has_spawnable_review(conn: sqlite3.Connection) -> bool:
         if profile_exists(row["assignee"]):
             return True
     return False
+
+
+_VALID_REPO_IDENTITY_RE = re.compile(r"[0-9a-f]{64}\Z")
+
+
+@dataclass(frozen=True)
+class WorkerRepoAuthority:
+    """Read-only repository authority resolved from one exact running claim."""
+
+    workspace_path: Path
+    repo_identity: str
+
+
+def _worker_repo_authority_inputs_valid(
+    task_id: object,
+    run_id: object,
+    claim_lock: object,
+) -> bool:
+    """Validate bootstrap capabilities without coercion or disclosure."""
+    return bool(
+        isinstance(task_id, str)
+        and task_id == task_id.strip()
+        and 0 < len(task_id) <= 256
+        and "\x00" not in task_id
+        and isinstance(run_id, int)
+        and not isinstance(run_id, bool)
+        and 0 < run_id <= 9223372036854775807
+        and isinstance(claim_lock, str)
+        and claim_lock == claim_lock.strip()
+        and 0 < len(claim_lock) <= 1024
+        and "\x00" not in claim_lock
+    )
+
+
+def resolve_worker_repo_authority(
+    db_path: str | os.PathLike[str],
+    *,
+    task_id: object,
+    run_id: object,
+    claim_lock: object,
+) -> Optional[WorkerRepoAuthority]:
+    """Resolve one exact running worker's repository authority read-only.
+
+    The database is opened with SQLite ``mode=ro`` and no schema initialization,
+    migration, pragma mutation, or lifecycle hook. All malformed, stale,
+    foreign, unusable-workspace, and schema/IO failures collapse to ``None``.
+    The caller receives only the workspace path read from the task row and its
+    expected repository identity; environment workspace/lock paths are never
+    consulted.
+    """
+    if not _worker_repo_authority_inputs_valid(task_id, run_id, claim_lock):
+        return None
+    assert isinstance(task_id, str)
+    assert isinstance(run_id, int) and not isinstance(run_id, bool)
+    assert isinstance(claim_lock, str)
+
+    conn: Optional[sqlite3.Connection] = None
+    try:
+        resolved_db = Path(db_path).expanduser().resolve(strict=True)
+        if not resolved_db.is_file():
+            return None
+        conn = sqlite3.connect(
+            f"{resolved_db.as_uri()}?mode=ro",
+            uri=True,
+            timeout=1.0,
+        )
+        conn.row_factory = sqlite3.Row
+        row = conn.execute(
+            """
+            SELECT t.workspace_kind, t.workspace_path, t.repo_identity
+              FROM tasks AS t
+              JOIN task_runs AS r
+                ON r.id = t.current_run_id AND r.task_id = t.id
+             WHERE t.id = ?
+               AND t.status = 'running'
+               AND t.current_run_id = ?
+               AND t.claim_lock = ?
+               AND r.id = ?
+               AND r.task_id = ?
+               AND r.status = 'running'
+               AND r.claim_lock = ?
+               AND r.ended_at IS NULL
+            """,
+            (task_id, run_id, claim_lock, run_id, task_id, claim_lock),
+        ).fetchone()
+        if row is None or row["workspace_kind"] not in {"dir", "worktree"}:
+            return None
+        identity = row["repo_identity"]
+        if not isinstance(identity, str) or not _VALID_REPO_IDENTITY_RE.fullmatch(
+            identity
+        ):
+            return None
+        raw_workspace = row["workspace_path"]
+        if not isinstance(raw_workspace, str) or not raw_workspace:
+            return None
+        workspace = Path(raw_workspace).expanduser()
+        if not workspace.is_absolute():
+            return None
+        workspace = workspace.resolve(strict=True)
+        if not workspace.is_dir():
+            return None
+        return WorkerRepoAuthority(
+            workspace_path=workspace,
+            repo_identity=identity,
+        )
+    except (OSError, RuntimeError, TypeError, ValueError, sqlite3.Error):
+        return None
+    finally:
+        if conn is not None:
+            conn.close()
+
+
+class _RepoAccountingUnavailable(RuntimeError):
+    """A repository-bound task cannot be safely accounted this tick."""
+
+    def __init__(self, reason: str, *, repo_identity: Optional[str] = None) -> None:
+        super().__init__(reason)
+        self.repo_identity = repo_identity
+
+
+def _task_repo_primary_path(task: Task) -> Optional[Path]:
+    """Best-effort lookup of a linked Project's existing primary path."""
+    if not task.project_id:
+        return None
+    try:
+        from hermes_cli import projects_db as _pdb
+
+        with _pdb.connect_closing() as project_conn:
+            project = _pdb.get_project(project_conn, task.project_id)
+        if project is not None and project.primary_path:
+            path = Path(project.primary_path).expanduser()
+            if path.exists() and path.is_dir():
+                return path
+    except Exception:
+        pass
+    return None
+
+
+def _task_repo_candidates(
+    task: Task,
+    *,
+    allow_project_primary_fallback: bool = True,
+) -> list[Path]:
+    """Return paths proving Git identity, optionally consulting Projects."""
+    candidates: list[Path] = []
+    if task.workspace_path:
+        workspace = Path(task.workspace_path).expanduser()
+        if workspace.exists() and workspace.is_dir():
+            candidates.append(workspace)
+        else:
+            # Legacy project worktrees persist ``<primary>/.worktrees/<id>``
+            # before that leaf exists. Use the nearest existing parent only as
+            # a Git discovery start; RepoWriteLock independently proves the
+            # actual common-directory identity before probing.
+            for parent in workspace.parents:
+                if parent.exists() and parent.is_dir():
+                    candidates.append(parent)
+                    break
+    if allow_project_primary_fallback:
+        primary = _task_repo_primary_path(task)
+        if primary is not None and primary not in candidates:
+            candidates.append(primary)
+    return candidates
+
+
+def _resolve_task_repo_identity(
+    conn: sqlite3.Connection,
+    task: Task,
+    *,
+    persist: bool = True,
+    allow_project_primary_fallback: bool = True,
+) -> Optional[str]:
+    """Resolve and optionally persist repository accounting for ``task``.
+
+    Scratch work is deliberately unaccounted. A stored non-NULL identity is
+    authoritative only when it is a canonical lowercase SHA-256 value;
+    malformed values fail closed rather than being silently replaced. Legacy
+    NULL rows derive from an existing workspace first, then (when explicitly
+    allowed) a linked Project's existing primary path. Dry-run callers disable
+    that fallback so this resolution cannot open or initialize projects.db.
+    Git common-directory discovery is delegated to Task 1's
+    :func:`repo_identity`, which collapses linked worktrees and symlinks.
+    """
+    if (task.workspace_kind or "scratch") == "scratch":
+        return None
+    if task.repo_identity is not None:
+        if isinstance(task.repo_identity, str) and _VALID_REPO_IDENTITY_RE.fullmatch(
+            task.repo_identity
+        ):
+            return task.repo_identity
+        raise _RepoAccountingUnavailable("malformed repo_identity")
+
+    from hermes_cli.repo_write_lock import repo_identity
+
+    identity: Optional[str] = None
+    for path in _task_repo_candidates(
+        task,
+        allow_project_primary_fallback=allow_project_primary_fallback,
+    ):
+        try:
+            identity = repo_identity(path)
+            break
+        except Exception:
+            continue
+    if identity is None or not _VALID_REPO_IDENTITY_RE.fullmatch(identity):
+        raise _RepoAccountingUnavailable("repo identity unavailable")
+
+    if persist:
+        if conn.in_transaction:
+            conn.execute(
+                "UPDATE tasks SET repo_identity = ? "
+                "WHERE id = ? AND repo_identity IS NULL",
+                (identity, task.id),
+            )
+        else:
+            with write_txn(conn):
+                conn.execute(
+                    "UPDATE tasks SET repo_identity = ? "
+                    "WHERE id = ? AND repo_identity IS NULL",
+                    (identity, task.id),
+                )
+        task.repo_identity = identity
+    return identity
+
+
+def _seed_busy_repo_identities(
+    conn: sqlite3.Connection,
+    *,
+    persist: bool,
+    allow_project_primary_fallback: bool = True,
+) -> tuple[set[str], bool]:
+    """Return running repository identities and whether any were unknowable."""
+    busy: set[str] = set()
+    uncertain = False
+    rows = conn.execute(
+        "SELECT id FROM tasks WHERE status = 'running' ORDER BY id ASC"
+    ).fetchall()
+    for row in rows:
+        task = get_task(conn, row["id"])
+        if task is None or (task.workspace_kind or "scratch") == "scratch":
+            continue
+        try:
+            identity = _resolve_task_repo_identity(
+                conn,
+                task,
+                persist=persist,
+                allow_project_primary_fallback=allow_project_primary_fallback,
+            )
+        except _RepoAccountingUnavailable:
+            # We cannot know which repository this running writer owns. Fail
+            # closed for repository-bound candidates, while scratch remains
+            # free to run because it cannot collide with a repository writer.
+            uncertain = True
+            continue
+        if identity is not None:
+            busy.add(identity)
+    return busy, uncertain
+
+
+def _probe_task_repo_lock(task: Task, identity: str) -> bool:
+    """Return whether another process holds the task's repository lock.
+
+    A successful non-blocking acquire is released immediately and is only
+    availability evidence. Any identity, security, ownership, or OS-operation
+    uncertainty fails closed through ``_RepoAccountingUnavailable``.
+    """
+    from hermes_cli.repo_write_lock import (
+        RepoIdentityError,
+        RepoLockBusy,
+        RepoLockError,
+        RepoWriteLock,
+    )
+
+    for path in _task_repo_candidates(task):
+        try:
+            probe = RepoWriteLock(path, blocking=False)
+        except RepoIdentityError:
+            continue
+        except (RepoLockError, OSError, RuntimeError, TypeError, ValueError):
+            raise _RepoAccountingUnavailable("repo lock unavailable") from None
+        if probe.identity != identity:
+            continue
+        try:
+            probe.acquire()
+        except RepoLockBusy:
+            return True
+        except (RepoLockError, OSError, RuntimeError):
+            raise _RepoAccountingUnavailable("repo lock unavailable") from None
+        try:
+            probe.release()
+        except (RepoLockError, OSError, RuntimeError):
+            raise _RepoAccountingUnavailable("repo lock unavailable") from None
+        return False
+    raise _RepoAccountingUnavailable("repo lock path unavailable")
+
+
+def _probe_existing_repo_lock_read_only(identity: str) -> bool:
+    """Observe an existing Task 1 lock leaf without filesystem mutation.
+
+    This dry-run-only probe intentionally couples to Task 1's private lock-root,
+    secure-flag, and validation authority. Keeping that authority in
+    ``repo_write_lock`` avoids a second hard-coded namespace or divergent
+    owner/mode rules while its mutating open/create path remains untouched.
+    Missing roots and leaves mean unlocked; every other uncertainty fails
+    closed through a constant-safe typed exception.
+    """
+    import hermes_cli.repo_write_lock as rwl
+
+    directory_fd: int | None = None
+    leaf_fd: int | None = None
+    acquired = False
+    busy = False
+    missing = False
+    failed = False
+    try:
+        rwl._require_posix()
+        if (
+            not _VALID_REPO_IDENTITY_RE.fullmatch(identity)
+            or rwl.fcntl is None
+            or any(
+                not hasattr(os, flag)
+                for flag in ("O_DIRECTORY", "O_NOFOLLOW", "O_CLOEXEC")
+            )
+        ):
+            raise rwl.RepoLockSecurityError("repo_lock_security_violation")
+        root = rwl._lock_root()
+        if not root.is_absolute() or len(root.parts) < 2:
+            raise rwl.RepoLockSecurityError("repo_lock_security_violation")
+
+        directory_flags = rwl._secure_flags(directory=True)
+        directory_fd = os.open(os.sep, directory_flags)
+        os.set_inheritable(directory_fd, False)
+        for component in root.parts[1:]:
+            try:
+                next_fd = os.open(component, directory_flags, dir_fd=directory_fd)
+            except FileNotFoundError:
+                missing = True
+                break
+            os.set_inheritable(next_fd, False)
+            if not rwl._best_effort_close(directory_fd):
+                directory_fd = next_fd
+                raise OSError
+            directory_fd = next_fd
+
+        if not missing:
+            rwl._validate_root(directory_fd)
+            # Task 1's leaf flags carry its NOFOLLOW/CLOEXEC/NONBLOCK policy.
+            # Strip O_RDWR to make the existing-leaf observation O_RDONLY;
+            # never add O_CREAT, O_TRUNC, or any write operation.
+            leaf_flags = rwl._secure_flags() & ~os.O_ACCMODE
+            try:
+                leaf_fd = os.open(
+                    f"{identity}.lock",
+                    leaf_flags,
+                    dir_fd=directory_fd,
+                )
+            except FileNotFoundError:
+                missing = True
+            if not missing:
+                assert leaf_fd is not None
+                os.set_inheritable(leaf_fd, False)
+                rwl._validate_leaf(leaf_fd)
+                try:
+                    rwl.fcntl.flock(
+                        leaf_fd,
+                        rwl.fcntl.LOCK_EX | rwl.fcntl.LOCK_NB,
+                    )
+                except OSError as exc:
+                    if exc.errno in (errno.EACCES, errno.EAGAIN, errno.EWOULDBLOCK):
+                        busy = True
+                    else:
+                        raise
+                else:
+                    acquired = True
+                    if not rwl._best_effort_unlock(leaf_fd):
+                        raise OSError
+                    acquired = False
+    except (
+        rwl.RepoLockError,
+        OSError,
+        RuntimeError,
+        TypeError,
+        ValueError,
+    ):
+        failed = True
+    finally:
+        if acquired and leaf_fd is not None:
+            failed = not rwl._best_effort_unlock(leaf_fd) or failed
+        if leaf_fd is not None:
+            failed = not rwl._best_effort_close(leaf_fd) or failed
+        if directory_fd is not None:
+            failed = not rwl._best_effort_close(directory_fd) or failed
+    if failed:
+        raise _RepoAccountingUnavailable(
+            "repo lock unavailable", repo_identity=identity,
+        ) from None
+    return False if missing else busy
+
+
+def _repo_busy_for_task(
+    conn: sqlite3.Connection,
+    task: Task,
+    *,
+    persist: bool,
+    busy_identities: Optional[set[str]] = None,
+    running_identity_uncertain: Optional[bool] = None,
+    read_only_probe: bool = False,
+) -> tuple[Optional[str], bool]:
+    """Combine same-board running ownership with the process-lock probe."""
+    if (task.workspace_kind or "scratch") == "scratch":
+        return None, False
+    identity = _resolve_task_repo_identity(
+        conn,
+        task,
+        persist=persist,
+        allow_project_primary_fallback=not read_only_probe,
+    )
+    if busy_identities is None or running_identity_uncertain is None:
+        busy_identities, running_identity_uncertain = _seed_busy_repo_identities(
+            conn,
+            persist=persist,
+            allow_project_primary_fallback=not read_only_probe,
+        )
+    if identity is None:
+        raise _RepoAccountingUnavailable("repo identity unavailable")
+    if running_identity_uncertain or identity in busy_identities:
+        return identity, True
+    if read_only_probe:
+        return identity, _probe_existing_repo_lock_read_only(identity)
+    return identity, _probe_task_repo_lock(task, identity)
+
+
+def _deny_repo_busy_claim(
+    conn: sqlite3.Connection,
+    task_id: str,
+    *,
+    expected_status: str,
+) -> None:
+    """Raise a constant-safe denial before an eligible claim mutation."""
+    if _repo_writer_mode() != "single_writer":
+        return
+    task = get_task(conn, task_id)
+    # Preserve ordinary claim diagnostics for missing, wrong-status, or already
+    # claimed tasks. Only a claim that could otherwise proceed is repo-checked.
+    if (
+        task is None
+        or task.status != expected_status
+        or task.claim_lock is not None
+    ):
+        return
+    try:
+        _identity, busy = _repo_busy_for_task(conn, task, persist=True)
+    except _RepoAccountingUnavailable:
+        busy = True
+    if busy:
+        raise RepoBusyError(REPO_BUSY_REASON)
+
+
+def _invoke_dispatch_spawn(spawn, task: Task, workspace: str, board: Optional[str]):
+    """Call a dispatcher spawn hook while preserving its legacy signatures."""
+    import inspect
+
+    try:
+        sig = inspect.signature(spawn)
+    except (TypeError, ValueError):
+        supports_board = False
+    else:
+        supports_board = "board" in sig.parameters
+
+    if supports_board:
+        return spawn(task, workspace, board=board)
+    return spawn(task, workspace)
+
+
+def _dispatch_single_writer_queue(
+    conn: sqlite3.Connection,
+    result: DispatchResult,
+    *,
+    spawn_fn,
+    ttl_seconds: Optional[int],
+    dry_run: bool,
+    max_spawn: Optional[int],
+    max_in_progress: Optional[int],
+    failure_limit: int,
+    board: Optional[str],
+    default_assignee: Optional[str],
+    max_in_progress_per_profile: Optional[int],
+) -> DispatchResult:
+    """Dispatch one combined ready/review queue with projected repo ownership."""
+    busy_identities, running_identity_uncertain = _seed_busy_repo_identities(
+        conn,
+        persist=not dry_run,
+        allow_project_primary_fallback=not dry_run,
+    )
+    rows = conn.execute(
+        "SELECT id, assignee, status FROM tasks "
+        "WHERE status IN ('ready', 'review') AND claim_lock IS NULL "
+        "ORDER BY priority DESC, created_at ASC, "
+        "CASE status WHEN 'ready' THEN 0 ELSE 1 END ASC, id ASC"
+    ).fetchall()
+    if not rows:
+        return result
+
+    running_count = int(
+        conn.execute("SELECT COUNT(*) FROM tasks WHERE status = 'running'").fetchone()[0]
+    )
+    global_ceiling: Optional[int] = None
+    for configured in (max_spawn, max_in_progress):
+        if configured is not None:
+            global_ceiling = (
+                int(configured)
+                if global_ceiling is None
+                else min(global_ceiling, int(configured))
+            )
+    if global_ceiling is not None and running_count >= global_ceiling:
+        return result
+
+    per_profile_cap = (
+        max_in_progress_per_profile
+        if isinstance(max_in_progress_per_profile, int)
+        and max_in_progress_per_profile > 0
+        else None
+    )
+    per_profile_running: dict[str, int] = {}
+    if per_profile_cap is not None:
+        for profile_row in conn.execute(
+            "SELECT assignee, COUNT(*) AS n FROM tasks "
+            "WHERE status = 'running' AND assignee IS NOT NULL GROUP BY assignee"
+        ):
+            per_profile_running[profile_row["assignee"]] = int(profile_row["n"])
+
+    configured_default = (default_assignee or "").strip() or None
+    default_exists = False
+    if configured_default:
+        try:
+            from hermes_cli.profiles import profile_exists as _profile_exists
+
+            default_exists = bool(_profile_exists(configured_default))
+        except Exception:
+            default_exists = True
+
+    projected_or_spawned = 0
+    for row in rows:
+        if (
+            global_ceiling is not None
+            and running_count + projected_or_spawned >= global_ceiling
+        ):
+            break
+        status = row["status"]
+        assignee = row["assignee"]
+        if not assignee:
+            if status == "ready" and configured_default and default_exists:
+                if not dry_run:
+                    try:
+                        with write_txn(conn):
+                            conn.execute(
+                                "UPDATE tasks SET assignee = ? WHERE id = ? "
+                                "AND (assignee IS NULL OR assignee = '')",
+                                (configured_default, row["id"]),
+                            )
+                            _append_event(
+                                conn, row["id"], "assigned",
+                                {
+                                    "assignee": configured_default,
+                                    "source": "kanban.default_assignee",
+                                },
+                            )
+                    except Exception:
+                        result.skipped_unassigned.append(row["id"])
+                        continue
+                assignee = configured_default
+                result.auto_assigned_default.append(row["id"])
+            else:
+                result.skipped_unassigned.append(row["id"])
+                continue
+
+        try:
+            from hermes_cli.profiles import profile_exists
+        except Exception:
+            profile_exists = None  # type: ignore[assignment]
+        if profile_exists is not None and not profile_exists(assignee):
+            result.skipped_nonspawnable.append(row["id"])
+            continue
+
+        if per_profile_cap is not None:
+            current = per_profile_running.get(assignee, 0)
+            if current >= per_profile_cap:
+                result.skipped_per_profile_capped.append(
+                    (row["id"], assignee, current)
+                )
+                continue
+
+        if status == "ready":
+            guard_reason = check_respawn_guard(conn, row["id"])
+            if guard_reason is not None:
+                result.respawn_guarded.append((row["id"], guard_reason))
+                if not dry_run:
+                    with write_txn(conn):
+                        _append_event(
+                            conn, row["id"], "respawn_guarded",
+                            {"reason": guard_reason},
+                        )
+                continue
+
+        task = get_task(conn, row["id"])
+        if task is None:
+            continue
+        try:
+            identity, repo_busy = _repo_busy_for_task(
+                conn,
+                task,
+                persist=not dry_run,
+                busy_identities=busy_identities,
+                running_identity_uncertain=running_identity_uncertain,
+                read_only_probe=dry_run,
+            )
+        except _RepoAccountingUnavailable as exc:
+            identity = (
+                exc.repo_identity
+                if isinstance(exc.repo_identity, str)
+                and _VALID_REPO_IDENTITY_RE.fullmatch(exc.repo_identity)
+                else task.repo_identity
+                if isinstance(task.repo_identity, str)
+                and _VALID_REPO_IDENTITY_RE.fullmatch(task.repo_identity)
+                else None
+            )
+            if identity is None:
+                continue
+            repo_busy = identity is not None
+        if identity is not None and repo_busy:
+            result.skipped_repo_busy.append((task.id, identity))
+            if not dry_run:
+                with write_txn(conn):
+                    _append_repo_busy_event_bounded(conn, task.id, identity)
+            continue
+
+        if dry_run:
+            result.spawned.append((task.id, assignee, ""))
+            projected_or_spawned += 1
+            if identity is not None:
+                busy_identities.add(identity)
+            if per_profile_cap is not None:
+                per_profile_running[assignee] = per_profile_running.get(assignee, 0) + 1
+            continue
+
+        try:
+            claimed = (
+                claim_task(
+                    conn, task.id, ttl_seconds=ttl_seconds, _repo_aware=True,
+                )
+                if status == "ready"
+                else claim_review_task(
+                    conn, task.id, ttl_seconds=ttl_seconds, _repo_aware=True,
+                )
+            )
+        except RepoBusyError:
+            # The preliminary queue check is only an ordering optimization.
+            # This claim-local check owns the invariant: BEGIN IMMEDIATE keeps
+            # the running-repo read and status CAS in one write transaction.
+            if identity is not None:
+                item = (task.id, identity)
+                if item not in result.skipped_repo_busy:
+                    result.skipped_repo_busy.append(item)
+                with write_txn(conn):
+                    _append_repo_busy_event_bounded(conn, task.id, identity)
+            continue
+        if claimed is None:
+            continue
+        claimed_run_id = claimed.current_run_id
+        claimed_lock = claimed.claim_lock
+        assert claimed_run_id is not None
+        assert claimed_lock is not None
+        try:
+            resolved_branch_name = None
+            if claimed.workspace_kind == "worktree":
+                workspace, resolved_branch_name = _resolve_worktree_workspace(
+                    claimed, board=board,
+                )
+            else:
+                workspace = resolve_workspace(claimed, board=board)
+        except Exception as exc:
+            auto = _record_spawn_failure(
+                conn, claimed.id, f"workspace: {exc}", failure_limit=failure_limit,
+            )
+            if auto:
+                result.auto_blocked.append(claimed.id)
+            continue
+
+        set_workspace_path(conn, claimed.id, str(workspace))
+        if claimed.workspace_kind == "worktree":
+            set_branch_name(
+                conn,
+                claimed.id,
+                resolved_branch_name
+                or (claimed.branch_name or "").strip()
+                or f"wt/{claimed.id}",
+            )
+        _maybe_emit_scratch_tip(conn, claimed.id, claimed.workspace_kind)
+        if status == "review":
+            claimed.skills = ["sdlc-review"]
+        spawn = spawn_fn if spawn_fn is not None else _default_spawn
+        try:
+            pid = _invoke_dispatch_spawn(spawn, claimed, str(workspace), board)
+            if pid and not _set_worker_pid(
+                conn,
+                claimed.id,
+                int(pid),
+                run_id=claimed_run_id,
+                claim_lock=claimed_lock,
+            ):
+                # The child won the lifecycle race (completed, blocked, or
+                # released repo-busy) before spawn returned its PID. That is a
+                # normal outcome: do not project capacity/ownership or report a
+                # spawn failure for a worker that already settled its run.
+                continue
+            result.spawned.append(
+                (claimed.id, claimed.assignee or "", str(workspace))
+            )
+            projected_or_spawned += 1
+            if identity is not None:
+                busy_identities.add(identity)
+            if per_profile_cap is not None and claimed.assignee:
+                per_profile_running[claimed.assignee] = (
+                    per_profile_running.get(claimed.assignee, 0) + 1
+                )
+        except Exception as exc:
+            auto = _record_spawn_failure(
+                conn, claimed.id, str(exc), failure_limit=failure_limit,
+            )
+            if auto:
+                result.auto_blocked.append(claimed.id)
+    return result
 
 
 def dispatch_once(
@@ -7592,6 +8780,24 @@ def dispatch_once(
     boards tick in parallel. See :func:`_dispatch_tick_lock` for the
     cross-process / cross-platform mechanics.
     """
+    # Single-writer dry runs are read-only queue projections, so they neither
+    # need board writer serialization nor may open/create ``<db>.dispatch.lock``.
+    # Mode-off retains the historical board-lock path below unchanged.
+    if dry_run and _repo_writer_mode() == "single_writer":
+        return _dispatch_once_locked(
+            conn,
+            spawn_fn=spawn_fn,
+            ttl_seconds=ttl_seconds,
+            dry_run=True,
+            max_spawn=max_spawn,
+            max_in_progress=max_in_progress,
+            failure_limit=failure_limit,
+            stale_timeout_seconds=stale_timeout_seconds,
+            board=board,
+            default_assignee=default_assignee,
+            max_in_progress_per_profile=max_in_progress_per_profile,
+        )
+
     try:
         db_path = kanban_db_path(board=board)
     except Exception:
@@ -7671,6 +8877,26 @@ def _dispatch_once_locked(
     ``board`` pins workspace/log/db resolution for this tick to a specific
     board. When omitted, the current-board resolution chain is used.
     """
+    # A single-writer dry run is a pure queue projection. Enter that path
+    # before zombie reaping and every DB-maintenance routine: those operations
+    # reclaim/close runs, emit events, promote dependencies, or touch process
+    # state and therefore are not observations. Mode-off dry runs deliberately
+    # retain their historical maintenance behavior below.
+    if dry_run and _repo_writer_mode() == "single_writer":
+        return _dispatch_single_writer_queue(
+            conn,
+            DispatchResult(),
+            spawn_fn=spawn_fn,
+            ttl_seconds=ttl_seconds,
+            dry_run=True,
+            max_spawn=max_spawn,
+            max_in_progress=max_in_progress,
+            failure_limit=failure_limit,
+            board=board,
+            default_assignee=default_assignee,
+            max_in_progress_per_profile=max_in_progress_per_profile,
+        )
+
     # Reap zombie children from previously spawned workers. See
     # reap_worker_zombies() for the full rationale.
     reap_worker_zombies()
@@ -7699,6 +8925,24 @@ def _dispatch_once_locked(
         result.rate_limited.extend(_crash_rate_limited)
     result.timed_out = enforce_max_runtime(conn)
     result.promoted = recompute_ready(conn, failure_limit=failure_limit)
+
+    # Task 3A: only the explicit single-writer mode opts into unified
+    # ready/review ordering and repository ownership. The historical loops
+    # below remain byte-for-byte behaviorally available when the mode is off.
+    if _repo_writer_mode() == "single_writer":
+        return _dispatch_single_writer_queue(
+            conn,
+            result,
+            spawn_fn=spawn_fn,
+            ttl_seconds=ttl_seconds,
+            dry_run=dry_run,
+            max_spawn=max_spawn,
+            max_in_progress=max_in_progress,
+            failure_limit=failure_limit,
+            board=board,
+            default_assignee=default_assignee,
+            max_in_progress_per_profile=max_in_progress_per_profile,
+        )
 
     # Count tasks already running so max_spawn enforces concurrency rather
     # than a per-tick spawn budget. See the docstring above for the full
@@ -7889,6 +9133,10 @@ def _dispatch_once_locked(
         claimed = claim_task(conn, row["id"], ttl_seconds=ttl_seconds)
         if claimed is None:
             continue
+        claimed_run_id = claimed.current_run_id
+        claimed_lock = claimed.claim_lock
+        assert claimed_run_id is not None
+        assert claimed_lock is not None
         try:
             resolved_branch_name = None
             if claimed.workspace_kind == "worktree":
@@ -7922,8 +9170,16 @@ def _dispatch_once_locked(
                     pid = _spawn(claimed, str(workspace))
             except (TypeError, ValueError):
                 pid = _spawn(claimed, str(workspace))
-            if pid:
-                _set_worker_pid(conn, claimed.id, int(pid))
+            if pid and not _set_worker_pid(
+                conn,
+                claimed.id,
+                int(pid),
+                run_id=claimed_run_id,
+                claim_lock=claimed_lock,
+            ):
+                # Child settled the exact run before the parent observed its
+                # PID. Do not count capacity or turn this into spawn_failed.
+                continue
             # NOTE: we intentionally do NOT reset consecutive_failures
             # here. A successful spawn proves the worker can start but
             # doesn't prove the run will succeed. Under unified
@@ -7981,6 +9237,10 @@ def _dispatch_once_locked(
         claimed = claim_review_task(conn, row["id"], ttl_seconds=ttl_seconds)
         if claimed is None:
             continue
+        claimed_run_id = claimed.current_run_id
+        claimed_lock = claimed.claim_lock
+        assert claimed_run_id is not None
+        assert claimed_lock is not None
         try:
             resolved_branch_name = None
             if claimed.workspace_kind == "worktree":
@@ -8017,8 +9277,16 @@ def _dispatch_once_locked(
                     pid = _spawn(claimed, str(workspace))
             except (TypeError, ValueError):
                 pid = _spawn(claimed, str(workspace))
-            if pid:
-                _set_worker_pid(conn, claimed.id, int(pid))
+            if pid and not _set_worker_pid(
+                conn,
+                claimed.id,
+                int(pid),
+                run_id=claimed_run_id,
+                claim_lock=claimed_lock,
+            ):
+                # Child settled the exact review run before the parent observed
+                # its PID. This is lifecycle progress, not a spawn failure.
+                continue
             result.spawned.append((claimed.id, claimed.assignee or "", str(workspace)))
             spawned += 1
         except Exception as exc:
@@ -8315,12 +9583,35 @@ def _default_spawn(
     if not task.assignee:
         raise ValueError(f"task {task.id} has no assignee")
 
+    # Dispatcher config is the sole mode authority. Snapshot it before profile
+    # resolution changes the child HERMES_HOME; the assignee may neither
+    # activate nor cancel repository locking through its own config.
+    dispatcher_repo_writer_mode = _repo_writer_mode()
+    bootstrap_repo_lock = (
+        dispatcher_repo_writer_mode == "single_writer"
+        and task.workspace_kind in {"dir", "worktree"}
+    )
+    if bootstrap_repo_lock and not (
+        _worker_repo_authority_inputs_valid(
+            task.id,
+            task.current_run_id,
+            task.claim_lock,
+        )
+        and isinstance(task.repo_identity, str)
+        and _VALID_REPO_IDENTITY_RE.fullmatch(task.repo_identity)
+    ):
+        raise RuntimeError("repo_worker_bootstrap_authority_invalid")
+
     from hermes_cli.profiles import normalize_profile_name
 
     profile_arg = normalize_profile_name(task.assignee)
 
     prompt = f"work kanban task {task.id}"
     env = dict(os.environ)
+    # Never forward a caller's/bootstrap parent's capability markers. The
+    # exact dispatcher claim below is the only authority allowed to add them.
+    env.pop("HERMES_KANBAN_REPO_LOCK_BOOTSTRAP", None)
+    env.pop(REPO_WRITER_CONTEXT_ENV, None)
 
     # Inject HERMES_HOME so the worker reads the profile-scoped config.yaml
     # (fallback_providers, toolsets, agent settings, etc.) instead of the root
@@ -8364,6 +9655,14 @@ def _default_spawn(
         env["HERMES_KANBAN_RUN_ID"] = str(task.current_run_id)
     if task.claim_lock:
         env["HERMES_KANBAN_CLAIM_LOCK"] = task.claim_lock
+    if bootstrap_repo_lock:
+        # Internal one-shot capability: dispatcher mode and its complete exact
+        # task/run/claim/repository tuple are the only activation authority.
+        # The child consumes this before dotenv/logging/plugin startup.
+        env["HERMES_KANBAN_REPO_LOCK_BOOTSTRAP"] = "1"
+        # Persistent restriction context for the worker lifetime. This grants
+        # no write authority; it only narrows high-bypass tool capabilities.
+        env[REPO_WRITER_CONTEXT_ENV] = "1"
     # Goal-loop mode: the worker reads these and wraps its run in the
     # Ralph-style /goal judge loop (see cli.py quiet-mode path). Only set
     # when enabled so non-goal tasks keep a clean env.

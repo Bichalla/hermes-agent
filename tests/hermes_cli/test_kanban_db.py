@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
+import ast
 import concurrent.futures
+import inspect
 import os
 import sqlite3
 import subprocess
@@ -88,6 +90,162 @@ def test_init_creates_expected_tables(kanban_home):
         ).fetchall()
     names = {r["name"] for r in rows}
     assert {"tasks", "task_links", "task_comments", "task_events"} <= names
+
+
+def test_repo_identity_fresh_schema_and_existing_create_default_to_null(kanban_home):
+    repo_identity_schema_contract_missing = "repo_identity_schema_contract_missing"
+
+    with kb.connect() as conn:
+        column = {
+            row["name"]: row for row in conn.execute("PRAGMA table_info(tasks)")
+        }.get("repo_identity")
+        task_id = kb.create_task(conn, title="legacy caller stays nullable")
+        task = kb.get_task(conn, task_id)
+        stored = conn.execute(
+            "SELECT repo_identity FROM tasks WHERE id = ?", (task_id,)
+        ).fetchone()
+
+    assert column is not None, repo_identity_schema_contract_missing
+    assert column["type"].upper() == "TEXT"
+    assert column["notnull"] == 0
+    assert column["dflt_value"] is None
+    assert task is not None
+    assert task.repo_identity is None
+    assert stored["repo_identity"] is None
+
+
+def test_repo_identity_create_read_and_reopen_persistence(tmp_path):
+    repo_identity_schema_contract_missing = "repo_identity_schema_contract_missing"
+    db_path = tmp_path / "repo-identity.db"
+    identity = "a" * 64
+
+    with kb.connect(db_path) as conn:
+        task_id = kb.create_task(
+            conn,
+            title="persist repository identity",
+            repo_identity=identity,
+        )
+        assert kb.get_task(conn, task_id).repo_identity == identity, (
+            repo_identity_schema_contract_missing
+        )
+        assert kb.list_tasks(conn)[0].repo_identity == identity
+
+    kb._INITIALIZED_PATHS.discard(str(db_path.resolve()))
+    with kb.connect(db_path) as reopened:
+        assert kb.get_task(reopened, task_id).repo_identity == identity
+
+
+def test_repo_identity_legacy_migration_is_additive_and_idempotent(tmp_path):
+    repo_identity_schema_contract_missing = "repo_identity_schema_contract_missing"
+    db_path = tmp_path / "legacy-repo-identity.db"
+    legacy = sqlite3.connect(str(db_path))
+    legacy.execute(
+        """
+        CREATE TABLE tasks (
+            id TEXT PRIMARY KEY,
+            title TEXT NOT NULL,
+            body TEXT,
+            assignee TEXT,
+            status TEXT NOT NULL,
+            priority INTEGER NOT NULL DEFAULT 0,
+            created_by TEXT,
+            created_at INTEGER NOT NULL,
+            started_at INTEGER,
+            completed_at INTEGER,
+            workspace_kind TEXT NOT NULL DEFAULT 'scratch',
+            workspace_path TEXT,
+            claim_lock TEXT,
+            claim_expires INTEGER
+        )
+        """
+    )
+    legacy.execute(
+        "INSERT INTO tasks (id, title, body, status, created_at) "
+        "VALUES ('legacy-repo', 'preserve me', 'legacy body', 'ready', 1)"
+    )
+    # Exercise the canonical drift-rebuild pass in the same initialization.
+    # Task mapping and the additive tasks migration must remain stable while an
+    # unrelated legacy table is rebuilt to the fresh schema.
+    legacy.execute(
+        """
+        CREATE TABLE task_events (
+            id TEXT PRIMARY KEY,
+            task_id TEXT NOT NULL,
+            kind TEXT NOT NULL,
+            payload TEXT,
+            created_at INTEGER NOT NULL
+        )
+        """
+    )
+    legacy.execute(
+        "INSERT INTO task_events (id, task_id, kind, created_at) "
+        "VALUES ('legacy-event', 'legacy-repo', 'created', 1)"
+    )
+    legacy.commit()
+    legacy.close()
+
+    with kb.connect(db_path) as migrated:
+        first_columns = [
+            row["name"] for row in migrated.execute("PRAGMA table_info(tasks)")
+        ]
+        rebuilt_event_id = {
+            row["name"]: row
+            for row in migrated.execute("PRAGMA table_info(task_events)")
+        }["id"]
+        first_task = kb.get_task(migrated, "legacy-repo")
+
+    kb._INITIALIZED_PATHS.discard(str(db_path.resolve()))
+    with kb.connect(db_path) as reopened:
+        second_columns = [
+            row["name"] for row in reopened.execute("PRAGMA table_info(tasks)")
+        ]
+        second_task = kb.get_task(reopened, "legacy-repo")
+        row_count = reopened.execute(
+            "SELECT COUNT(*) FROM tasks WHERE id = 'legacy-repo'"
+        ).fetchone()[0]
+
+    assert first_columns.count("repo_identity") == 1, (
+        repo_identity_schema_contract_missing
+    )
+    assert rebuilt_event_id["type"].upper() == "INTEGER"
+    assert rebuilt_event_id["pk"] == 1
+    assert second_columns == first_columns
+    assert row_count == 1
+    assert first_task is not None and second_task is not None
+    assert first_task == second_task
+    assert second_task.title == "preserve me"
+    assert second_task.body == "legacy body"
+    assert second_task.repo_identity is None
+
+
+def test_repo_identity_task_mapping_is_independent_of_select_column_order(kanban_home):
+    repo_identity_schema_contract_missing = "repo_identity_schema_contract_missing"
+    identity = "b" * 64
+
+    with kb.connect() as conn:
+        task_id = kb.create_task(
+            conn,
+            title="named mapping",
+            repo_identity=identity,
+        )
+        canonical = kb.get_task(conn, task_id)
+        reversed_row = conn.execute(
+            "SELECT block_recurrences, repo_identity, session_id, goal_max_turns, "
+            "goal_mode, max_retries, model_override, skills, current_step_key, "
+            "workflow_template_id, current_run_id, last_heartbeat_at, "
+            "max_runtime_seconds, last_failure_error, worker_pid, "
+            "consecutive_failures, idempotency_key, result, tenant, claim_expires, "
+            "claim_lock, project_id, branch_name, workspace_path, workspace_kind, "
+            "completed_at, started_at, created_at, created_by, priority, status, "
+            "assignee, body, title, id FROM tasks WHERE id = ?",
+            (task_id,),
+        ).fetchone()
+
+    assert canonical is not None
+    assert kb.Task.from_row(reversed_row) == canonical, (
+        repo_identity_schema_contract_missing
+    )
+    assert canonical.repo_identity == identity
 
 
 def test_connect_honors_kanban_busy_timeout_env(kanban_home, monkeypatch):
@@ -460,13 +618,22 @@ def test_stale_claim_reclaimed(kanban_home, monkeypatch):
     with kb.connect() as conn:
         t = kb.create_task(conn, title="x", assignee="a")
         host = _kb._claimer_id().split(":", 1)[0]
-        kb.claim_task(conn, t, claimer=f"{host}:worker")
+        active = kb.claim_task(conn, t, claimer=f"{host}:worker")
+        assert active is not None
+        assert active.current_run_id is not None
+        assert active.claim_lock is not None
         killed: list[int] = []
 
         def _signal(_pid, sig):
             killed.append(sig)
 
-        kb._set_worker_pid(conn, t, 12345)
+        assert kb._set_worker_pid(
+            conn,
+            t,
+            12345,
+            run_id=active.current_run_id,
+            claim_lock=active.claim_lock,
+        )
         # Rewind claim_expires so it looks stale.
         conn.execute(
             "UPDATE tasks SET claim_expires = ? WHERE id = ?",
@@ -494,8 +661,17 @@ def test_stale_claim_with_live_pid_extends_instead_of_reclaiming(
     with kb.connect() as conn:
         t = kb.create_task(conn, title="x", assignee="a")
         host = _kb._claimer_id().split(":", 1)[0]
-        kb.claim_task(conn, t, claimer=f"{host}:worker")
-        kb._set_worker_pid(conn, t, 12345)
+        active = kb.claim_task(conn, t, claimer=f"{host}:worker")
+        assert active is not None
+        assert active.current_run_id is not None
+        assert active.claim_lock is not None
+        assert kb._set_worker_pid(
+            conn,
+            t,
+            12345,
+            run_id=active.current_run_id,
+            claim_lock=active.claim_lock,
+        )
 
         old_expires = int(time.time()) - 60
         conn.execute(
@@ -534,8 +710,17 @@ def test_stale_claim_with_live_pid_uses_env_ttl_override(
     with kb.connect() as conn:
         t = kb.create_task(conn, title="x", assignee="a")
         host = _kb._claimer_id().split(":", 1)[0]
-        kb.claim_task(conn, t, claimer=f"{host}:worker")
-        kb._set_worker_pid(conn, t, 12345)
+        active = kb.claim_task(conn, t, claimer=f"{host}:worker")
+        assert active is not None
+        assert active.current_run_id is not None
+        assert active.claim_lock is not None
+        assert kb._set_worker_pid(
+            conn,
+            t,
+            12345,
+            run_id=active.current_run_id,
+            claim_lock=active.claim_lock,
+        )
         conn.execute(
             "UPDATE tasks SET claim_expires = ? WHERE id = ?",
             (int(time.time()) - 60, t),
@@ -566,8 +751,17 @@ def test_stale_claim_deferred_when_live_worker_survives_termination(
     with kb.connect() as conn:
         t = kb.create_task(conn, title="x", assignee="a")
         host = _kb._claimer_id().split(":", 1)[0]
-        kb.claim_task(conn, t, claimer=f"{host}:worker")
-        kb._set_worker_pid(conn, t, 12345)
+        active = kb.claim_task(conn, t, claimer=f"{host}:worker")
+        assert active is not None
+        assert active.current_run_id is not None
+        assert active.claim_lock is not None
+        assert kb._set_worker_pid(
+            conn,
+            t,
+            12345,
+            run_id=active.current_run_id,
+            claim_lock=active.claim_lock,
+        )
 
         old_expires = int(time.time()) - 60
         # Heartbeat stale by > 1h so the live-pid EXTEND branch is skipped and
@@ -617,8 +811,17 @@ def test_stale_claim_reclaimed_when_termination_succeeds(
     with kb.connect() as conn:
         t = kb.create_task(conn, title="x", assignee="a")
         host = _kb._claimer_id().split(":", 1)[0]
-        kb.claim_task(conn, t, claimer=f"{host}:worker")
-        kb._set_worker_pid(conn, t, 12345)
+        active = kb.claim_task(conn, t, claimer=f"{host}:worker")
+        assert active is not None
+        assert active.current_run_id is not None
+        assert active.claim_lock is not None
+        assert kb._set_worker_pid(
+            conn,
+            t,
+            12345,
+            run_id=active.current_run_id,
+            claim_lock=active.claim_lock,
+        )
         conn.execute(
             "UPDATE tasks SET claim_expires = ?, last_heartbeat_at = ? "
             "WHERE id = ?",
@@ -651,8 +854,17 @@ def test_stale_claim_released_when_worker_not_host_local(
     with kb.connect() as conn:
         t = kb.create_task(conn, title="x", assignee="a")
         host = _kb._claimer_id().split(":", 1)[0]
-        kb.claim_task(conn, t, claimer=f"{host}:worker")
-        kb._set_worker_pid(conn, t, 12345)
+        active = kb.claim_task(conn, t, claimer=f"{host}:worker")
+        assert active is not None
+        assert active.current_run_id is not None
+        assert active.claim_lock is not None
+        assert kb._set_worker_pid(
+            conn,
+            t,
+            12345,
+            run_id=active.current_run_id,
+            claim_lock=active.claim_lock,
+        )
         conn.execute(
             "UPDATE tasks SET claim_expires = ?, last_heartbeat_at = ? "
             "WHERE id = ?",
@@ -678,8 +890,17 @@ def test_detect_stale_defers_when_live_worker_survives(kanban_home, monkeypatch)
 
     with kb.connect() as conn:
         t = kb.create_task(conn, title="wedged", assignee="worker")
-        kb.claim_task(conn, t)
-        kb._set_worker_pid(conn, t, os.getpid())
+        active = kb.claim_task(conn, t)
+        assert active is not None
+        assert active.current_run_id is not None
+        assert active.claim_lock is not None
+        assert kb._set_worker_pid(
+            conn,
+            t,
+            os.getpid(),
+            run_id=active.current_run_id,
+            claim_lock=active.claim_lock,
+        )
 
         five_hours_ago = int(time.time()) - (5 * 3600)
         with kb.write_txn(conn):
@@ -729,8 +950,17 @@ def test_stale_claim_reclaim_event_records_diagnostic_payload(
     with kb.connect() as conn:
         t = kb.create_task(conn, title="x", assignee="a")
         host = _kb._claimer_id().split(":", 1)[0]
-        kb.claim_task(conn, t, claimer=f"{host}:worker")
-        kb._set_worker_pid(conn, t, 12345)
+        active = kb.claim_task(conn, t, claimer=f"{host}:worker")
+        assert active is not None
+        assert active.current_run_id is not None
+        assert active.claim_lock is not None
+        assert kb._set_worker_pid(
+            conn,
+            t,
+            12345,
+            run_id=active.current_run_id,
+            claim_lock=active.claim_lock,
+        )
         old_expires = int(time.time()) - 3600
         hb_at = int(time.time()) - 1800
         conn.execute(
@@ -916,6 +1146,934 @@ def test_classify_worker_exit_recognizes_rate_limit_sentinel(kanban_home):
     # Plain non-zero exit is still a normal crash, not rate-limited.
     _kb._record_worker_exit(pid + 1, _exited_status(1))
     assert _kb._classify_worker_exit(pid + 1) == ("nonzero_exit", 1)
+
+
+def _repo_busy_running_task(
+    conn,
+    *,
+    repo_identity="a" * 64,
+    pid=43176,
+    claim_lock="/private/claims/never-persist-this-token",
+):
+    task_id = kb.create_task(
+        conn,
+        title="repo-busy lifecycle",
+        assignee="owner",
+        workspace_kind="dir",
+        workspace_path="/private/repos/never-persist-this-path",
+        repo_identity=repo_identity,
+    )
+    claimed = kb.claim_task(conn, task_id, claimer=claim_lock)
+    assert claimed is not None
+    run_id = claimed.current_run_id
+    assert run_id is not None
+    conn.execute(
+        "UPDATE tasks SET worker_pid=?, consecutive_failures=7, "
+        "last_failure_error=? WHERE id=?",
+        (pid, "/private/history/must-be-preserved", task_id),
+    )
+    conn.execute(
+        "UPDATE task_runs SET worker_pid=? WHERE id=?",
+        (pid, run_id),
+    )
+    conn.commit()
+    return task_id, run_id, claim_lock, repo_identity, pid
+
+
+def _repo_busy_persisted_rows(conn, task_id):
+    return {
+        "task": tuple(
+            conn.execute("SELECT * FROM tasks WHERE id=?", (task_id,)).fetchone()
+        ),
+        "runs": [
+            tuple(row)
+            for row in conn.execute(
+                "SELECT * FROM task_runs WHERE task_id=? ORDER BY id", (task_id,)
+            ).fetchall()
+        ],
+        "events": [
+            tuple(row)
+            for row in conn.execute(
+                "SELECT * FROM task_events WHERE task_id=? ORDER BY id", (task_id,)
+            ).fetchall()
+        ],
+    }
+
+
+def test_repo_worker_early_lock_authority_resolver_is_read_only_and_exact(tmp_path):
+    repo_worker_early_lock_contract_missing = "repo_worker_early_lock_contract_missing"
+    repo = tmp_path / "repo"
+    subprocess.run(["git", "init", "-q", str(repo)], check=True)
+    from hermes_cli.repo_write_lock import repo_identity
+
+    db_path = tmp_path / "authority.db"
+    with kb.connect(db_path) as conn:
+        task_id = kb.create_task(
+            conn,
+            title="authority",
+            workspace_kind="dir",
+            workspace_path=str(repo),
+        )
+        claim = kb.claim_task(conn, task_id, claimer="exact-claim")
+        assert claim is not None and claim.current_run_id is not None
+        identity = repo_identity(repo)
+        conn.execute(
+            "UPDATE tasks SET repo_identity=? WHERE id=?", (identity, task_id)
+        )
+        conn.commit()
+        before = _repo_busy_persisted_rows(conn, task_id)
+
+    authority = kb.resolve_worker_repo_authority(
+        db_path,
+        task_id=task_id,
+        run_id=claim.current_run_id,
+        claim_lock="exact-claim",
+    )
+    assert authority.workspace_path == repo.resolve()
+    assert authority.repo_identity == identity
+    assert set(authority.__dataclass_fields__) == {"workspace_path", "repo_identity"}
+
+    rejected = (
+        {"task_id": task_id + "-foreign"},
+        {"run_id": claim.current_run_id + 1},
+        {"claim_lock": "foreign"},
+    )
+    for changed in rejected:
+        exact = {
+            "task_id": task_id,
+            "run_id": claim.current_run_id,
+            "claim_lock": "exact-claim",
+        }
+        exact.update(changed)
+        assert kb.resolve_worker_repo_authority(db_path, **exact) is None, (
+            repo_worker_early_lock_contract_missing
+        )
+    with kb.connect(db_path) as conn:
+        assert _repo_busy_persisted_rows(conn, task_id) == before
+
+
+def test_repo_worker_early_lock_authority_resolver_rejects_non_repository_workspace(
+    tmp_path,
+):
+    repo_worker_early_lock_contract_missing = "repo_worker_early_lock_contract_missing"
+    db_path = tmp_path / "authority-invalid.db"
+    with kb.connect(db_path) as conn:
+        task_id, run_id, claim_lock, identity, _pid = _repo_busy_running_task(conn)
+        conn.execute(
+            "UPDATE tasks SET workspace_kind='scratch', workspace_path=? WHERE id=?",
+            (str(tmp_path), task_id),
+        )
+        conn.commit()
+        before = _repo_busy_persisted_rows(conn, task_id)
+    assert kb.resolve_worker_repo_authority(
+        db_path,
+        task_id=task_id,
+        run_id=run_id,
+        claim_lock=claim_lock,
+    ) is None, repo_worker_early_lock_contract_missing
+    with kb.connect(db_path) as conn:
+        assert _repo_busy_persisted_rows(conn, task_id) == before
+
+
+def test_repo_worker_early_lock_contract_missing_exit_classifier_is_stable(
+    kanban_home,
+):
+    repo_worker_early_lock_contract_missing = (
+        "repo_worker_early_lock_contract_missing"
+    )
+    assert kb.KANBAN_REPO_BUSY_EXIT_CODE == 76, (
+        repo_worker_early_lock_contract_missing
+    )
+    assert kb.KANBAN_REPO_BUSY_EXIT_CODE not in {
+        0,
+        1,
+        2,
+        kb.KANBAN_RATE_LIMIT_EXIT_CODE,
+    }
+
+    cases = {
+        0: ("clean_exit", 0),
+        1: ("nonzero_exit", 1),
+        kb.KANBAN_RATE_LIMIT_EXIT_CODE: (
+            "rate_limited",
+            kb.KANBAN_RATE_LIMIT_EXIT_CODE,
+        ),
+        kb.KANBAN_REPO_BUSY_EXIT_CODE: (
+            "repo_busy",
+            kb.KANBAN_REPO_BUSY_EXIT_CODE,
+        ),
+    }
+    for offset, (exit_code, expected) in enumerate(cases.items()):
+        pid = 32000 + offset
+        kb._record_worker_exit(pid, _exited_status(exit_code))
+        assert kb._classify_worker_exit(pid) == expected
+
+
+def test_repo_worker_early_lock_contract_missing_exact_cas_is_durable_and_idempotent(
+    tmp_path,
+):
+    repo_worker_early_lock_contract_missing = (
+        "repo_worker_early_lock_contract_missing"
+    )
+    db_path = tmp_path / "repo-busy.db"
+    with kb.connect(db_path) as conn:
+        task_id, run_id, claim_lock, repo_identity, _pid = _repo_busy_running_task(
+            conn
+        )
+        before = kb.get_task(conn, task_id)
+        assert before is not None
+        result = kb.release_worker_for_repo_busy(
+            conn,
+            task_id=task_id,
+            run_id=run_id,
+            claim_lock=claim_lock,
+            repo_identity=repo_identity,
+        )
+        assert result == kb.REPO_BUSY_RELEASE_APPLIED, (
+            repo_worker_early_lock_contract_missing
+        )
+
+        task = kb.get_task(conn, task_id)
+        assert task is not None
+        assert task.status == "ready"
+        assert task.claim_lock is None
+        assert task.claim_expires is None
+        assert task.worker_pid is None
+        assert task.current_run_id is None
+        assert task.assignee == before.assignee == "owner"
+        assert task.workspace_kind == before.workspace_kind == "dir"
+        assert task.workspace_path == before.workspace_path
+        assert task.workspace_path is not None
+        assert task.repo_identity == before.repo_identity == repo_identity
+        assert task.consecutive_failures == before.consecutive_failures == 7
+        assert task.last_failure_error == before.last_failure_error
+
+        run = conn.execute(
+            "SELECT * FROM task_runs WHERE id=?", (run_id,)
+        ).fetchone()
+        assert run["task_id"] == task_id
+        assert run["status"] == "repo_busy"
+        assert run["outcome"] == "repo_busy"
+        assert run["ended_at"] is not None
+        assert run["claim_lock"] is None
+        assert run["claim_expires"] is None
+        assert run["worker_pid"] is None
+        assert run["summary"] == "repo_busy"
+        assert run["error"] is None
+        assert claim_lock not in (run["metadata"] or "")
+        assert task.workspace_path not in (run["metadata"] or "")
+
+        repo_busy_events = conn.execute(
+            "SELECT * FROM task_events WHERE task_id=? AND kind='repo_busy'",
+            (task_id,),
+        ).fetchall()
+        assert len(repo_busy_events) == 1
+        assert repo_busy_events[0]["run_id"] == run_id
+        assert claim_lock not in (repo_busy_events[0]["payload"] or "")
+        assert task.workspace_path not in (repo_busy_events[0]["payload"] or "")
+        assert '"reason": "repo_busy"' in repo_busy_events[0]["payload"]
+        assert repo_identity in repo_busy_events[0]["payload"]
+        applied_rows = _repo_busy_persisted_rows(conn, task_id)
+
+        assert kb.release_worker_for_repo_busy(
+            conn,
+            task_id=task_id,
+            run_id=run_id,
+            claim_lock=claim_lock,
+            repo_identity=repo_identity,
+        ) == kb.REPO_BUSY_RELEASE_ALREADY_APPLIED
+        assert _repo_busy_persisted_rows(conn, task_id) == applied_rows
+
+    with kb.connect(db_path) as reopened:
+        assert kb.release_worker_for_repo_busy(
+            reopened,
+            task_id=task_id,
+            run_id=run_id,
+            claim_lock=claim_lock,
+            repo_identity=repo_identity,
+        ) == kb.REPO_BUSY_RELEASE_ALREADY_APPLIED
+        assert _repo_busy_persisted_rows(reopened, task_id) == applied_rows
+        for changed in (
+            {"run_id": run_id + 1},
+            {"claim_lock": claim_lock + "-foreign"},
+            {"repo_identity": "b" * 64},
+        ):
+            exact = {
+                "task_id": task_id,
+                "run_id": run_id,
+                "claim_lock": claim_lock,
+                "repo_identity": repo_identity,
+            }
+            exact.update(changed)
+            assert kb.release_worker_for_repo_busy(
+                reopened, **exact
+            ) == kb.REPO_BUSY_RELEASE_REJECTED
+            assert _repo_busy_persisted_rows(reopened, task_id) == applied_rows
+
+
+@pytest.mark.parametrize(
+    "mismatch",
+    [
+        "task_id",
+        "run_id",
+        "task_status",
+        "task_current_run",
+        "task_claim",
+        "task_repo",
+        "run_task",
+        "run_status",
+        "run_claim",
+        "run_ended",
+    ],
+)
+def test_repo_worker_early_lock_contract_missing_each_mismatch_is_noop(
+    kanban_home,
+    mismatch,
+):
+    repo_worker_early_lock_contract_missing = (
+        "repo_worker_early_lock_contract_missing"
+    )
+    with kb.connect() as conn:
+        task_id, run_id, claim_lock, repo_identity, _pid = _repo_busy_running_task(
+            conn
+        )
+        call = {
+            "task_id": task_id,
+            "run_id": run_id,
+            "claim_lock": claim_lock,
+            "repo_identity": repo_identity,
+        }
+        if mismatch == "task_id":
+            call["task_id"] = "t_foreign"
+        elif mismatch == "run_id":
+            call["run_id"] = run_id + 1000
+        elif mismatch == "task_status":
+            conn.execute("UPDATE tasks SET status='ready' WHERE id=?", (task_id,))
+        elif mismatch == "task_current_run":
+            conn.execute(
+                "UPDATE tasks SET current_run_id=NULL WHERE id=?", (task_id,)
+            )
+        elif mismatch == "task_claim":
+            conn.execute(
+                "UPDATE tasks SET claim_lock='foreign' WHERE id=?", (task_id,)
+            )
+        elif mismatch == "task_repo":
+            conn.execute(
+                "UPDATE tasks SET repo_identity=? WHERE id=?", ("b" * 64, task_id)
+            )
+        elif mismatch == "run_task":
+            conn.execute(
+                "UPDATE task_runs SET task_id='t_foreign' WHERE id=?", (run_id,)
+            )
+        elif mismatch == "run_status":
+            conn.execute(
+                "UPDATE task_runs SET status='done' WHERE id=?", (run_id,)
+            )
+        elif mismatch == "run_claim":
+            conn.execute(
+                "UPDATE task_runs SET claim_lock='foreign' WHERE id=?", (run_id,)
+            )
+        elif mismatch == "run_ended":
+            conn.execute(
+                "UPDATE task_runs SET ended_at=1 WHERE id=?", (run_id,)
+            )
+        conn.commit()
+        before = _repo_busy_persisted_rows(conn, task_id)
+        foreign_events_before = conn.execute(
+            "SELECT COUNT(*) FROM task_events WHERE kind='repo_busy'"
+        ).fetchone()[0]
+
+        assert kb.release_worker_for_repo_busy(
+            conn, **call
+        ) == kb.REPO_BUSY_RELEASE_REJECTED, (
+            repo_worker_early_lock_contract_missing
+        )
+        assert _repo_busy_persisted_rows(conn, task_id) == before
+        assert conn.execute(
+            "SELECT COUNT(*) FROM task_events WHERE kind='repo_busy'"
+        ).fetchone()[0] == foreign_events_before
+
+
+@pytest.mark.parametrize(
+    "changed",
+    [
+        {"task_id": None},
+        {"task_id": ""},
+        {"task_id": " t_bad"},
+        {"run_id": None},
+        {"run_id": True},
+        {"run_id": 0},
+        {"run_id": "1"},
+        {"claim_lock": None},
+        {"claim_lock": ""},
+        {"claim_lock": "   "},
+        {"repo_identity": None},
+        {"repo_identity": "A" * 64},
+        {"repo_identity": "a" * 63},
+        {"repo_identity": "/private/repo"},
+    ],
+)
+def test_repo_worker_early_lock_contract_missing_malformed_is_noop(
+    kanban_home,
+    changed,
+):
+    repo_worker_early_lock_contract_missing = (
+        "repo_worker_early_lock_contract_missing"
+    )
+    with kb.connect() as conn:
+        task_id, run_id, claim_lock, repo_identity, _pid = _repo_busy_running_task(
+            conn
+        )
+        call = {
+            "task_id": task_id,
+            "run_id": run_id,
+            "claim_lock": claim_lock,
+            "repo_identity": repo_identity,
+        }
+        call.update(changed)
+        before = _repo_busy_persisted_rows(conn, task_id)
+        assert kb.release_worker_for_repo_busy(
+            conn, **call
+        ) == kb.REPO_BUSY_RELEASE_REJECTED, (
+            repo_worker_early_lock_contract_missing
+        )
+        assert _repo_busy_persisted_rows(conn, task_id) == before
+
+
+def test_repo_worker_early_lock_contract_missing_cas_rolls_back_partial_update(
+    kanban_home,
+):
+    repo_worker_early_lock_contract_missing = (
+        "repo_worker_early_lock_contract_missing"
+    )
+    with kb.connect() as conn:
+        task_id, run_id, claim_lock, repo_identity, _pid = _repo_busy_running_task(
+            conn
+        )
+        conn.execute(
+            "CREATE TEMP TRIGGER ignore_repo_busy_task_update "
+            "BEFORE UPDATE OF status ON tasks "
+            f"WHEN OLD.id = '{task_id}' BEGIN SELECT RAISE(IGNORE); END"
+        )
+        before = _repo_busy_persisted_rows(conn, task_id)
+        assert kb.release_worker_for_repo_busy(
+            conn,
+            task_id=task_id,
+            run_id=run_id,
+            claim_lock=claim_lock,
+            repo_identity=repo_identity,
+        ) == kb.REPO_BUSY_RELEASE_REJECTED, (
+            repo_worker_early_lock_contract_missing
+        )
+        assert _repo_busy_persisted_rows(conn, task_id) == before
+
+
+def test_repo_worker_early_lock_contract_missing_reaper_fallback_uses_exact_cas(
+    kanban_home,
+    monkeypatch,
+):
+    repo_worker_early_lock_contract_missing = (
+        "repo_worker_early_lock_contract_missing"
+    )
+    monkeypatch.setattr(kb, "_pid_alive", lambda _pid: False)
+    monkeypatch.setenv("HERMES_KANBAN_CRASH_GRACE_SECONDS", "0")
+
+    with kb.connect() as conn:
+        host = kb._claimer_id().split(":", 1)[0]
+        task_id, run_id, claim_lock, repo_identity, pid = _repo_busy_running_task(
+            conn,
+            claim_lock=f"{host}:repo-busy-worker",
+        )
+        kb._record_worker_exit(pid, _exited_status(kb.KANBAN_REPO_BUSY_EXIT_CODE))
+        assert kb.detect_crashed_workers(conn) == []
+        task = kb.get_task(conn, task_id)
+        assert task is not None
+        assert task.status == "ready"
+        assert task.current_run_id is None
+        assert task.consecutive_failures == 7
+        assert task.last_failure_error == "/private/history/must-be-preserved"
+        assert tuple(
+            conn.execute(
+                "SELECT status, outcome FROM task_runs WHERE id=?", (run_id,)
+            ).fetchone()
+        ) == ("repo_busy", "repo_busy")
+        events = conn.execute(
+            "SELECT run_id, payload FROM task_events "
+            "WHERE task_id=? AND kind='repo_busy'",
+            (task_id,),
+        ).fetchall()
+        assert len(events) == 1
+        assert events[0]["run_id"] == run_id
+        assert claim_lock not in events[0]["payload"]
+        assert getattr(kb.detect_crashed_workers, "_last_rate_limited", []) == []
+
+        settled = _repo_busy_persisted_rows(conn, task_id)
+        assert kb.detect_crashed_workers(conn) == []
+        assert _repo_busy_persisted_rows(conn, task_id) == settled, (
+            repo_worker_early_lock_contract_missing
+        )
+
+
+def _worker_pid_cas_state(conn, task_id, run_id):
+    task = conn.execute(
+        "SELECT status, current_run_id, claim_lock, worker_pid, "
+        "consecutive_failures, last_failure_error FROM tasks WHERE id=?",
+        (task_id,),
+    ).fetchone()
+    run = conn.execute(
+        "SELECT task_id, status, claim_lock, worker_pid, ended_at, outcome "
+        "FROM task_runs WHERE id=?",
+        (run_id,),
+    ).fetchone()
+    events = conn.execute(
+        "SELECT run_id, payload FROM task_events "
+        "WHERE task_id=? AND kind='spawned' ORDER BY id",
+        (task_id,),
+    ).fetchall()
+    return tuple(task) if task else None, tuple(run) if run else None, [tuple(e) for e in events]
+
+
+def test_repo_worker_early_lock_contract_missing_parent_pid_cas_loses_to_repo_busy(
+    kanban_home, monkeypatch, all_assignees_spawnable,
+):
+    repo_worker_early_lock_contract_missing = "repo_worker_early_lock_contract_missing"
+    repo_identity = "d" * 64
+    release_results = []
+    capability = {}
+    monkeypatch.setattr(kb, "_repo_writer_mode", lambda: "single_writer")
+    monkeypatch.setattr(
+        kb,
+        "_repo_busy_for_task",
+        lambda _conn, task, **_kwargs: (task.repo_identity, False),
+    )
+
+    with kb.connect() as conn:
+        task_id = kb.create_task(
+            conn,
+            title="child wins repo lifecycle",
+            assignee="worker",
+            workspace_kind="dir",
+            workspace_path=str(kanban_home),
+            repo_identity=repo_identity,
+        )
+        conn.execute(
+            "UPDATE tasks SET consecutive_failures=4, last_failure_error=? WHERE id=?",
+            ("preserve-existing-failure", task_id),
+        )
+        conn.commit()
+
+        def release_before_returning_pid(task, _workspace, board=None):
+            assert task.current_run_id is not None
+            assert task.claim_lock is not None
+            capability.update(
+                run_id=task.current_run_id,
+                claim_lock=task.claim_lock,
+            )
+            release_results.append(
+                kb.release_worker_for_repo_busy(
+                    conn,
+                    task_id=task.id,
+                    run_id=task.current_run_id,
+                    claim_lock=task.claim_lock,
+                    repo_identity=task.repo_identity,
+                )
+            )
+            return 43176
+
+        result = kb.dispatch_once(conn, spawn_fn=release_before_returning_pid)
+        run = conn.execute(
+            "SELECT id, status, worker_pid FROM task_runs WHERE task_id=?",
+            (task_id,),
+        ).fetchone()
+        task = kb.get_task(conn, task_id)
+        repo_busy_count = conn.execute(
+            "SELECT COUNT(*) FROM task_events WHERE task_id=? AND kind='repo_busy'",
+            (task_id,),
+        ).fetchone()[0]
+        spawned_count = conn.execute(
+            "SELECT COUNT(*) FROM task_events WHERE task_id=? AND kind='spawned'",
+            (task_id,),
+        ).fetchone()[0]
+
+        assert release_results == [kb.REPO_BUSY_RELEASE_APPLIED]
+        assert task is not None
+        assert task.status == "ready"
+        assert task.worker_pid is None
+        assert task.current_run_id is None
+        assert task.consecutive_failures == 4
+        assert task.last_failure_error == "preserve-existing-failure"
+        assert run["status"] == "repo_busy"
+        assert run["worker_pid"] is None
+        assert repo_busy_count == 1
+        assert spawned_count == 0
+        assert result.spawned == []
+        assert result.auto_blocked == []
+        assert kb.release_worker_for_repo_busy(
+            conn,
+            task_id=task_id,
+            run_id=capability["run_id"],
+            claim_lock=capability["claim_lock"],
+            repo_identity=repo_identity,
+        ) == kb.REPO_BUSY_RELEASE_ALREADY_APPLIED, (
+            repo_worker_early_lock_contract_missing
+        )
+
+
+@pytest.mark.parametrize("terminal_action", ["complete", "block"])
+def test_parent_pid_cas_loses_when_child_finishes_before_spawn_returns(
+    kanban_home, monkeypatch, all_assignees_spawnable, terminal_action,
+):
+    monkeypatch.setattr(kb, "_repo_writer_mode", lambda: "single_writer")
+    with kb.connect() as conn:
+        task_id = kb.create_task(conn, title=terminal_action, assignee="worker")
+
+        def finish_before_returning_pid(task, _workspace, board=None):
+            if terminal_action == "complete":
+                assert kb.complete_task(conn, task.id, summary="child completed")
+            else:
+                assert kb.block_task(conn, task.id, reason="child blocked")
+            return 43177
+
+        result = kb.dispatch_once(conn, spawn_fn=finish_before_returning_pid)
+        task = kb.get_task(conn, task_id)
+        run = conn.execute(
+            "SELECT status, worker_pid, ended_at FROM task_runs WHERE task_id=?",
+            (task_id,),
+        ).fetchone()
+        spawned_count = conn.execute(
+            "SELECT COUNT(*) FROM task_events WHERE task_id=? AND kind='spawned'",
+            (task_id,),
+        ).fetchone()[0]
+
+    assert task.status == ("done" if terminal_action == "complete" else "blocked")
+    assert task.worker_pid is None
+    assert task.current_run_id is None
+    assert run["status"] == ("done" if terminal_action == "complete" else "blocked")
+    assert run["worker_pid"] is None
+    assert run["ended_at"] is not None
+    assert spawned_count == 0
+    assert result.spawned == []
+    assert result.auto_blocked == []
+
+
+@pytest.mark.parametrize("initial_status", ["ready", "review"])
+def test_parent_pid_cas_loses_in_legacy_ready_and_review_dispatch(
+    kanban_home, monkeypatch, all_assignees_spawnable, initial_status,
+):
+    monkeypatch.setattr(kb, "_repo_writer_mode", lambda: "off")
+    repo_identity = "e" * 64
+    captured = {}
+    with kb.connect() as conn:
+        task_id = kb.create_task(
+            conn,
+            title=f"legacy {initial_status}",
+            assignee="worker",
+            repo_identity=repo_identity,
+        )
+        if initial_status == "review":
+            conn.execute("UPDATE tasks SET status='review' WHERE id=?", (task_id,))
+            conn.commit()
+
+        def release_before_returning_pid(task, _workspace, board=None):
+            captured.update(
+                run_id=task.current_run_id,
+                claim_lock=task.claim_lock,
+            )
+            assert kb.release_worker_for_repo_busy(
+                conn,
+                task_id=task.id,
+                run_id=task.current_run_id,
+                claim_lock=task.claim_lock,
+                repo_identity=task.repo_identity,
+            ) == kb.REPO_BUSY_RELEASE_APPLIED
+            return 43178
+
+        result = kb.dispatch_once(conn, spawn_fn=release_before_returning_pid)
+        task = kb.get_task(conn, task_id)
+        run = conn.execute(
+            "SELECT status, worker_pid FROM task_runs WHERE id=?",
+            (captured["run_id"],),
+        ).fetchone()
+        spawned_count = conn.execute(
+            "SELECT COUNT(*) FROM task_events WHERE task_id=? AND kind='spawned'",
+            (task_id,),
+        ).fetchone()[0]
+
+        assert task.status == "ready"
+        assert task.worker_pid is None
+        assert task.current_run_id is None
+        assert run["status"] == "repo_busy"
+        assert run["worker_pid"] is None
+        assert spawned_count == 0
+        assert result.spawned == []
+        assert result.auto_blocked == []
+        assert kb.release_worker_for_repo_busy(
+            conn,
+            task_id=task_id,
+            run_id=captured["run_id"],
+            claim_lock=captured["claim_lock"],
+            repo_identity=repo_identity,
+        ) == kb.REPO_BUSY_RELEASE_ALREADY_APPLIED
+
+
+@pytest.mark.parametrize(
+    "mismatch",
+    [
+        "task_id",
+        "run_id",
+        "claim_lock",
+        "task_status",
+        "task_current_run",
+        "task_claim",
+        "run_task",
+        "run_status",
+        "run_claim",
+        "run_ended",
+    ],
+)
+def test_set_worker_pid_exact_cas_mismatch_matrix_is_noop(kanban_home, mismatch):
+    with kb.connect() as conn:
+        task_id = kb.create_task(conn, title="pid cas", assignee="worker")
+        other_id = kb.create_task(conn, title="other", assignee="worker")
+        claimed = kb.claim_task(conn, task_id, claimer="exact-pid-claim")
+        assert claimed is not None and claimed.current_run_id is not None
+        call = {
+            "task_id": task_id,
+            "run_id": claimed.current_run_id,
+            "claim_lock": claimed.claim_lock,
+        }
+        if mismatch == "task_id":
+            call["task_id"] = other_id
+        elif mismatch == "run_id":
+            call["run_id"] += 1000
+        elif mismatch == "claim_lock":
+            call["claim_lock"] = "foreign-claim"
+        elif mismatch == "task_status":
+            conn.execute("UPDATE tasks SET status='ready' WHERE id=?", (task_id,))
+        elif mismatch == "task_current_run":
+            conn.execute("UPDATE tasks SET current_run_id=NULL WHERE id=?", (task_id,))
+        elif mismatch == "task_claim":
+            conn.execute("UPDATE tasks SET claim_lock='foreign' WHERE id=?", (task_id,))
+        elif mismatch == "run_task":
+            conn.execute(
+                "UPDATE task_runs SET task_id=? WHERE id=?",
+                (other_id, claimed.current_run_id),
+            )
+        elif mismatch == "run_status":
+            conn.execute(
+                "UPDATE task_runs SET status='done' WHERE id=?",
+                (claimed.current_run_id,),
+            )
+        elif mismatch == "run_claim":
+            conn.execute(
+                "UPDATE task_runs SET claim_lock='foreign' WHERE id=?",
+                (claimed.current_run_id,),
+            )
+        elif mismatch == "run_ended":
+            conn.execute(
+                "UPDATE task_runs SET ended_at=1 WHERE id=?",
+                (claimed.current_run_id,),
+            )
+        conn.commit()
+        before = _worker_pid_cas_state(conn, task_id, claimed.current_run_id)
+
+        assert kb._set_worker_pid(
+            conn,
+            call["task_id"],
+            43179,
+            run_id=call["run_id"],
+            claim_lock=call["claim_lock"],
+        ) is False
+        assert _worker_pid_cas_state(conn, task_id, claimed.current_run_id) == before
+
+
+def test_set_worker_pid_exact_cas_rolls_back_partial_update(kanban_home):
+    with kb.connect() as conn:
+        task_id = kb.create_task(conn, title="pid rollback", assignee="worker")
+        claimed = kb.claim_task(conn, task_id, claimer="pid-rollback-claim")
+        assert claimed is not None and claimed.current_run_id is not None
+        conn.execute(
+            "CREATE TEMP TRIGGER ignore_worker_pid_run_update "
+            "BEFORE UPDATE OF worker_pid ON task_runs "
+            f"WHEN OLD.id = {claimed.current_run_id} BEGIN SELECT RAISE(IGNORE); END"
+        )
+        before = _worker_pid_cas_state(conn, task_id, claimed.current_run_id)
+
+        assert kb._set_worker_pid(
+            conn,
+            task_id,
+            43180,
+            run_id=claimed.current_run_id,
+            claim_lock=claimed.claim_lock,
+        ) is False
+        assert _worker_pid_cas_state(conn, task_id, claimed.current_run_id) == before
+
+
+def test_set_worker_pid_exact_cas_sets_task_run_and_one_spawned_event(kanban_home):
+    with kb.connect() as conn:
+        task_id = kb.create_task(conn, title="pid success", assignee="worker")
+        claimed = kb.claim_task(conn, task_id, claimer="pid-success-claim")
+        assert claimed is not None and claimed.current_run_id is not None
+
+        assert kb._set_worker_pid(
+            conn,
+            task_id,
+            43181,
+            run_id=claimed.current_run_id,
+            claim_lock=claimed.claim_lock,
+        ) is True
+        task, run, events = _worker_pid_cas_state(
+            conn, task_id, claimed.current_run_id
+        )
+        assert task[3] == 43181
+        assert run[3] == 43181
+        assert events == [(claimed.current_run_id, '{"pid": 43181}')]
+
+        assert kb._set_worker_pid(
+            conn,
+            task_id,
+            43181,
+            run_id=claimed.current_run_id,
+            claim_lock=claimed.claim_lock,
+        ) is False
+        assert _worker_pid_cas_state(
+            conn, task_id, claimed.current_run_id
+        ) == (task, run, events)
+
+
+def test_set_worker_pid_signature_requires_exact_authority_keywords():
+    signature = inspect.signature(kb._set_worker_pid)
+    assert signature.parameters["run_id"].default is inspect.Parameter.empty
+    assert signature.parameters["claim_lock"].default is inspect.Parameter.empty
+    assert signature.parameters["run_id"].annotation in {int, "int"}
+    assert signature.parameters["claim_lock"].annotation in {str, "str"}
+
+
+@pytest.mark.parametrize(
+    ("run_id", "claim_lock"),
+    [
+        (1, None),
+        (None, "partial-claim"),
+        (None, None),
+        (True, "malformed-claim"),
+        (1, 7),
+        (0, "zero-run"),
+        (1, ""),
+    ],
+)
+def test_set_worker_pid_partial_or_malformed_explicit_authority_is_noop(
+    kanban_home, run_id, claim_lock,
+):
+    with kb.connect() as conn:
+        task_id = kb.create_task(conn, title="bad pid authority", assignee="worker")
+        claimed = kb.claim_task(conn, task_id, claimer="valid-pid-claim")
+        assert claimed is not None
+        assert claimed.current_run_id is not None
+        assert claimed.claim_lock is not None
+        before = _worker_pid_cas_state(conn, task_id, claimed.current_run_id)
+
+        assert kb._set_worker_pid(
+            conn,
+            task_id,
+            43184,
+            run_id=run_id,
+            claim_lock=claim_lock,
+        ) is False
+        assert _worker_pid_cas_state(conn, task_id, claimed.current_run_id) == before
+
+
+def test_set_worker_pid_stale_generation_cannot_write_reclaimed_generation(
+    kanban_home,
+):
+    with kb.connect() as conn:
+        task_id = kb.create_task(conn, title="stale pid authority", assignee="worker")
+        generation_a = kb.claim_task(conn, task_id, claimer="pid-generation-a")
+        assert generation_a is not None
+        assert generation_a.current_run_id is not None
+        assert generation_a.claim_lock is not None
+        run_a = generation_a.current_run_id
+        lock_a = generation_a.claim_lock
+
+        assert kb.reclaim_task(conn, task_id, reason="advance claim generation")
+        generation_b = kb.claim_task(conn, task_id, claimer="pid-generation-b")
+        assert generation_b is not None
+        assert generation_b.current_run_id is not None
+        assert generation_b.claim_lock is not None
+        run_b = generation_b.current_run_id
+        lock_b = generation_b.claim_lock
+        assert run_b != run_a
+        assert lock_b != lock_a
+
+        assert kb._set_worker_pid(
+            conn,
+            task_id,
+            43185,
+            run_id=run_a,
+            claim_lock=lock_a,
+        ) is False
+        task_after_stale = kb.get_task(conn, task_id)
+        assert task_after_stale is not None
+        assert task_after_stale.current_run_id == run_b
+        assert task_after_stale.claim_lock == lock_b
+        assert task_after_stale.worker_pid is None
+        assert conn.execute(
+            "SELECT worker_pid FROM task_runs WHERE id=?", (run_b,)
+        ).fetchone()["worker_pid"] is None
+        assert conn.execute(
+            "SELECT COUNT(*) FROM task_events "
+            "WHERE task_id=? AND kind='spawned'",
+            (task_id,),
+        ).fetchone()[0] == 0
+
+        assert kb._set_worker_pid(
+            conn,
+            task_id,
+            43186,
+            run_id=run_b,
+            claim_lock=lock_b,
+        ) is True
+        task_after_current = kb.get_task(conn, task_id)
+        assert task_after_current is not None
+        assert task_after_current.worker_pid == 43186
+        assert conn.execute(
+            "SELECT worker_pid FROM task_runs WHERE id=?", (run_a,)
+        ).fetchone()["worker_pid"] is None
+        assert conn.execute(
+            "SELECT worker_pid FROM task_runs WHERE id=?", (run_b,)
+        ).fetchone()["worker_pid"] == 43186
+        spawned = conn.execute(
+            "SELECT run_id, payload FROM task_events "
+            "WHERE task_id=? AND kind='spawned' ORDER BY id",
+            (task_id,),
+        ).fetchall()
+        assert [tuple(row) for row in spawned] == [
+            (run_b, '{"pid": 43186}')
+        ]
+
+
+def test_set_worker_pid_call_sites_supply_both_authority_keywords():
+    repo_root = Path(__file__).parents[2]
+    missing = []
+    for source in repo_root.rglob("*.py"):
+        if {"__pycache__", "venv", ".venv"}.intersection(source.parts):
+            continue
+        tree = ast.parse(
+            source.read_text(encoding="utf-8-sig"), filename=str(source)
+        )
+        for node in ast.walk(tree):
+            if not isinstance(node, ast.Call):
+                continue
+            name = None
+            if isinstance(node.func, ast.Name):
+                name = node.func.id
+            elif isinstance(node.func, ast.Attribute):
+                name = node.func.attr
+            if name != "_set_worker_pid":
+                continue
+            keywords = {keyword.arg for keyword in node.keywords}
+            if not {"run_id", "claim_lock"}.issubset(keywords):
+                missing.append(f"{source.relative_to(repo_root)}:{node.lineno}")
+    assert missing == []
 
 
 def test_rate_limit_exit_requeues_without_counting_failure(
@@ -4187,8 +5345,17 @@ def test_detect_stale_returns_running_task_with_no_heartbeat(kanban_home, monkey
 
     with kb.connect() as conn:
         t = kb.create_task(conn, title="stale-no-hb", assignee="worker")
-        kb.claim_task(conn, t)
-        kb._set_worker_pid(conn, t, os.getpid())
+        active = kb.claim_task(conn, t)
+        assert active is not None
+        assert active.current_run_id is not None
+        assert active.claim_lock is not None
+        assert kb._set_worker_pid(
+            conn,
+            t,
+            os.getpid(),
+            run_id=active.current_run_id,
+            claim_lock=active.claim_lock,
+        )
 
         # Rewind started_at so the task appears to have been running for 5 hours.
         five_hours_ago = int(time.time()) - (5 * 3600)
@@ -4219,8 +5386,17 @@ def test_detect_stale_returns_task_with_stale_heartbeat(kanban_home, monkeypatch
 
     with kb.connect() as conn:
         t = kb.create_task(conn, title="stale-hb", assignee="worker")
-        kb.claim_task(conn, t)
-        kb._set_worker_pid(conn, t, os.getpid())
+        active = kb.claim_task(conn, t)
+        assert active is not None
+        assert active.current_run_id is not None
+        assert active.claim_lock is not None
+        assert kb._set_worker_pid(
+            conn,
+            t,
+            os.getpid(),
+            run_id=active.current_run_id,
+            claim_lock=active.claim_lock,
+        )
 
         five_hours_ago = int(time.time()) - (5 * 3600)
         heartbeat_2h_ago = int(time.time()) - (2 * 3600)
@@ -4252,8 +5428,17 @@ def test_detect_stale_skips_task_with_recent_heartbeat(kanban_home, monkeypatch)
 
     with kb.connect() as conn:
         t = kb.create_task(conn, title="alive-hb", assignee="worker")
-        kb.claim_task(conn, t)
-        kb._set_worker_pid(conn, t, os.getpid())
+        active = kb.claim_task(conn, t)
+        assert active is not None
+        assert active.current_run_id is not None
+        assert active.claim_lock is not None
+        assert kb._set_worker_pid(
+            conn,
+            t,
+            os.getpid(),
+            run_id=active.current_run_id,
+            claim_lock=active.claim_lock,
+        )
 
         five_hours_ago = int(time.time()) - (5 * 3600)
         heartbeat_now = int(time.time())  # heartbeat just happened
@@ -4283,8 +5468,17 @@ def test_detect_stale_skips_recently_started_task(kanban_home, monkeypatch):
 
     with kb.connect() as conn:
         t = kb.create_task(conn, title="fresh", assignee="worker")
-        kb.claim_task(conn, t)
-        kb._set_worker_pid(conn, t, os.getpid())
+        active = kb.claim_task(conn, t)
+        assert active is not None
+        assert active.current_run_id is not None
+        assert active.claim_lock is not None
+        assert kb._set_worker_pid(
+            conn,
+            t,
+            os.getpid(),
+            run_id=active.current_run_id,
+            claim_lock=active.claim_lock,
+        )
 
         # Started only 1 hour ago — well within the 4h threshold.
         one_hour_ago = int(time.time()) - 3600
@@ -4311,8 +5505,17 @@ def test_detect_stale_skips_when_timeout_zero(kanban_home, monkeypatch):
 
     with kb.connect() as conn:
         t = kb.create_task(conn, title="disabled", assignee="worker")
-        kb.claim_task(conn, t)
-        kb._set_worker_pid(conn, t, os.getpid())
+        active = kb.claim_task(conn, t)
+        assert active is not None
+        assert active.current_run_id is not None
+        assert active.claim_lock is not None
+        assert kb._set_worker_pid(
+            conn,
+            t,
+            os.getpid(),
+            run_id=active.current_run_id,
+            claim_lock=active.claim_lock,
+        )
 
         five_hours_ago = int(time.time()) - (5 * 3600)
         with kb.write_txn(conn):
@@ -4338,8 +5541,17 @@ def test_detect_stale_skips_blocked_tasks(kanban_home, monkeypatch):
 
     with kb.connect() as conn:
         t = kb.create_task(conn, title="blocked-task", assignee="worker")
-        kb.claim_task(conn, t)
-        kb._set_worker_pid(conn, t, os.getpid())
+        active = kb.claim_task(conn, t)
+        assert active is not None
+        assert active.current_run_id is not None
+        assert active.claim_lock is not None
+        assert kb._set_worker_pid(
+            conn,
+            t,
+            os.getpid(),
+            run_id=active.current_run_id,
+            claim_lock=active.claim_lock,
+        )
 
         five_hours_ago = int(time.time()) - (5 * 3600)
         with kb.write_txn(conn):
@@ -4377,8 +5589,17 @@ def test_detect_stale_does_not_tick_failure_counter(kanban_home, monkeypatch):
 
     with kb.connect() as conn:
         t = kb.create_task(conn, title="stale-no-counter-tick", assignee="worker")
-        kb.claim_task(conn, t)
-        kb._set_worker_pid(conn, t, os.getpid())
+        active = kb.claim_task(conn, t)
+        assert active is not None
+        assert active.current_run_id is not None
+        assert active.claim_lock is not None
+        assert kb._set_worker_pid(
+            conn,
+            t,
+            os.getpid(),
+            run_id=active.current_run_id,
+            claim_lock=active.claim_lock,
+        )
 
         five_hours_ago = int(time.time()) - (5 * 3600)
         with kb.write_txn(conn):

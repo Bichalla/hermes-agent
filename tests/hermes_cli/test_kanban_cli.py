@@ -5,6 +5,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import subprocess
 import threading
 from pathlib import Path
 
@@ -72,6 +73,96 @@ def test_parse_branch_flag_rejects_empty_and_option_like():
         kc._parse_branch_flag("-bad")
     with pytest.raises(argparse.ArgumentTypeError):
         kc._parse_branch_flag("bad branch")
+
+
+@pytest.fixture
+def cli_project_create(tmp_path, monkeypatch):
+    """Run the real argparse -> command path against temp-only state."""
+    from hermes_cli import config
+    from hermes_cli import projects_db as pdb
+
+    home = tmp_path / ".hermes"
+    home.mkdir()
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    monkeypatch.setattr(Path, "home", lambda: tmp_path)
+    kb._INITIALIZED_PATHS.clear()
+    kb.init_db()
+
+    def run(*, mode: str, workspace_args: tuple[str, ...] = ()):
+        (home / "config.yaml").write_text(
+            f"kanban:\n  repo_writer_mode: {mode}\n",
+            encoding="utf-8",
+        )
+        config._LOAD_CONFIG_CACHE.clear()
+
+        repo = tmp_path / f"{mode}-project"
+        repo.mkdir()
+        subprocess.run(["git", "init", "-q", str(repo)], check=True)
+        with pdb.connect_closing() as project_conn:
+            project_id = pdb.create_project(
+                project_conn,
+                name=f"{mode} CLI Project",
+                folders=[str(repo)],
+            )
+            project = pdb.get_project(project_conn, project_id)
+        assert project is not None
+
+        parser = argparse.ArgumentParser(prog="hermes", add_help=False)
+        sub = parser.add_subparsers(dest="command")
+        kc.build_parser(sub)
+        args = parser.parse_args([
+            "kanban",
+            "create",
+            f"{mode} CLI task",
+            "--project",
+            project.slug,
+            *workspace_args,
+        ])
+        rc = kc.kanban_command(args)
+        with kb.connect_closing() as conn:
+            task = kb.list_tasks(conn, limit=1)[0]
+        return args, rc, task, project
+
+    yield run
+    config._LOAD_CONFIG_CACHE.clear()
+
+
+def test_red_cli_omitted_workspace_off_uses_project_worktree(cli_project_create):
+    marker = "repo_writer_mode_call_path_missing"
+    args, rc, task, project = cli_project_create(mode="off")
+
+    assert args.workspace is None, marker
+    assert rc == 0, marker
+    assert task.workspace_kind == "worktree", marker
+    assert task.workspace_path == os.path.join(
+        project.primary_path, ".worktrees", task.id
+    ), marker
+    assert task.branch_name == f"{project.slug}/{task.id}-off-cli-task", marker
+
+
+def test_red_cli_omitted_workspace_single_writer_uses_project_dir(cli_project_create):
+    marker = "repo_writer_mode_call_path_missing"
+    args, rc, task, project = cli_project_create(mode="single_writer")
+
+    assert args.workspace is None, marker
+    assert rc == 0, marker
+    assert task.workspace_kind == "dir", marker
+    assert task.workspace_path == project.primary_path, marker
+    assert task.branch_name is None, marker
+
+
+def test_red_cli_explicit_scratch_remains_scratch(cli_project_create):
+    marker = "repo_writer_mode_call_path_missing"
+    args, rc, task, _project = cli_project_create(
+        mode="single_writer",
+        workspace_args=("--workspace", "scratch"),
+    )
+
+    assert args.workspace == "scratch", marker
+    assert rc == 0, marker
+    assert task.workspace_kind == "scratch", marker
+    assert task.workspace_path is None, marker
+    assert task.branch_name is None, marker
 
 
 # ---------------------------------------------------------------------------

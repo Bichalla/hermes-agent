@@ -167,6 +167,15 @@ def _rewrite_handoff(conn, task_id, stored: Path, mutate_handoff=None, mutate_ev
     conn.commit()
 
 
+def _rebind_handoff_card(conn, task_id, stored: Path):
+    task = kb.get_task(conn, task_id)
+    assert task is not None and task.body is not None
+    body = json.loads(task.body)
+    body["contract"]["change_gate"]["artifact_sha256"] = hashlib.sha256(stored.read_bytes()).hexdigest()
+    conn.execute("UPDATE tasks SET body = ? WHERE id = ?", (json.dumps(body), task_id))
+    conn.commit()
+
+
 def test_lane_contract_exposes_bounded_change_gate_object():
     contract = parse_contract_body(
         implementation_body(
@@ -422,6 +431,122 @@ def test_wrong_stage_and_role_fail_before_artifact_authority(canonical_kanban_ho
             model_override="gpt-5.6-luna",
         )
         _claim_blocked_without_side_effects(conn, role_id, "CHANGE_GATE_ROLE_INVALID")
+
+
+def test_attached_handoff_path_missing_is_artifact_missing(canonical_kanban_home):
+    with kb.connect() as conn:
+        task_id, stored = _prepare_gate_task(conn, canonical_kanban_home)
+        stored.unlink()
+        _claim_blocked_without_side_effects(conn, task_id, "CHANGE_GATE_ARTIFACT_MISSING")
+
+
+def test_attached_handoff_non_regular_is_artifact_unsafe(canonical_kanban_home):
+    with kb.connect() as conn:
+        task_id, stored = _prepare_gate_task(conn, canonical_kanban_home)
+        stored.unlink()
+        stored.mkdir()
+        _claim_blocked_without_side_effects(conn, task_id, "CHANGE_GATE_ARTIFACT_UNSAFE")
+
+
+def test_attached_handoff_attachment_root_escape_is_artifact_unsafe(canonical_kanban_home):
+    with kb.connect() as conn:
+        task_id, stored = _prepare_gate_task(conn, canonical_kanban_home)
+        escaped = canonical_kanban_home / "escaped-handoff.json"
+        escaped.write_bytes(stored.read_bytes())
+        conn.execute("UPDATE task_attachments SET stored_path = ? WHERE task_id = ?", (str(escaped), task_id))
+        task = kb.get_task(conn, task_id)
+        assert task is not None and task.body is not None
+        body = json.loads(task.body)
+        body["contract"]["change_gate"]["artifact_ref"] = str(escaped)
+        body["contract"]["change_gate"]["artifact_sha256"] = hashlib.sha256(escaped.read_bytes()).hexdigest()
+        conn.execute("UPDATE tasks SET body = ? WHERE id = ?", (json.dumps(body), task_id))
+        conn.commit()
+        _claim_blocked_without_side_effects(conn, task_id, "CHANGE_GATE_ARTIFACT_UNSAFE")
+
+
+def test_malformed_handoff_with_correct_card_digest_is_schema_invalid(canonical_kanban_home):
+    with kb.connect() as conn:
+        task_id, stored = _prepare_gate_task(conn, canonical_kanban_home)
+        stored.write_bytes(b"{ malformed handoff")
+        _rebind_handoff_card(conn, task_id, stored)
+        _claim_blocked_without_side_effects(conn, task_id, "CHANGE_GATE_SCHEMA_INVALID")
+
+
+def test_policy_version_mismatch_with_rebound_digests_is_blocked(canonical_kanban_home):
+    with kb.connect() as conn:
+        task_id, stored = _prepare_gate_task(conn, canonical_kanban_home)
+        _rewrite_handoff(
+            conn,
+            task_id,
+            stored,
+            mutate_handoff=lambda handoff: handoff.update({"policy_version": "change-gate-policy/v999"}),
+        )
+        _claim_blocked_without_side_effects(conn, task_id, "CHANGE_GATE_POLICY_VERSION_MISMATCH")
+
+
+def test_validator_source_a_to_b_reloads_between_readiness_validations(canonical_kanban_home, monkeypatch):
+    with kb.connect() as conn:
+        task_a, _ = _prepare_gate_task(conn, canonical_kanban_home)
+        task_b, _ = _prepare_gate_task(conn, canonical_kanban_home)
+        a = kb.get_task(conn, task_a)
+        b = kb.get_task(conn, task_b)
+        assert a is not None and b is not None
+        attachments_a = kb.list_attachments(conn, task_a)
+        attachments_b = kb.list_attachments(conn, task_b)
+        original_read = lane_roles._read_trusted_file
+        original_load = lane_roles._load_change_gate_validator
+        source_path = lane_roles._CANONICAL_CHANGE_GATE_ROOT / "scripts/change_gate_validate.py"
+        source_reads = {"count": 0}
+        loaded_digests = []
+
+        def source_a_then_b(root, path, *, limit):
+            snapshot = original_read(root, path, limit=limit)
+            if Path(path) == source_path:
+                source_reads["count"] += 1
+                if source_reads["count"] >= 3:
+                    changed = snapshot.data + b"\n# deterministic source B\n"
+                    return replace(snapshot, data=changed, sha256=hashlib.sha256(changed).hexdigest())
+            return snapshot
+
+        def load_record(source):
+            loaded_digests.append(source.sha256)
+            return original_load(source)
+
+        monkeypatch.setattr(lane_roles, "_read_trusted_file", source_a_then_b)
+        monkeypatch.setattr(lane_roles, "_load_change_gate_validator", load_record)
+        first = lane_roles.check_change_gate_readiness(
+            a, attachments_a, attachment_root=kb.task_attachments_dir(task_a)
+        )
+        second = lane_roles.check_change_gate_readiness(
+            b, attachments_b, attachment_root=kb.task_attachments_dir(task_b)
+        )
+
+    assert first.ok is True
+    assert second.ok is True
+    assert len(loaded_digests) == 2
+    assert loaded_digests[0] != loaded_digests[1]
+    assert source_reads["count"] >= 4
+
+
+def test_intermediate_directory_replacement_between_snapshots_is_unsafe(canonical_kanban_home, monkeypatch):
+    with kb.connect() as conn:
+        task_id, stored = _prepare_gate_task(conn, canonical_kanban_home)
+        original_read = lane_roles._read_trusted_file
+        reads = {"handoff": 0}
+
+        def changed_intermediate_snapshot(root, path, *, limit):
+            snapshot = original_read(root, path, limit=limit)
+            if Path(path) == stored:
+                reads["handoff"] += 1
+                if reads["handoff"] == 2:
+                    changed_identity = tuple(snapshot.identity[:-1]) + (snapshot.identity[-1] + 1,)
+                    return replace(snapshot, identity=changed_identity)
+            return snapshot
+
+        monkeypatch.setattr(lane_roles, "_read_trusted_file", changed_intermediate_snapshot)
+        _claim_blocked_without_side_effects(conn, task_id, "CHANGE_GATE_ARTIFACT_UNSAFE")
+
+    assert reads["handoff"] == 2
 
 
 def test_handoff_final_and_intermediate_symlinks_fail_closed(canonical_kanban_home):

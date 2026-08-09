@@ -109,6 +109,25 @@ def _release_singleton_lock(handle) -> None:
         pass
 
 
+def _gate_skip_changed(state: dict[str, tuple], slug: str, skips: list[dict]) -> bool:
+    """Return true once per board/gate-state fingerprint; keep telemetry quiet."""
+    fingerprint = tuple(
+        sorted(
+            (
+                item.get("task_id"),
+                tuple(item.get("reason_codes", ())),
+            )
+            for item in skips
+        )
+    )
+    if not skips:
+        state.pop(slug, None)
+        return False
+    changed = state.get(slug) != fingerprint
+    state[slug] = fingerprint
+    return changed
+
+
 class GatewayKanbanWatchersMixin:
     """Kanban watcher / notifier / dispatcher loops for GatewayRunner."""
 
@@ -940,6 +959,7 @@ class GatewayKanbanWatchersMixin:
         HEALTH_WINDOW = 6
         bad_ticks = 0
         last_warn_at = 0
+        last_gate_skip_fingerprint: dict[str, tuple] = {}
         # Avoid hot-looping corrupt-looking board DBs, but do not suppress
         # same-fingerprint retries forever: transient WAL/open races can
         # surface as "database disk image is malformed" for one tick.
@@ -1236,7 +1256,12 @@ class GatewayKanbanWatchersMixin:
                 any_spawned = False
                 for slug, res in (results or []):
                     gate_skips = getattr(res, "skipped_change_gate", []) if res is not None else []
-                    if res is not None and (getattr(res, "spawned", None) or gate_skips):
+                    gate_changed = _gate_skip_changed(
+                        last_gate_skip_fingerprint, slug, gate_skips
+                    )
+                    if res is not None and (
+                        getattr(res, "spawned", None) or gate_changed
+                    ):
                         any_spawned = any_spawned or bool(getattr(res, "spawned", None))
                         # Quiet by default — only log when something actually
                         # happened, so an idle gateway stays silent. Change Gate

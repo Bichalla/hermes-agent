@@ -19,7 +19,7 @@ def kanban_home(tmp_path, monkeypatch):
     return home
 
 
-def test_claim_gate_refuses_before_write_transaction(kanban_home, monkeypatch):
+def test_claim_gate_authority_runs_inside_write_transaction(kanban_home, monkeypatch):
     with kb.connect() as conn:
         task_id = kb.create_task(
             conn,
@@ -28,14 +28,19 @@ def test_claim_gate_refuses_before_write_transaction(kanban_home, monkeypatch):
             assignee="default",
         )
 
-        def fail_if_locked(*_args, **_kwargs):
-            raise AssertionError("Change Gate must run before write_txn")
+        seen = []
+        original = kb._check_change_gate_before_claim
 
-        monkeypatch.setattr(kb, "write_txn", fail_if_locked)
+        def observe_transaction(connection, *args, **kwargs):
+            seen.append(connection.in_transaction)
+            return original(connection, *args, **kwargs)
+
+        monkeypatch.setattr(kb, "_check_change_gate_before_claim", observe_transaction)
         with pytest.raises(kb.ChangeGateBlocked) as exc_info:
             kb.claim_task(conn, task_id)
 
     assert exc_info.value.reason_codes == ["CHANGE_GATE_METADATA_MISSING"]
+    assert seen == [True]
 
 
 def test_dispatcher_projects_invalid_gate_as_bounded_skip_and_not_spawnable(kanban_home):

@@ -9,10 +9,12 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 import hashlib
-import importlib.util
 import json
+import os
 from pathlib import Path
 import re
+import stat
+import types
 from typing import Any, Iterable, Optional
 
 from hermes_constants import get_default_hermes_root
@@ -62,8 +64,10 @@ CHANGE_GATE_REASON_CODES = frozenset({
 })
 _CANONICAL_CHANGE_GATE_ROOT = Path("/Users/honbul/.hermes")
 _CHANGE_GATE_PACKET_LIMIT = 1024 * 1024
+_CHANGE_GATE_POLICY_LIMIT = 512 * 1024
 _MISSING = object()
 _validator_module: Any = None
+_validator_module_digest: Optional[str] = None
 
 
 @dataclass(frozen=True)
@@ -82,6 +86,18 @@ class ChangeGateReadiness:
     ok: bool
     reason_codes: list[str] = field(default_factory=list)
     bootstrap_active: bool = False
+
+
+@dataclass(frozen=True)
+class _StableFileSnapshot:
+    path: Path
+    data: bytes
+    sha256: str
+    identity: tuple[int, int, int, int, int, int]
+
+
+class _TrustedReadError(OSError):
+    """A rooted no-follow read could not prove the authorized file identity."""
 
 
 class ChangeGateBlocked(RuntimeError):
@@ -304,18 +320,147 @@ def _attachment_value(attachment: Any, name: str) -> Any:
     return getattr(attachment, name, None)
 
 
-def _load_change_gate_validator() -> Any:
-    """Load the canonical Phase 1 validator without subprocess or HERMES_HOME."""
-    global _validator_module
-    if _validator_module is not None:
+def _stat_identity(value: os.stat_result) -> tuple[int, int, int, int, int, int]:
+    return (
+        int(value.st_dev),
+        int(value.st_ino),
+        int(value.st_mode),
+        int(value.st_size),
+        int(value.st_mtime_ns),
+        int(value.st_ctime_ns),
+    )
+
+
+def _rooted_components(root: Path, target: Path) -> tuple[Path, list[str]]:
+    """Return an absolute target and safe relative components without resolving links."""
+    raw_parts = Path(os.fspath(target)).parts
+    if any(component in {".", ".."} for component in raw_parts):
+        raise _TrustedReadError("non-normalized rooted path")
+    root_abs = Path(os.path.abspath(os.fspath(root)))
+    target_abs = Path(os.path.abspath(os.fspath(target)))
+    if os.path.normpath(os.fspath(target_abs)) != os.fspath(target_abs):
+        raise _TrustedReadError("non-normalized rooted path")
+    try:
+        relative = target_abs.relative_to(root_abs)
+    except ValueError as exc:
+        raise _TrustedReadError("path escapes trusted root") from exc
+    components = list(relative.parts)
+    if not components or any(component in {"", ".", ".."} for component in components):
+        raise _TrustedReadError("invalid rooted path components")
+    return target_abs, components
+
+
+def _read_trusted_file(root: Path, target: Path, *, limit: int) -> _StableFileSnapshot:
+    """Read a regular file through descriptor-rooted, no-follow traversal."""
+    if not hasattr(os, "O_NOFOLLOW") or not hasattr(os, "O_DIRECTORY"):
+        raise _TrustedReadError("rooted no-follow traversal unavailable")
+    target_abs, components = _rooted_components(root, target)
+    try:
+        root_fd = os.open(
+            os.fspath(Path(os.path.abspath(os.fspath(root)))),
+            os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW,
+        )
+    except OSError as exc:
+        raise _TrustedReadError("trusted root could not be opened") from exc
+    parent_fd = root_fd
+    opened_dirs: list[int] = []
+    try:
+        for component in components[:-1]:
+            next_fd = os.open(
+                component,
+                os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW,
+                dir_fd=parent_fd,
+            )
+            info = os.fstat(next_fd)
+            if not stat.S_ISDIR(info.st_mode):
+                os.close(next_fd)
+                raise _TrustedReadError("intermediate component is not a directory")
+            opened_dirs.append(next_fd)
+            parent_fd = next_fd
+        final_fd = os.open(
+            components[-1], os.O_RDONLY | os.O_NOFOLLOW, dir_fd=parent_fd
+        )
+        try:
+            before = os.fstat(final_fd)
+            if not stat.S_ISREG(before.st_mode) or before.st_size > limit:
+                raise _TrustedReadError("final component is not a bounded regular file")
+            chunks: list[bytes] = []
+            total = 0
+            while total <= limit:
+                chunk = os.read(final_fd, min(65536, limit + 1 - total))
+                if not chunk:
+                    break
+                chunks.append(chunk)
+                total += len(chunk)
+                if total > limit:
+                    raise _TrustedReadError("file exceeds bounded read limit")
+            after = os.fstat(final_fd)
+            before_identity = _stat_identity(before)
+            after_identity = _stat_identity(after)
+            if before_identity != after_identity:
+                raise _TrustedReadError("file identity changed during read")
+            data = b"".join(chunks)
+            return _StableFileSnapshot(
+                path=target_abs,
+                data=data,
+                sha256=hashlib.sha256(data).hexdigest(),
+                identity=after_identity,
+            )
+        finally:
+            os.close(final_fd)
+    except FileNotFoundError as exc:
+        raise _TrustedReadError("trusted file missing") from exc
+    except OSError as exc:
+        if isinstance(exc, _TrustedReadError):
+            raise
+        raise _TrustedReadError("trusted file could not be opened") from exc
+    finally:
+        for fd in reversed(opened_dirs):
+            os.close(fd)
+        os.close(root_fd)
+
+
+def _snapshot_same(left: _StableFileSnapshot, right: _StableFileSnapshot) -> bool:
+    return (
+        left.path == right.path
+        and left.identity == right.identity
+        and left.sha256 == right.sha256
+    )
+
+
+def _strict_json_object(raw: bytes) -> dict[str, Any]:
+    def reject_duplicates(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
+        result: dict[str, Any] = {}
+        for key, value in pairs:
+            if key in result:
+                raise ValueError("duplicate JSON key")
+            result[key] = value
+        return result
+
+    value = json.loads(raw.decode("utf-8"), object_pairs_hook=reject_duplicates)
+    if not isinstance(value, dict):
+        raise ValueError("JSON root is not an object")
+    return value
+
+
+def _load_change_gate_validator(source: Optional[_StableFileSnapshot] = None) -> Any:
+    """Load the canonical validator from exact trusted-read bytes."""
+    global _validator_module, _validator_module_digest
+    if source is None:
+        source = _read_trusted_file(
+            _CANONICAL_CHANGE_GATE_ROOT,
+            _CANONICAL_CHANGE_GATE_ROOT / "scripts/change_gate_validate.py",
+            limit=_CHANGE_GATE_POLICY_LIMIT,
+        )
+    if _validator_module is not None and _validator_module_digest == source.sha256:
         return _validator_module
-    path = _CANONICAL_CHANGE_GATE_ROOT / "scripts" / "change_gate_validate.py"
-    spec = importlib.util.spec_from_file_location("hermes_change_gate_validator", path)
-    if spec is None or spec.loader is None:
-        raise ImportError("canonical Change Gate validator unavailable")
-    module = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(module)
+    module = types.ModuleType("hermes_change_gate_validator")
+    module.__file__ = os.fspath(source.path)
+    module.__package__ = ""
+    code = compile(source.data, os.fspath(source.path), "exec")
+    exec(code, module.__dict__)
     _validator_module = module
+    _validator_module_digest = source.sha256
     return module
 
 
@@ -357,7 +502,11 @@ def check_change_gate_readiness(
     contract = parse_contract_body(_task_get(task, "body", ""))
     if contract.lane != "implementation":
         return ChangeGateReadiness(ok=True)
-    if not contract.parseable or contract.change_gate is None:
+    if contract.change_gate is None:
+        parsed_body = _body_to_dict(_task_get(task, "body", "")) or {}
+        payload = _contract_payload(parsed_body)
+        if "change_gate" in payload:
+            return ChangeGateReadiness(False, ["CHANGE_GATE_SCHEMA_INVALID"])
         return ChangeGateReadiness(False, ["CHANGE_GATE_METADATA_MISSING"])
     metadata = contract.change_gate
     reasons: list[str] = []
@@ -378,39 +527,67 @@ def check_change_gate_readiness(
         return ChangeGateReadiness(False, ["CHANGE_GATE_ARTIFACT_NOT_ATTACHED"])
 
     artifact = Path(metadata.artifact_ref)
-    root = Path(attachment_root).resolve()
-    if artifact.is_symlink():
-        return ChangeGateReadiness(False, ["CHANGE_GATE_ARTIFACT_UNSAFE"])
-    if not artifact.exists():
-        return ChangeGateReadiness(False, ["CHANGE_GATE_ARTIFACT_MISSING"])
-    if not artifact.is_file():
-        return ChangeGateReadiness(False, ["CHANGE_GATE_ARTIFACT_UNSAFE"])
+    if not artifact.is_absolute():
+        artifact = Path(attachment_root) / artifact
     try:
-        artifact.resolve().relative_to(root)
-    except ValueError:
+        handoff_snapshot = _read_trusted_file(
+            Path(attachment_root), artifact, limit=_CHANGE_GATE_PACKET_LIMIT
+        )
+    except _TrustedReadError as exc:
+        if "missing" in str(exc):
+            return ChangeGateReadiness(False, ["CHANGE_GATE_ARTIFACT_MISSING"])
         return ChangeGateReadiness(False, ["CHANGE_GATE_ARTIFACT_UNSAFE"])
-
-    try:
-        raw = artifact.read_bytes()
-    except OSError:
-        return ChangeGateReadiness(False, ["CHANGE_GATE_ARTIFACT_UNSAFE"])
-    if len(raw) > _CHANGE_GATE_PACKET_LIMIT:
-        return ChangeGateReadiness(False, ["CHANGE_GATE_ARTIFACT_UNSAFE"])
-    if hashlib.sha256(raw).hexdigest() != metadata.artifact_sha256:
+    if handoff_snapshot.sha256 != metadata.artifact_sha256:
         return ChangeGateReadiness(False, ["CHANGE_GATE_DIGEST_MISMATCH"])
     try:
-        handoff = json.loads(raw.decode("utf-8"))
-    except (UnicodeDecodeError, json.JSONDecodeError):
+        handoff = _strict_json_object(handoff_snapshot.data)
+    except (UnicodeDecodeError, json.JSONDecodeError, ValueError):
         return ChangeGateReadiness(False, ["CHANGE_GATE_SCHEMA_INVALID"])
-    if not isinstance(handoff, dict):
-        return ChangeGateReadiness(False, ["CHANGE_GATE_SCHEMA_INVALID"])
+    evidence_ref = handoff.get("evidence_ref")
+    evidence_sha256 = handoff.get("evidence_sha256")
+    if not _is_clean_text(evidence_ref) or not re.fullmatch(r"[0-9a-f]{64}", str(evidence_sha256 or "")):
+        return ChangeGateReadiness(False, ["CHANGE_GATE_EVIDENCE_INVALID"])
+    evidence_path = Path(str(evidence_ref))
+    if not evidence_path.is_absolute():
+        evidence_path = _CANONICAL_CHANGE_GATE_ROOT / evidence_path
+    try:
+        evidence_snapshot = _read_trusted_file(
+            _CANONICAL_CHANGE_GATE_ROOT, evidence_path, limit=_CHANGE_GATE_PACKET_LIMIT
+        )
+        validator_source = _read_trusted_file(
+            _CANONICAL_CHANGE_GATE_ROOT,
+            _CANONICAL_CHANGE_GATE_ROOT / "scripts/change_gate_validate.py",
+            limit=_CHANGE_GATE_POLICY_LIMIT,
+        )
+        policy_snapshot = _read_trusted_file(
+            _CANONICAL_CHANGE_GATE_ROOT,
+            _CANONICAL_CHANGE_GATE_ROOT / "policies/change-gate/policy.yaml",
+            limit=_CHANGE_GATE_POLICY_LIMIT,
+        )
+        schema_paths = [
+            _CANONICAL_CHANGE_GATE_ROOT / "policies/change-gate" / name
+            for name in (
+                "evidence-packet.schema.json",
+                "frozen-handoff.schema.json",
+                "scope-deviation.schema.json",
+                "review-result.schema.json",
+            )
+        ]
+        schema_snapshots = [
+            _read_trusted_file(_CANONICAL_CHANGE_GATE_ROOT, path, limit=_CHANGE_GATE_POLICY_LIMIT)
+            for path in schema_paths
+        ]
+    except _TrustedReadError:
+        return ChangeGateReadiness(False, ["CHANGE_GATE_ARTIFACT_UNSAFE"])
+    if evidence_snapshot.sha256 != evidence_sha256:
+        return ChangeGateReadiness(False, ["CHANGE_GATE_DIGEST_MISMATCH"])
 
     validator = None
     try:
-        validator = _load_change_gate_validator()
+        validator = _load_change_gate_validator(validator_source)
         validator.validate_artifact(
             "handoff",
-            artifact,
+            handoff_snapshot.path,
             canonical_root=_CANONICAL_CHANGE_GATE_ROOT,
             schema_dir=_CANONICAL_CHANGE_GATE_ROOT / "policies/change-gate",
             policy_path=_CANONICAL_CHANGE_GATE_ROOT / "policies/change-gate/policy.yaml",
@@ -420,6 +597,50 @@ def check_change_gate_readiness(
         if validation_error is not None and isinstance(exc, validation_error):
             return ChangeGateReadiness(False, [_map_validator_failure(getattr(exc, "code", ""), handoff, task)])
         return ChangeGateReadiness(False, ["CHANGE_GATE_VALIDATOR_UNAVAILABLE"])
+
+    try:
+        post_snapshots = [
+            _read_trusted_file(_CANONICAL_CHANGE_GATE_ROOT, path, limit=_CHANGE_GATE_POLICY_LIMIT)
+            for path in schema_paths
+        ]
+        post_snapshots.append(
+            _read_trusted_file(
+                _CANONICAL_CHANGE_GATE_ROOT,
+                _CANONICAL_CHANGE_GATE_ROOT / "policies/change-gate/policy.yaml",
+                limit=_CHANGE_GATE_POLICY_LIMIT,
+            )
+        )
+        post_snapshots.append(
+            _read_trusted_file(
+                _CANONICAL_CHANGE_GATE_ROOT,
+                _CANONICAL_CHANGE_GATE_ROOT / "scripts/change_gate_validate.py",
+                limit=_CHANGE_GATE_POLICY_LIMIT,
+            )
+        )
+        post_snapshots.append(
+            _read_trusted_file(
+                _CANONICAL_CHANGE_GATE_ROOT,
+                evidence_snapshot.path,
+                limit=_CHANGE_GATE_PACKET_LIMIT,
+            )
+        )
+        post_snapshots.append(
+            _read_trusted_file(
+                Path(attachment_root), handoff_snapshot.path, limit=_CHANGE_GATE_PACKET_LIMIT
+            )
+        )
+    except _TrustedReadError:
+        return ChangeGateReadiness(False, ["CHANGE_GATE_ARTIFACT_UNSAFE"])
+    pre_snapshots = schema_snapshots + [
+        policy_snapshot,
+        validator_source,
+        evidence_snapshot,
+        handoff_snapshot,
+    ]
+    if any(not _snapshot_same(before, after) for before, after in zip(pre_snapshots, post_snapshots)):
+        return ChangeGateReadiness(False, ["CHANGE_GATE_ARTIFACT_UNSAFE"])
+    if _validator_module_digest != validator_source.sha256:
+        return ChangeGateReadiness(False, ["CHANGE_GATE_ARTIFACT_UNSAFE"])
 
     if handoff.get("task_id") != _task_get(task, "id", None):
         return ChangeGateReadiness(False, ["CHANGE_GATE_TASK_MISMATCH"])

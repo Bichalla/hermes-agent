@@ -4,14 +4,18 @@ from __future__ import annotations
 
 import hashlib
 import json
+import sqlite3
 import shutil
 import uuid
+from dataclasses import replace
 from pathlib import Path
 
 import pytest
 
 from hermes_cli import kanban_db as kb
+import hermes_cli.kanban_lane_roles as lane_roles
 from hermes_cli.kanban_lane_roles import parse_contract_body
+from gateway.kanban_watchers import _gate_skip_changed
 
 
 @pytest.fixture
@@ -199,6 +203,21 @@ def test_implementation_without_metadata_is_blocked_before_claim_side_effects(ka
         assert "CHANGE_GATE_METADATA_MISSING" in str(exc_info.value)
 
 
+def test_present_malformed_change_gate_is_schema_invalid(kanban_home):
+    body = implementation_body(
+        stage="PLAN_APPROVED",
+        artifact_ref="/Users/honbul/.hermes/missing.json",
+        artifact_sha256="a" * 64,
+        role="EXECUTOR",
+        unexpected="reject",
+    )
+    with kb.connect() as conn:
+        task_id = kb.create_task(conn, title="malformed gate", body=body, assignee="worker")
+        with pytest.raises(kb.ChangeGateBlocked) as exc_info:
+            kb.claim_task(conn, task_id)
+    assert exc_info.value.reason_codes == ["CHANGE_GATE_SCHEMA_INVALID"]
+
+
 def test_valid_handoff_claims_once_and_invalid_bootstrap_has_no_side_effects(canonical_kanban_home):
     with kb.connect() as conn:
         task_id, _ = _prepare_gate_task(conn, canonical_kanban_home)
@@ -251,6 +270,68 @@ def test_attachment_authority_and_digest_fail_closed(canonical_kanban_home):
             kb.claim_task(conn, unattached_id)
         assert exc_info.value.reason_codes == ["CHANGE_GATE_ARTIFACT_NOT_ATTACHED"]
 
+
+def test_handoff_final_and_intermediate_symlinks_fail_closed(canonical_kanban_home):
+    with kb.connect() as conn:
+        final_id, stored = _prepare_gate_task(conn, canonical_kanban_home)
+        outside = canonical_kanban_home / "outside.json"
+        outside.write_bytes(stored.read_bytes())
+        stored.unlink()
+        stored.symlink_to(outside)
+        with pytest.raises(kb.ChangeGateBlocked) as exc_info:
+            kb.claim_task(conn, final_id)
+        assert exc_info.value.reason_codes == ["CHANGE_GATE_ARTIFACT_UNSAFE"]
+
+        intermediate_id, intermediate = _prepare_gate_task(conn, canonical_kanban_home)
+        outside_dir = canonical_kanban_home / "outside-dir"
+        outside_dir.mkdir()
+        (outside_dir / "handoff.json").write_bytes(intermediate.read_bytes())
+        task_dir = intermediate.parent
+        intermediate.unlink()
+        task_dir.rmdir()
+        task_dir.symlink_to(outside_dir, target_is_directory=True)
+        with pytest.raises(kb.ChangeGateBlocked) as exc_info:
+            kb.claim_task(conn, intermediate_id)
+        assert exc_info.value.reason_codes == ["CHANGE_GATE_ARTIFACT_UNSAFE"]
+
+
+def test_handoff_replacement_during_validation_is_unsafe(canonical_kanban_home, monkeypatch):
+    with kb.connect() as conn:
+        task_id, stored = _prepare_gate_task(conn, canonical_kanban_home)
+        original = lane_roles._read_trusted_file
+        reads = {"handoff": 0}
+
+        def replaced_after_validation(root, target, *, limit):
+            snapshot = original(root, target, limit=limit)
+            if Path(target) == stored:
+                reads["handoff"] += 1
+                if reads["handoff"] == 2:
+                    return replace(snapshot, identity=tuple(value + 1 for value in snapshot.identity))
+            return snapshot
+
+        monkeypatch.setattr(lane_roles, "_read_trusted_file", replaced_after_validation)
+        with pytest.raises(kb.ChangeGateBlocked) as exc_info:
+            kb.claim_task(conn, task_id)
+
+    assert exc_info.value.reason_codes == ["CHANGE_GATE_ARTIFACT_UNSAFE"]
+    assert reads["handoff"] == 2
+
+
+def test_cached_validator_reloads_when_canonical_source_digest_changes():
+    source = lane_roles._read_trusted_file(
+        lane_roles._CANONICAL_CHANGE_GATE_ROOT,
+        lane_roles._CANONICAL_CHANGE_GATE_ROOT / "scripts/change_gate_validate.py",
+        limit=lane_roles._CHANGE_GATE_POLICY_LIMIT,
+    )
+    first = lane_roles._load_change_gate_validator(source)
+    changed = replace(
+        source,
+        data=source.data + b"\n# synthetic source revision\n",
+        sha256=hashlib.sha256(source.data + b"\n# synthetic source revision\n").hexdigest(),
+    )
+    second = lane_roles._load_change_gate_validator(changed)
+    assert second is not first
+    assert lane_roles._validator_module_digest == changed.sha256
 
 def test_dispatch_dry_run_skips_invalid_gate_without_mutation(kanban_home, monkeypatch):
     with kb.connect() as conn:
@@ -353,3 +434,160 @@ def test_cli_create_and_kanban_tool_round_trip_model_override(kanban_home, capsy
     with kb.connect() as conn:
         tool_task = kb.get_task(conn, result["task_id"])
         assert tool_task is not None and tool_task.model_override == "gpt-5.6-luna"
+
+
+def test_authoritative_gate_runs_inside_active_write_transaction(canonical_kanban_home, monkeypatch):
+    with kb.connect() as conn:
+        task_id, _ = _prepare_gate_task(conn, canonical_kanban_home)
+        seen = []
+        original = kb._check_change_gate_before_claim
+
+        def wrapped(connection, *args, **kwargs):
+            seen.append(connection.in_transaction)
+            return original(connection, *args, **kwargs)
+
+        monkeypatch.setattr(kb, "_check_change_gate_before_claim", wrapped)
+        claimed = kb.claim_task(conn, task_id)
+
+    assert claimed is not None
+    assert seen == [True]
+
+
+def test_competing_sqlite_writer_is_locked_during_authority_snapshot(canonical_kanban_home, monkeypatch):
+    with kb.connect() as conn:
+        task_id, _ = _prepare_gate_task(conn, canonical_kanban_home)
+        original = kb._check_change_gate_before_claim
+        blocked = []
+
+        def wrapped(connection, *args, **kwargs):
+            contender = sqlite3.connect(str(kb.kanban_db_path()), timeout=0.05)
+            try:
+                with pytest.raises(sqlite3.OperationalError):
+                    contender.execute("BEGIN IMMEDIATE")
+                blocked.append(True)
+            finally:
+                contender.close()
+            return original(connection, *args, **kwargs)
+
+        monkeypatch.setattr(kb, "_check_change_gate_before_claim", wrapped)
+        assert kb.claim_task(conn, task_id) is not None
+
+    assert blocked == [True]
+
+
+def _assert_authority_input_mutation_is_unsafe(canonical_kanban_home, monkeypatch, target_name):
+    with kb.connect() as conn:
+        task_id, _ = _prepare_gate_task(conn, canonical_kanban_home)
+        original_read = lane_roles._read_trusted_file
+        original_load = lane_roles._load_change_gate_validator
+        mutated = {"done": False}
+        target = lane_roles._CANONICAL_CHANGE_GATE_ROOT / target_name
+
+        def load_proxy(source):
+            actual = original_load(source)
+
+            class Proxy:
+                ValidationError = actual.ValidationError
+
+                @staticmethod
+                def validate_artifact(*args, **kwargs):
+                    result = actual.validate_artifact(*args, **kwargs)
+                    mutated["done"] = True
+                    return result
+
+            lane_roles._validator_module_digest = source.sha256
+            return Proxy()
+
+        def changed_post_snapshot(root, path, *, limit):
+            snapshot = original_read(root, path, limit=limit)
+            if mutated["done"] and Path(path) == target:
+                changed = snapshot.data + b"\n# simulated concurrent replacement\n"
+                return replace(
+                    snapshot,
+                    data=changed,
+                    sha256=hashlib.sha256(changed).hexdigest(),
+                )
+            return snapshot
+
+        monkeypatch.setattr(lane_roles, "_load_change_gate_validator", load_proxy)
+        monkeypatch.setattr(lane_roles, "_read_trusted_file", changed_post_snapshot)
+        with pytest.raises(kb.ChangeGateBlocked) as exc_info:
+            kb.claim_task(conn, task_id)
+
+    assert mutated["done"] is True
+    assert exc_info.value.reason_codes == ["CHANGE_GATE_ARTIFACT_UNSAFE"]
+
+
+def test_policy_mutation_during_canonical_validation_is_unsafe(canonical_kanban_home, monkeypatch):
+    _assert_authority_input_mutation_is_unsafe(
+        canonical_kanban_home, monkeypatch, "policies/change-gate/policy.yaml"
+    )
+
+
+def test_schema_mutation_during_canonical_validation_is_unsafe(canonical_kanban_home, monkeypatch):
+    _assert_authority_input_mutation_is_unsafe(
+        canonical_kanban_home,
+        monkeypatch,
+        "policies/change-gate/frozen-handoff.schema.json",
+    )
+
+
+def _purity_snapshot(home):
+    with kb.connect() as conn:
+        tables = {}
+        for table in ("tasks", "task_links", "task_events", "task_runs", "task_attachments"):
+            tables[table] = [tuple(row) for row in conn.execute(f"SELECT * FROM {table} ORDER BY 1")]
+    files = []
+    attachments = home / "attachments"
+    if attachments.exists():
+        for path in sorted(p for p in attachments.rglob("*") if p.is_file()):
+            files.append((str(path.relative_to(home)), path.stat().st_size, hashlib.sha256(path.read_bytes()).hexdigest()))
+    workspace_files = []
+    workspace_root = kb.workspaces_root()
+    if workspace_root.exists():
+        workspace_files = sorted(str(p.relative_to(workspace_root)) for p in workspace_root.rglob("*") if p.is_file())
+    lock = kb.kanban_db_path().with_name(kb.kanban_db_path().name + ".dispatch.lock")
+    return tables, files, workspace_files, lock.exists()
+
+
+def test_dispatch_dry_run_is_board_wide_read_only(kanban_home, monkeypatch):
+    with kb.connect() as conn:
+        invalid_id = kb.create_task(
+            conn,
+            title="invalid implementation",
+            body=json.dumps({"contract": {"lane": "implementation"}}),
+            assignee="default",
+        )
+        normal_id = kb.create_task(conn, title="normal ready", body="legacy", assignee="default")
+        parent_id = kb.create_task(conn, title="parent", body="legacy", assignee="default", initial_status="blocked")
+        conn.execute("UPDATE tasks SET status = 'done' WHERE id = ?", (parent_id,))
+        child_id = kb.create_task(conn, title="todo child", body="legacy", assignee="default", parents=(parent_id,))
+        conn.execute("UPDATE tasks SET status = 'todo' WHERE id = ?", (child_id,))
+        stale_id = kb.create_task(conn, title="stale running", body="legacy", assignee="default")
+        conn.execute(
+            "UPDATE tasks SET status = 'running', claim_lock = 'stale-lock', claim_expires = 0 WHERE id = ?",
+            (stale_id,),
+        )
+        conn.commit()
+        before = _purity_snapshot(kanban_home)
+        monkeypatch.setattr(kb, "profile_exists", lambda _name: True, raising=False)
+        result = kb.dispatch_once(conn, dry_run=True)
+        after = _purity_snapshot(kanban_home)
+
+    assert result.skipped_change_gate == [{"task_id": invalid_id, "reason_codes": ["CHANGE_GATE_METADATA_MISSING"]}]
+    assert any(row[0] == normal_id for row in before[0]["tasks"])
+    assert before == after
+
+
+def test_gateway_gate_skip_telemetry_is_quiet_until_state_changes():
+    state = {}
+    skips = [{"task_id": "t1", "reason_codes": ["CHANGE_GATE_METADATA_MISSING"]}]
+    assert _gate_skip_changed(state, "default", skips) is True
+    assert _gate_skip_changed(state, "default", skips) is False
+    assert _gate_skip_changed(
+        state,
+        "default",
+        [{"task_id": "t1", "reason_codes": ["CHANGE_GATE_SCHEMA_INVALID"]}],
+    ) is True
+    assert _gate_skip_changed(state, "default", []) is False
+    assert _gate_skip_changed(state, "default", skips) is True

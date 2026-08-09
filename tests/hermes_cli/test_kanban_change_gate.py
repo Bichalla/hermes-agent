@@ -899,6 +899,48 @@ def test_validator_source_mutation_during_canonical_validation_is_unsafe(canonic
     )
 
 
+def test_validator_fresh_load_failure_maps_to_unavailable(canonical_kanban_home, monkeypatch):
+    with kb.connect() as conn:
+        task_id, _ = _prepare_gate_task(conn, canonical_kanban_home)
+        task = kb.get_task(conn, task_id)
+        assert task is not None
+        attachments = kb.list_attachments(conn, task_id)
+
+        def fail_load(_source):
+            raise RuntimeError("deterministic validator compile failure")
+
+        monkeypatch.setattr(lane_roles, "_validator_module", None)
+        monkeypatch.setattr(lane_roles, "_validator_module_digest", None)
+        monkeypatch.setattr(lane_roles, "_load_change_gate_validator", fail_load)
+        result = lane_roles.check_change_gate_readiness(
+            task, attachments, attachment_root=kb.task_attachments_dir(task_id)
+        )
+
+    assert result.reason_codes == ["CHANGE_GATE_VALIDATOR_UNAVAILABLE"]
+    assert "CHANGE_GATE_ARTIFACT_UNSAFE" not in result.reason_codes
+
+
+def test_loaded_validator_digest_mismatch_remains_artifact_unsafe(canonical_kanban_home, monkeypatch):
+    with kb.connect() as conn:
+        task_id, _ = _prepare_gate_task(conn, canonical_kanban_home)
+        task = kb.get_task(conn, task_id)
+        assert task is not None
+        attachments = kb.list_attachments(conn, task_id)
+        original_load = lane_roles._load_change_gate_validator
+
+        def load_with_wrong_bound_digest(source):
+            validator = original_load(source)
+            lane_roles._validator_module_digest = "0" * 64
+            return validator
+
+        monkeypatch.setattr(lane_roles, "_load_change_gate_validator", load_with_wrong_bound_digest)
+        result = lane_roles.check_change_gate_readiness(
+            task, attachments, attachment_root=kb.task_attachments_dir(task_id)
+        )
+
+    assert result.reason_codes == ["CHANGE_GATE_ARTIFACT_UNSAFE"]
+
+
 def _assert_semantic_failure_with_authority_drift(
     canonical_kanban_home, monkeypatch, target_name, validation_code, validation_path="$"
 ):

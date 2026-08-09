@@ -678,10 +678,10 @@ def check_change_gate_readiness(
     ]
     if any(not _snapshot_same(before, after) for before, after in zip(pre_snapshots, post_snapshots)):
         return ChangeGateReadiness(False, ["CHANGE_GATE_ARTIFACT_UNSAFE"])
-    if _validator_module_digest != validator_source.sha256:
-        return ChangeGateReadiness(False, ["CHANGE_GATE_ARTIFACT_UNSAFE"])
     if validator_failure is not None:
         return ChangeGateReadiness(False, ["CHANGE_GATE_VALIDATOR_UNAVAILABLE"])
+    if validator is not None and _validator_module_digest != validator_source.sha256:
+        return ChangeGateReadiness(False, ["CHANGE_GATE_ARTIFACT_UNSAFE"])
     if validation_exception is not None:
         return ChangeGateReadiness(
             False,

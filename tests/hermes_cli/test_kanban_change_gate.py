@@ -899,6 +899,136 @@ def test_validator_source_mutation_during_canonical_validation_is_unsafe(canonic
     )
 
 
+def _assert_semantic_failure_with_authority_drift(
+    canonical_kanban_home, monkeypatch, target_name, validation_code, validation_path="$"
+):
+    with kb.connect() as conn:
+        task_id, _ = _prepare_gate_task(conn, canonical_kanban_home)
+        task = kb.get_task(conn, task_id)
+        assert task is not None
+        attachments = kb.list_attachments(conn, task_id)
+        original_read = lane_roles._read_trusted_file
+        original_load = lane_roles._load_change_gate_validator
+        target = lane_roles._CANONICAL_CHANGE_GATE_ROOT / target_name
+        state = {"validated": False}
+
+        def load_proxy(source):
+            actual = original_load(source)
+
+            class Proxy:
+                ValidationError = actual.ValidationError
+
+                @staticmethod
+                def validate_artifact(*args, **kwargs):
+                    state["validated"] = True
+                    raise actual.ValidationError(validation_code, validation_path)
+
+            lane_roles._validator_module_digest = source.sha256
+            return Proxy()
+
+        def changed_post_snapshot(root, path, *, limit):
+            snapshot = original_read(root, path, limit=limit)
+            if state["validated"] and Path(path) == target:
+                changed = snapshot.data + b"\n# deterministic authority drift\n"
+                return replace(snapshot, data=changed, sha256=hashlib.sha256(changed).hexdigest())
+            return snapshot
+
+        monkeypatch.setattr(lane_roles, "_load_change_gate_validator", load_proxy)
+        monkeypatch.setattr(lane_roles, "_read_trusted_file", changed_post_snapshot)
+        result = lane_roles.check_change_gate_readiness(
+            task, attachments, attachment_root=kb.task_attachments_dir(task_id)
+        )
+
+    assert state["validated"] is True
+    assert result.reason_codes == ["CHANGE_GATE_ARTIFACT_UNSAFE"]
+
+
+def test_policy_drift_wins_over_semantic_validation_failure(canonical_kanban_home, monkeypatch):
+    _assert_semantic_failure_with_authority_drift(
+        canonical_kanban_home,
+        monkeypatch,
+        "policies/change-gate/policy.yaml",
+        "POLICY_VERSION_MISMATCH",
+    )
+
+
+def test_schema_drift_wins_over_semantic_validation_failure(canonical_kanban_home, monkeypatch):
+    _assert_semantic_failure_with_authority_drift(
+        canonical_kanban_home,
+        monkeypatch,
+        "policies/change-gate/frozen-handoff.schema.json",
+        "SCHEMA_VALIDATION_FAILED",
+    )
+
+
+def test_evidence_drift_wins_over_semantic_validation_failure(canonical_kanban_home, monkeypatch):
+    with kb.connect() as conn:
+        task_id, stored = _prepare_gate_task(conn, canonical_kanban_home)
+        task = kb.get_task(conn, task_id)
+        assert task is not None
+        handoff = json.loads(stored.read_text(encoding="utf-8"))
+        evidence_target = Path(handoff["evidence_ref"])
+        original_read = lane_roles._read_trusted_file
+        original_load = lane_roles._load_change_gate_validator
+        state = {"validated": False}
+
+        def load_proxy(source):
+            actual = original_load(source)
+
+            class Proxy:
+                ValidationError = actual.ValidationError
+
+                @staticmethod
+                def validate_artifact(*args, **kwargs):
+                    state["validated"] = True
+                    raise actual.ValidationError("SCHEMA_VALIDATION_FAILED", str(evidence_target))
+
+            lane_roles._validator_module_digest = source.sha256
+            return Proxy()
+
+        def changed_post_snapshot(root, path, *, limit):
+            snapshot = original_read(root, path, limit=limit)
+            if state["validated"] and Path(path) == evidence_target:
+                changed = snapshot.data + b"\n# deterministic evidence drift\n"
+                return replace(snapshot, data=changed, sha256=hashlib.sha256(changed).hexdigest())
+            return snapshot
+
+        monkeypatch.setattr(lane_roles, "_load_change_gate_validator", load_proxy)
+        monkeypatch.setattr(lane_roles, "_read_trusted_file", changed_post_snapshot)
+        result = lane_roles.check_change_gate_readiness(
+            task, kb.list_attachments(conn, task_id), attachment_root=kb.task_attachments_dir(task_id)
+        )
+
+    assert state["validated"] is True
+    assert result.reason_codes == ["CHANGE_GATE_ARTIFACT_UNSAFE"]
+
+
+@pytest.mark.parametrize("component", ["*", "?", "[abc]", ".", ".."])
+def test_raw_unsafe_path_components_are_artifact_unsafe(canonical_kanban_home, component):
+    with kb.connect() as conn:
+        task_id = kb.create_task(
+            conn,
+            title="unsafe rooted component",
+            body=implementation_body(
+                stage="PLAN_APPROVED",
+                artifact_ref=f"{canonical_kanban_home}/attachments/pending/{component}/handoff.json",
+                artifact_sha256="a" * 64,
+                role="EXECUTOR",
+            ),
+            assignee="change-gate-xhigh",
+            model_override="gpt-5.6-luna",
+        )
+        raw_path = f"{canonical_kanban_home}/attachments/{task_id}/{component}/handoff.json"
+        task = kb.get_task(conn, task_id)
+        assert task is not None and task.body is not None
+        body = json.loads(task.body)
+        body["contract"]["change_gate"]["artifact_ref"] = raw_path
+        conn.execute("UPDATE tasks SET body = ? WHERE id = ?", (json.dumps(body), task_id))
+        kb.add_attachment(conn, task_id, filename="handoff.json", stored_path=raw_path, size=0)
+        conn.commit()
+        _claim_blocked_without_side_effects(conn, task_id, "CHANGE_GATE_ARTIFACT_UNSAFE")
+
+
 def _purity_snapshot(home):
     with kb.connect() as conn:
         tables = {}

@@ -333,11 +333,23 @@ def _stat_identity(value: os.stat_result) -> tuple[int, int, int, int, int, int]
     )
 
 
-def _rooted_components(root: Path, target: Path) -> tuple[Path, list[str]]:
+def _rooted_components(root: Path, target: Path | str) -> tuple[Path, list[str]]:
     """Return an absolute target and safe relative components without resolving links."""
-    raw_parts = Path(os.fspath(target)).parts
-    if any(component in {".", ".."} for component in raw_parts):
+    raw_target = os.fspath(target)
+    if isinstance(raw_target, bytes):
+        raw_target = os.fsdecode(raw_target)
+    if not raw_target:
         raise _TrustedReadError("non-normalized rooted path")
+    raw_parts = raw_target.split(os.sep)
+    if raw_target.startswith(os.sep):
+        raw_parts = raw_parts[1:]
+    if any(
+        not component
+        or component in {".", ".."}
+        or any(char in component for char in "*?[]")
+        for component in raw_parts
+    ):
+        raise _TrustedReadError("unsafe rooted path component")
     root_abs = Path(os.path.abspath(os.fspath(root)))
     target_abs = Path(os.path.abspath(os.fspath(target)))
     if os.path.normpath(os.fspath(target_abs)) != os.fspath(target_abs):
@@ -352,7 +364,7 @@ def _rooted_components(root: Path, target: Path) -> tuple[Path, list[str]]:
     return target_abs, components
 
 
-def _read_trusted_file(root: Path, target: Path, *, limit: int) -> _StableFileSnapshot:
+def _read_trusted_file(root: Path, target: Path | str, *, limit: int) -> _StableFileSnapshot:
     """Read a regular file through descriptor-rooted, no-follow traversal."""
     if not hasattr(os, "O_NOFOLLOW") or not hasattr(os, "O_DIRECTORY"):
         raise _TrustedReadError("rooted no-follow traversal unavailable")
@@ -548,9 +560,10 @@ def check_change_gate_readiness(
     if metadata.artifact_ref not in stored_paths:
         return ChangeGateReadiness(False, ["CHANGE_GATE_ARTIFACT_NOT_ATTACHED"])
 
-    artifact = Path(metadata.artifact_ref)
-    if not artifact.is_absolute():
-        artifact = Path(attachment_root) / artifact
+    artifact_ref = str(metadata.artifact_ref)
+    artifact = artifact_ref if os.path.isabs(artifact_ref) else os.path.join(
+        os.fspath(attachment_root), artifact_ref
+    )
     try:
         handoff_snapshot = _read_trusted_file(
             Path(attachment_root), artifact, limit=_CHANGE_GATE_PACKET_LIMIT
@@ -569,9 +582,10 @@ def check_change_gate_readiness(
     evidence_sha256 = handoff.get("evidence_sha256")
     if not _is_clean_text(evidence_ref) or not re.fullmatch(r"[0-9a-f]{64}", str(evidence_sha256 or "")):
         return ChangeGateReadiness(False, ["CHANGE_GATE_EVIDENCE_INVALID"])
-    evidence_path = Path(str(evidence_ref))
-    if not evidence_path.is_absolute():
-        evidence_path = _CANONICAL_CHANGE_GATE_ROOT / evidence_path
+    evidence_ref_text = str(evidence_ref)
+    evidence_path = evidence_ref_text if os.path.isabs(evidence_ref_text) else os.path.join(
+        os.fspath(_CANONICAL_CHANGE_GATE_ROOT), evidence_ref_text
+    )
     try:
         evidence_snapshot = _read_trusted_file(
             _CANONICAL_CHANGE_GATE_ROOT, evidence_path, limit=_CHANGE_GATE_PACKET_LIMIT
@@ -605,6 +619,8 @@ def check_change_gate_readiness(
         return ChangeGateReadiness(False, ["CHANGE_GATE_EVIDENCE_INVALID"])
 
     validator = None
+    validation_exception = None
+    validator_failure = None
     try:
         validator = _load_change_gate_validator(validator_source)
         validator.validate_artifact(
@@ -617,16 +633,9 @@ def check_change_gate_readiness(
     except Exception as exc:
         validation_error = getattr(validator, "ValidationError", None)
         if validation_error is not None and isinstance(exc, validation_error):
-            return ChangeGateReadiness(
-                False,
-                [_map_validator_failure(
-                    getattr(exc, "code", ""),
-                    handoff,
-                    task,
-                    getattr(exc, "path", None),
-                )],
-            )
-        return ChangeGateReadiness(False, ["CHANGE_GATE_VALIDATOR_UNAVAILABLE"])
+            validation_exception = exc
+        else:
+            validator_failure = exc
 
     try:
         post_snapshots = [
@@ -671,6 +680,18 @@ def check_change_gate_readiness(
         return ChangeGateReadiness(False, ["CHANGE_GATE_ARTIFACT_UNSAFE"])
     if _validator_module_digest != validator_source.sha256:
         return ChangeGateReadiness(False, ["CHANGE_GATE_ARTIFACT_UNSAFE"])
+    if validator_failure is not None:
+        return ChangeGateReadiness(False, ["CHANGE_GATE_VALIDATOR_UNAVAILABLE"])
+    if validation_exception is not None:
+        return ChangeGateReadiness(
+            False,
+            [_map_validator_failure(
+                getattr(validation_exception, "code", ""),
+                handoff,
+                task,
+                getattr(validation_exception, "path", None),
+            )],
+        )
 
     if handoff.get("task_id") != _task_get(task, "id", None):
         return ChangeGateReadiness(False, ["CHANGE_GATE_TASK_MISMATCH"])

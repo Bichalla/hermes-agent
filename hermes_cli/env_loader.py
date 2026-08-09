@@ -6,7 +6,10 @@ import os
 import sys
 from pathlib import Path
 
-from dotenv import load_dotenv
+from hermes_cli.repo_writer_context import (
+    REPO_WRITER_CONTEXT_ENV,
+    is_repo_writer_context,
+)
 from utils import atomic_replace, fast_safe_load
 
 
@@ -37,6 +40,12 @@ _SECRET_SOURCES: dict[str, str] = {}
 # in-process cache prevents redundant network calls, but the print, the
 # config re-parse, and the ASCII sanitization sweep still ran every time.
 _APPLIED_HOMES: set[str] = set()
+
+def _restore_repo_writer_context() -> None:
+    if is_repo_writer_context():
+        os.environ[REPO_WRITER_CONTEXT_ENV] = "1"
+    else:
+        os.environ.pop(REPO_WRITER_CONTEXT_ENV, None)
 
 
 def get_secret_source(env_var: str) -> str | None:
@@ -152,10 +161,34 @@ def _sanitize_loaded_credentials() -> None:
 
 
 def _load_dotenv_with_fallback(path: Path, *, override: bool) -> None:
+    disabled = os.environ.get("PYTHON_DOTENV_DISABLED", "").casefold()
+    if disabled in {"1", "true", "t", "yes", "y"}:
+        return
+
+    def _parse(encoding: str) -> dict[str, str | None]:
+        # DotEnv owns python-dotenv's parsing, interpolation, duplicate-key,
+        # override-precedence, and key-without-value semantics. We only replace
+        # its final environment-write loop so the protected marker is never
+        # transiently assigned by an untrusted dotenv source.
+        from dotenv.main import DotEnv
+
+        return DotEnv(
+            dotenv_path=path,
+            override=override,
+            encoding=encoding,
+        ).dict()
+
     try:
-        load_dotenv(dotenv_path=path, override=override, encoding="utf-8")
+        values = _parse("utf-8")
     except UnicodeDecodeError:
-        load_dotenv(dotenv_path=path, override=override, encoding="latin-1")
+        values = _parse("latin-1")
+    for key, value in values.items():
+        if key == REPO_WRITER_CONTEXT_ENV:
+            continue
+        if key in os.environ and not override:
+            continue
+        if value is not None:
+            os.environ[key] = value
     # Strip non-ASCII characters from credential env vars that were just
     # loaded.  API keys must be pure ASCII since they're sent as HTTP
     # header values (httpx encodes headers as ASCII).  Non-ASCII chars
@@ -230,6 +263,20 @@ def load_hermes_dotenv(
       the user env exists.
     - if no user env exists, the project `.env` also overrides stale shell vars.
     """
+    try:
+        return _load_hermes_dotenv_impl(
+            hermes_home=hermes_home,
+            project_env=project_env,
+        )
+    finally:
+        _restore_repo_writer_context()
+
+
+def _load_hermes_dotenv_impl(
+    *,
+    hermes_home: str | os.PathLike | None = None,
+    project_env: str | os.PathLike | None = None,
+) -> list[Path]:
     loaded: list[Path] = []
 
     home_path = Path(hermes_home or os.getenv("HERMES_HOME", Path.home() / ".hermes"))
@@ -343,7 +390,24 @@ def _apply_external_secret_sources(home_path: Path) -> None:
         return
 
     try:
-        report = apply_all(cfg, home_path)
+        class _ProtectedEnvironment:
+            """Delegate env access while dropping the protected marker write."""
+
+            def get(self, key, default=None):
+                return os.environ.get(key, default)
+
+            def __setitem__(self, key, value):
+                if key != REPO_WRITER_CONTEXT_ENV:
+                    os.environ[key] = value
+
+        report = apply_all(cfg, home_path, environ=_ProtectedEnvironment())
+        # Keep provenance/status output honest when a source attempted to
+        # supply the protected internal marker through a mapped or bulk secret.
+        report.provenance.pop(REPO_WRITER_CONTEXT_ENV, None)
+        for source_report in report.sources:
+            if REPO_WRITER_CONTEXT_ENV in source_report.applied:
+                source_report.applied.remove(REPO_WRITER_CONTEXT_ENV)
+                source_report.skipped_protected.append(REPO_WRITER_CONTEXT_ENV)
     except Exception:  # noqa: BLE001 — belt-and-braces; apply_all shouldn't raise
         return
 

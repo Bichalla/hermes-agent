@@ -8,6 +8,7 @@ import os
 import posixpath
 import sys
 import threading
+from contextlib import ExitStack
 from pathlib import Path, PurePosixPath
 
 from agent.file_safety import get_read_block_error
@@ -19,11 +20,34 @@ from tools.file_operations import (
 )
 from tools import file_state
 from agent.redact import redact_sensitive_text
+from hermes_cli.repo_write_guard import (
+    RepoWriteGuard,
+    RepoWriteGuardCode,
+    RepoWriteGuardError,
+)
+from tools.patch_parser import apply_v4a_operations, parse_v4a_patch
 
 logger = logging.getLogger(__name__)
 
 
 _EXPECTED_WRITE_ERRNOS = {errno.EACCES, errno.EPERM, errno.EROFS}
+_REPO_WRITE_GUARD_DENIED = {
+    "status": "blocked",
+    "error": "repo_write_guard_denied",
+}
+
+
+def _repo_write_guard_denied(error: RepoWriteGuardError) -> str:
+    """Return constant-safe JSON for every typed repository guard denial."""
+    result = dict(_REPO_WRITE_GUARD_DENIED)
+    result["code"] = error.code.value
+    return json.dumps(result, ensure_ascii=False)
+
+
+def _repo_write_guard_path_denied() -> str:
+    result = dict(_REPO_WRITE_GUARD_DENIED)
+    result["code"] = RepoWriteGuardCode.PATH.value
+    return json.dumps(result, ensure_ascii=False)
 
 
 def _expand_tilde(path: str) -> str:
@@ -593,12 +617,20 @@ def _get_hermes_config_resolved() -> str | None:
     return _hermes_config_resolved
 
 
-def _check_sensitive_path(filepath: str, task_id: str = "default") -> str | None:
+def _check_sensitive_path(
+    filepath: str,
+    task_id: str = "default",
+    *,
+    resolved_path: str | None = None,
+) -> str | None:
     """Return an error message if the path targets a sensitive system location."""
-    try:
-        resolved = str(_resolve_path_for_task(filepath, task_id))
-    except (OSError, ValueError):
-        resolved = filepath
+    if resolved_path is None:
+        try:
+            resolved = str(_resolve_path_for_task(filepath, task_id))
+        except (OSError, ValueError):
+            resolved = filepath
+    else:
+        resolved = resolved_path
     normalized = os.path.normpath(_expand_tilde(filepath))
     _err = (
         f"Refusing to write to sensitive system path: {filepath}\n"
@@ -657,7 +689,12 @@ def _get_container_mirror_prefix_for_task(task_id: str = "default") -> str | Non
     return None
 
 
-def _check_cross_profile_path(filepath: str, task_id: str = "default") -> str | None:
+def _check_cross_profile_path(
+    filepath: str,
+    task_id: str = "default",
+    *,
+    resolved_path: str | None = None,
+) -> str | None:
     """Return a soft-guard warning when ``filepath`` lands in another Hermes
     profile's scoped area, a host-side sandbox-mirror of authoritative profile
     state, or the Docker container's sandbox mirror of Hermes state.
@@ -698,10 +735,13 @@ def _check_cross_profile_path(filepath: str, task_id: str = "default") -> str | 
     # Resolve via the task's cwd so a relative ``skills/foo/SKILL.md``
     # in a session that cd'd into ``~/.hermes/profiles/other/`` is
     # classified against the right base.
-    try:
-        resolved = str(_resolve_path_for_task(filepath, task_id))
-    except (OSError, ValueError):
-        resolved = filepath
+    if resolved_path is None:
+        try:
+            resolved = str(_resolve_path_for_task(filepath, task_id))
+        except (OSError, ValueError):
+            resolved = filepath
+    else:
+        resolved = resolved_path
 
     warning = get_cross_profile_warning(resolved)
     if warning is not None:
@@ -1450,7 +1490,12 @@ def notify_other_tool_call(task_id: str = "default"):
                 task_data["dedup_hits"].clear()
 
 
-def _invalidate_dedup_for_path(filepath: str, task_id: str) -> None:
+def _invalidate_dedup_for_path(
+    filepath: str,
+    task_id: str,
+    *,
+    resolved_path: str | None = None,
+) -> None:
     """Remove all dedup cache entries whose resolved path matches *filepath*.
 
     Called after write_file and patch so that a subsequent read_file on
@@ -1463,10 +1508,13 @@ def _invalidate_dedup_for_path(filepath: str, task_id: str) -> None:
     Must be called with ``_read_tracker_lock`` **not** held — acquires it
     internally.
     """
-    try:
-        resolved = str(_resolve_path(filepath))
-    except (OSError, ValueError):
-        return
+    if resolved_path is None:
+        try:
+            resolved = str(_resolve_path_for_task(filepath, task_id))
+        except (OSError, ValueError):
+            return
+    else:
+        resolved = resolved_path
     with _read_tracker_lock:
         task_data = _read_tracker.get(task_id)
         if task_data is None:
@@ -1480,7 +1528,12 @@ def _invalidate_dedup_for_path(filepath: str, task_id: str) -> None:
             del dedup[k]
 
 
-def _update_read_timestamp(filepath: str, task_id: str) -> None:
+def _update_read_timestamp(
+    filepath: str,
+    task_id: str,
+    *,
+    resolved_path: str | None = None,
+) -> None:
     """Record the file's current modification time after a successful write.
 
     Called after write_file and patch so that consecutive edits by the
@@ -1490,10 +1543,17 @@ def _update_read_timestamp(filepath: str, task_id: str) -> None:
     Also invalidates the dedup cache for the written path so that
     subsequent reads return fresh content (fixes #13144).
     """
-    # Invalidate dedup first (before acquiring lock for timestamp update).
-    _invalidate_dedup_for_path(filepath, task_id)
+    if resolved_path is None:
+        try:
+            resolved = str(_resolve_path_for_task(filepath, task_id))
+        except (OSError, ValueError):
+            return
+    else:
+        resolved = resolved_path
+    # Reuse the exact string for dedup invalidation; never resolve through the
+    # nested helper after the mutation endpoint has already been canonicalized.
+    _invalidate_dedup_for_path(filepath, task_id, resolved_path=resolved)
     try:
-        resolved = str(_resolve_path_for_task(filepath, task_id))
         current_mtime = os.path.getmtime(resolved)
     except (OSError, ValueError):
         return
@@ -1504,17 +1564,25 @@ def _update_read_timestamp(filepath: str, task_id: str) -> None:
             _cap_read_tracker_data(task_data)
 
 
-def _check_file_staleness(filepath: str, task_id: str) -> str | None:
+def _check_file_staleness(
+    filepath: str,
+    task_id: str,
+    *,
+    resolved_path: str | None = None,
+) -> str | None:
     """Check whether a file was modified since the agent last read it.
 
     Returns a warning string if the file is stale (mtime changed since
     the last read_file call for this task), or None if the file is fresh
     or was never read.  Does not block — the write still proceeds.
     """
-    try:
-        resolved = str(_resolve_path_for_task(filepath, task_id))
-    except (OSError, ValueError):
-        return None
+    if resolved_path is None:
+        try:
+            resolved = str(_resolve_path_for_task(filepath, task_id))
+        except (OSError, ValueError):
+            return None
+    else:
+        resolved = resolved_path
     with _read_tracker_lock:
         task_data = _read_tracker.get(task_id)
         if not task_data:
@@ -1574,35 +1642,36 @@ def write_file_tool(path: str, content: str, task_id: str = "default",
                     session_id: str | None = None) -> str:
     """Write content to a file.
 
-    ``cross_profile`` opts out of the soft cross-Hermes-profile guard. The
-    guard fires only on writes that land in another profile's
-    skills/plugins/cron/memories directory; everything else is unaffected.
-    Pass ``True`` after explicit user direction — same shape as ``force``
-    on the terminal tool.
+    Host-local Git endpoints are protected by the cross-process repository
+    guard for the complete stale-check, mutation, lint, and bookkeeping window.
+    Non-local backends and host paths outside Git retain their legacy behavior.
     """
-    sensitive_err = _check_sensitive_path(path, task_id)
-    if sensitive_err:
-        return tool_error(sensitive_err)
-    if not cross_profile:
-        cross_warning = _check_cross_profile_path(path, task_id)
-        if cross_warning:
-            return tool_error(cross_warning)
     if _is_internal_file_tool_content(content):
         return tool_error(
             "Refusing to write internal read_file display text as file content. "
             "Strip read_file line-number prefixes or reconstruct the intended "
             "file contents before writing."
         )
+
+    local_backend = _terminal_env_type_for_task(task_id) == "local"
     try:
-        # Resolve once for the registry lock + stale check.  Failures here
-        # fall back to the legacy path — write proceeds, per-task staleness
-        # check below still runs.
         try:
-            _resolved = str(_resolve_path_for_task(path, task_id))
+            resolved_path = _resolve_path_for_task(path, task_id)
+            _resolved = str(resolved_path)
         except Exception:
+            if local_backend:
+                return _repo_write_guard_path_denied()
+            resolved_path = None
             _resolved = None
 
         if _resolved is None:
+            sensitive_err = _check_sensitive_path(path, task_id)
+            if sensitive_err:
+                return tool_error(sensitive_err)
+            if not cross_profile:
+                cross_profile_warning = _check_cross_profile_path(path, task_id)
+                if cross_profile_warning:
+                    return tool_error(cross_profile_warning)
             stale_warning = _check_file_staleness(path, task_id)
             file_ops = _get_file_ops(task_id)
             result = file_ops.write_file(path, content)
@@ -1614,16 +1683,31 @@ def write_file_tool(path: str, content: str, task_id: str = "default",
             _update_read_timestamp(path, task_id)
             return json.dumps(result_dict, ensure_ascii=False)
 
-        # Serialize the read→modify→write region per-path so concurrent
-        # subagents can't interleave on the same file.  Different paths
-        # remain fully parallel.
-        with file_state.lock_path(_resolved):
-            # Cross-agent staleness wins over per-task warning when both
-            # fire — its message names the sibling subagent.
+        with ExitStack() as locks:
+            # The repository guard is deliberately OUTSIDE the existing
+            # per-path lock, establishing one stable global lock order.
+            if local_backend and isinstance(resolved_path, Path):
+                repository_guard = RepoWriteGuard([resolved_path])
+                locks.callback(repository_guard.release)
+                repository_guard.acquire()
+
+            sensitive_err = _check_sensitive_path(
+                path, task_id, resolved_path=_resolved
+            )
+            if sensitive_err:
+                return tool_error(sensitive_err)
+            if not cross_profile:
+                cross_profile_warning = _check_cross_profile_path(
+                    path, task_id, resolved_path=_resolved
+                )
+                if cross_profile_warning:
+                    return tool_error(cross_profile_warning)
+
+            locks.enter_context(file_state.lock_path(_resolved))
             cross_warning = file_state.check_stale(task_id, _resolved)
-            stale_warning = _check_file_staleness(path, task_id)
-            # Workspace-divergence warning: relative path resolving outside the
-            # terminal's cwd (the worktree-cwd bug). Lowest priority of the three.
+            stale_warning = _check_file_staleness(
+                path, task_id, resolved_path=_resolved
+            )
             cwd_warning = _path_resolution_warning(path, Path(_resolved), task_id)
             file_ops = _get_file_ops(task_id)
             result = file_ops.write_file(_resolved, content)
@@ -1631,19 +1715,16 @@ def write_file_tool(path: str, content: str, task_id: str = "default",
             effective_warning = cross_warning or stale_warning or cwd_warning
             if effective_warning:
                 result_dict["_warning"] = effective_warning
-            # Always report the ABSOLUTE path actually written, so a wrong-cwd
-            # mismatch is visible in the response instead of silently routing
-            # the edit to the wrong checkout.
             result_dict["resolved_path"] = _resolved
             if not result_dict.get("error"):
                 result_dict["files_modified"] = [_resolved]
                 _mark_verification_stale(task_id, [_resolved], session_id=session_id)
-            # Refresh stamps after the successful write so consecutive
-            # writes by this task don't trigger false staleness warnings.
-            _update_read_timestamp(path, task_id)
+            _update_read_timestamp(path, task_id, resolved_path=_resolved)
             if not result_dict.get("error"):
                 file_state.note_write(task_id, _resolved)
         return json.dumps(result_dict, ensure_ascii=False)
+    except RepoWriteGuardError as error:
+        return _repo_write_guard_denied(error)
     except Exception as e:
         if _is_expected_write_exception(e):
             logger.debug("write_file expected denial: %s: %s", type(e).__name__, e)
@@ -1656,194 +1737,266 @@ def patch_tool(mode: str = "replace", path: str = None, old_string: str = None,
                new_string: str = None, replace_all: bool = False, patch: str = None,
                task_id: str = "default", cross_profile: bool = False,
                session_id: str | None = None) -> str:
-    """Patch a file using replace mode or V4A patch format.
+    """Patch exact resolved endpoints, repository guard before path locks."""
+    local_backend = _terminal_env_type_for_task(task_id) == "local"
+    operations = None
+    endpoint_names: list[str] = []
+    replace_target = path or ""
 
-    ``cross_profile`` opts out of the soft cross-Hermes-profile guard for
-    targets under another profile's skills/plugins/cron/memories
-    directory. Same shape as ``write_file``'s flag.
-    """
-    # Check sensitive paths for both replace (explicit path) and V4A patch (extract paths)
-    _paths_to_check = []
-    if path:
-        _paths_to_check.append(path)
-    if mode == "patch" and patch:
-        import re as _re
+    if mode == "replace":
+        if not path:
+            return tool_error("path required")
+        if old_string is None or new_string is None:
+            return tool_error("old_string and new_string required")
+        endpoint_names = [path]
+    elif mode == "patch":
+        if not patch:
+            return tool_error("patch content required")
+        operations, parse_error = parse_v4a_patch(patch)
+        if parse_error:
+            return tool_error(parse_error)
+
         from tools.path_security import has_traversal_component
-        def _reject_v4a_traversal(v4a_path: str) -> str | None:
-            # V4A path headers come from patch CONTENT, not the explicit
-            # ``path=`` arg — so they're more attacker-influenceable (skill
-            # content, web extract, prompt injection). Reject ``..`` traversal
-            # in V4A headers: a legitimate multi-file patch from a single cwd
-            # can always emit absolute paths or paths relative to the agent's
-            # cwd without ``..``. The explicit ``path=`` arg is unchanged
-            # because the agent uses relative ``..`` paths legitimately
-            # (e.g. ``patch path="../other_module/x.py"`` from a worktree).
-            if has_traversal_component(v4a_path):
-                return tool_error(
-                    f"V4A patch header contains '..' traversal: {v4a_path!r}. "
-                    "Use the agent's cwd-relative path (no '..') or an absolute "
-                    "path in '*** Update File:' / '*** Add File:' / "
-                    "'*** Delete File:' / '*** Move File:' headers."
-                )
-            return None
 
-        # ``\s*`` (not ``\s+``) after ``***`` matches patch_parser leniency:
-        # it accepts ``***Update File:`` with no space after the asterisks
-        # (patch_parser.py uses ``\*\*\*\s*Update\s+File:``). Requiring a space
-        # here let a no-space header parse + apply while skipping this check.
-        for _m in _re.finditer(r'^\*\*\*\s*(?:Update|Add|Delete)\s+File:\s*(.+)$', patch, _re.MULTILINE):
-            v4a_path = _m.group(1).strip()
-            _err = _reject_v4a_traversal(v4a_path)
-            if _err:
-                return _err
-            _paths_to_check.append(v4a_path)
-        # ``*** Move File: src -> dst`` is a valid V4A op (patch_parser.py:114)
-        # but was never extracted, so a Move targeting /etc/crontab skipped the
-        # sensitive-path pre-check. Check BOTH endpoints, and run them through
-        # the same ``..`` traversal rejection as the other headers.
-        for _m in _re.finditer(r'^\*\*\*\s*Move\s+File:\s*(.+?)\s*->\s*(.+)$', patch, _re.MULTILINE):
-            for v4a_path in (_m.group(1).strip(), _m.group(2).strip()):
-                _err = _reject_v4a_traversal(v4a_path)
-                if _err:
-                    return _err
-                _paths_to_check.append(v4a_path)
-    for _p in _paths_to_check:
-        sensitive_err = _check_sensitive_path(_p, task_id)
-        if sensitive_err:
-            return tool_error(sensitive_err)
-        if not cross_profile:
-            cross_warning = _check_cross_profile_path(_p, task_id)
-            if cross_warning:
-                return tool_error(cross_warning)
+        for operation in operations:
+            candidates = [operation.file_path]
+            if operation.new_path is not None:
+                candidates.append(operation.new_path)
+            for candidate in candidates:
+                if has_traversal_component(candidate):
+                    return tool_error(
+                        f"V4A patch header contains '..' traversal: {candidate!r}. "
+                        "Use the agent's cwd-relative path (no '..') or an "
+                        "absolute path in a V4A file header."
+                    )
+                endpoint_names.append(candidate)
+    else:
+        return tool_error(f"Unknown mode: {mode}")
+
     try:
-        # Resolve paths for locking.  Ordered + deduplicated so concurrent
-        # callers lock in the same order — prevents deadlock on overlapping
-        # multi-file V4A patches.
-        _resolved_paths: list[str] = []
-        _seen: set[str] = set()
-        for _p in _paths_to_check:
+        # Each canonical parser endpoint is resolved exactly once. The resulting
+        # Path objects are both the repository-guard endpoints and, on the local
+        # V4A branch, the actual apply endpoints.
+        resolved_by_name: dict[str, Path | PurePosixPath | None] = {}
+        for endpoint in endpoint_names:
+            if endpoint in resolved_by_name:
+                continue
             try:
-                _r = str(_resolve_path_for_task(_p, task_id))
+                resolved_by_name[endpoint] = _resolve_path_for_task(endpoint, task_id)
             except Exception:
-                _r = None
-            if _r and _r not in _seen:
-                _resolved_paths.append(_r)
-                _seen.add(_r)
-        _resolved_paths.sort()
+                if local_backend:
+                    return _repo_write_guard_path_denied()
+                resolved_by_name[endpoint] = None
 
-        # Acquire per-path locks in sorted order via ExitStack.  On single
-        # path this degenerates to one lock; on empty list (unresolvable)
-        # it's a no-op and execution falls through unchanged.
-        from contextlib import ExitStack
-        with ExitStack() as _locks:
-            for _r in _resolved_paths:
-                _locks.enter_context(file_state.lock_path(_r))
+        unique_endpoint_names = list(dict.fromkeys(endpoint_names))
+        local_apply = (
+            local_backend
+            and bool(endpoint_names)
+            and all(isinstance(resolved_by_name[name], Path) for name in endpoint_names)
+        )
+        exact_endpoints = [
+            resolved_by_name[name]
+            for name in unique_endpoint_names
+            if resolved_by_name[name] is not None
+        ]
+        exact_strings = [str(endpoint) for endpoint in exact_endpoints]
+        unique_exact_strings = sorted(set(exact_strings))
 
-            # Collect warnings — cross-agent registry first (names sibling),
-            # then per-task tracker as a fallback.
+        with ExitStack() as locks:
+            repository_guard: RepoWriteGuard | None = None
+            if local_apply:
+                repository_guard = RepoWriteGuard(
+                    [endpoint for endpoint in exact_endpoints if isinstance(endpoint, Path)]
+                )
+                if repository_guard.identities:
+                    locks.callback(repository_guard.release)
+                    repository_guard.acquire()
+
+            # Run path policy checks only after a genuine repository guard has
+            # been acquired. A busy denial therefore cannot reach config,
+            # file_ops, mutation, or bookkeeping.
+            for endpoint in unique_endpoint_names:
+                resolved = resolved_by_name[endpoint]
+                resolved_text = str(resolved) if resolved is not None else None
+                sensitive_err = _check_sensitive_path(
+                    endpoint, task_id, resolved_path=resolved_text
+                )
+                if sensitive_err:
+                    return tool_error(sensitive_err)
+                if not cross_profile:
+                    cross_profile_warning = _check_cross_profile_path(
+                        endpoint, task_id, resolved_path=resolved_text
+                    )
+                    if cross_profile_warning:
+                        return tool_error(cross_profile_warning)
+
+            # Stable per-path ordering is nested inside stable repository order.
+            for resolved in unique_exact_strings:
+                locks.enter_context(file_state.lock_path(resolved))
+
             stale_warnings: list[str] = []
-            _path_to_resolved: dict[str, str] = {}
-            for _p in _paths_to_check:
-                try:
-                    _r = str(_resolve_path_for_task(_p, task_id))
-                except Exception:
-                    _r = None
-                _path_to_resolved[_p] = _r
-                _cross = file_state.check_stale(task_id, _r) if _r else None
-                _sw = _cross or _check_file_staleness(_p, task_id)
-                if not _sw and _r:
-                    # Workspace-divergence warning (worktree-cwd bug): relative
-                    # path resolving outside the terminal's cwd.
-                    _sw = _path_resolution_warning(_p, Path(_r), task_id)
-                if _sw:
-                    stale_warnings.append(_sw)
+            for endpoint in unique_endpoint_names:
+                resolved = resolved_by_name[endpoint]
+                resolved_text = str(resolved) if resolved is not None else None
+                cross_warning = (
+                    file_state.check_stale(task_id, resolved_text)
+                    if resolved_text
+                    else None
+                )
+                stale_warning = cross_warning or _check_file_staleness(
+                    endpoint, task_id, resolved_path=resolved_text
+                )
+                if not stale_warning and isinstance(resolved, Path):
+                    stale_warning = _path_resolution_warning(
+                        endpoint, resolved, task_id
+                    )
+                if stale_warning:
+                    stale_warnings.append(stale_warning)
 
             file_ops = _get_file_ops(task_id)
-
             if mode == "replace":
-                if not path:
-                    return tool_error("path required")
-                if old_string is None or new_string is None:
-                    return tool_error("old_string and new_string required")
-                # Pass the resolved ABSOLUTE path to the shell layer so it
-                # operates on the exact file the tool layer resolved — the
-                # shell's own cwd may differ (worktree-cwd bug), and a relative
-                # path would let the two layers disagree about which file is
-                # being edited.
-                _replace_target = _path_to_resolved.get(path) or path
-                result = file_ops.patch_replace(_replace_target, old_string, new_string, replace_all)
-            elif mode == "patch":
-                if not patch:
-                    return tool_error("patch content required")
-                result = file_ops.patch_v4a(patch)
+                replace_endpoint = resolved_by_name[path]
+                replace_target = str(replace_endpoint) if replace_endpoint else path
+                result = file_ops.patch_replace(
+                    replace_target, old_string, new_string, replace_all
+                )
+            elif repository_guard is not None and repository_guard.identities:
+                assert operations is not None
+                for operation in operations:
+                    operation.file_path = str(resolved_by_name[operation.file_path])
+                    if operation.new_path is not None:
+                        operation.new_path = str(resolved_by_name[operation.new_path])
+                # Local V4A is parsed once and these exact absolute endpoints are
+                # validated and applied. Never hand local patch text to a raw
+                # reparsing patch_v4a endpoint.
+                class _LocalExactOps:
+                    """Delegate exact local operations while normalizing move plumbing."""
+
+                    def __init__(self, delegate):
+                        self._delegate = delegate
+
+                    def __getattr__(self, name):
+                        return getattr(self._delegate, name)
+
+                    def move_file(self, source_path, destination_path):
+                        # The parsed endpoint is already absolute and guarded.
+                        # Create only this move's destination parent immediately
+                        # before the underlying mutation.
+                        Path(destination_path).parent.mkdir(parents=True, exist_ok=True)
+                        return self._delegate.move_file(source_path, destination_path)
+
+                    def _check_lint(self, lint_path):
+                        # Older PatchResult plumbing labels a move as
+                        # ``source -> destination``. Keep the lint endpoint
+                        # exact and destination-based for the public result.
+                        if " -> " in lint_path:
+                            lint_path = lint_path.split(" -> ", 1)[1]
+                        return self._delegate._check_lint(lint_path)
+
+                exact_ops = (
+                    _LocalExactOps(file_ops)
+                    if hasattr(file_ops, "move_file")
+                    or hasattr(file_ops, "_check_lint")
+                    else file_ops
+                )
+                result = apply_v4a_operations(operations, exact_ops)
             else:
-                return tool_error(f"Unknown mode: {mode}")
+                # Remote/container paths retain their backend-native raw V4A
+                # behavior. An empty/no-endpoint patch also remains legacy.
+                assert patch is not None
+                result = file_ops.patch_v4a(patch)
 
             result_dict = result.to_dict()
+            if (
+                mode == "patch"
+                and local_apply
+                and operations
+                and not result_dict.get("error")
+            ):
+                # Keep the public V4A result truthful even when the underlying
+                # parser uses its legacy ``files_modified`` representation for
+                # moves. A move deletes the source and creates the destination.
+                move_pairs = [
+                    (str(op.file_path), str(op.new_path))
+                    for op in operations
+                    if op.operation.value == "move" and op.new_path is not None
+                ]
+                if move_pairs:
+                    modified = list(result_dict.get("files_modified") or [])
+                    for source_path, destination_path in move_pairs:
+                        move_label = f"{source_path} -> {destination_path}"
+                        modified = [item for item in modified if item != move_label]
+                    if modified:
+                        result_dict["files_modified"] = modified
+                    else:
+                        result_dict.pop("files_modified", None)
+                    result_dict["files_deleted"] = [
+                        *list(result_dict.get("files_deleted") or []),
+                        *[source_path for source_path, _ in move_pairs],
+                    ]
+                    result_dict["files_created"] = [
+                        *list(result_dict.get("files_created") or []),
+                        *[destination_path for _, destination_path in move_pairs],
+                    ]
+                    lint = dict(result_dict.get("lint") or {})
+                    for source_path, destination_path in move_pairs:
+                        move_label = f"{source_path} -> {destination_path}"
+                        lint.pop(source_path, None)
+                        if move_label in lint:
+                            lint[destination_path] = lint.pop(move_label)
+                    if lint:
+                        result_dict["lint"] = lint
             if stale_warnings:
-                result_dict["_warning"] = stale_warnings[0] if len(stale_warnings) == 1 else " | ".join(stale_warnings)
-            # Report the ABSOLUTE path(s) actually patched so a wrong-cwd
-            # mismatch (e.g. a worktree session editing the main checkout) is
-            # visible in the response instead of silently landing elsewhere.
-            _resolved_modified = [
-                _path_to_resolved.get(_p) or _p for _p in _paths_to_check
-            ]
-            # Refresh stored timestamps for all successfully-patched paths so
-            # consecutive edits by this task don't trigger false warnings.
-            if not result_dict.get("error"):
-                result_dict["files_modified"] = _resolved_modified
-                if len(_resolved_modified) == 1:
-                    result_dict["resolved_path"] = _resolved_modified[0]
-                _mark_verification_stale(task_id, _resolved_modified, session_id=session_id)
-                for _p in _paths_to_check:
-                    _update_read_timestamp(_p, task_id)
-                    _r = _path_to_resolved.get(_p)
-                    if _r:
-                        file_state.note_write(task_id, _r)
-                # Successful patch: clear any prior consecutive-failure
-                # counters for the touched paths so a future failure on
-                # the same path starts the escalation cycle fresh.
-                _reset_patch_failures(task_id, [
-                    _r for _r in (_path_to_resolved.get(_p) for _p in _paths_to_check) if _r
-                ])
-        # Hint when old_string not found — saves iterations where the agent
-        # retries with stale content instead of re-reading the file.
-        # Suppressed when patch_replace already attached a rich "Did you mean?"
-        # snippet (which is strictly more useful than the generic hint).
-        if result_dict.get("error") and "Could not find" in str(result_dict["error"]):
-            # Track per-file consecutive failures for replace mode.  The
-            # ``path`` arg only exists for replace mode; for V4A patches
-            # we'd need to walk the headers, but in practice V4A failures
-            # are far rarer and the existing _hint covers them adequately.
-            failure_count = 0
-            if mode == "replace" and path:
-                resolved = _path_to_resolved.get(path) or path
-                failure_count = _record_patch_failure(task_id, resolved)
+                result_dict["_warning"] = (
+                    stale_warnings[0]
+                    if len(stale_warnings) == 1
+                    else " | ".join(stale_warnings)
+                )
 
-            if failure_count >= 3:
-                # Escalating hint after multiple consecutive failures on the
-                # same path.  Most common cause is a stale view of the file —
-                # the model is retrying with the same old_string against
-                # content that has since changed.  Surface the failure count
-                # so the model recognises it's in a loop and breaks out by
-                # re-reading or falling back to write_file.
-                result_dict["_hint"] = (
-                    f"This is failure #{failure_count} patching {path!r}. "
-                    "Stop retrying with variations of the same old_string. "
-                    "Either: (1) re-read the file fresh to verify current "
-                    "content, (2) use a longer / more unique old_string with "
-                    "surrounding context lines, or (3) use write_file to "
-                    "replace the entire file if the targeted region is hard "
-                    "to anchor."
+            if not result_dict.get("error"):
+                if mode == "replace":
+                    result_dict["files_modified"] = [replace_target]
+                    result_dict["resolved_path"] = replace_target
+                # V4A's own operation-aware files_modified/files_created/
+                # files_deleted fields are retained; their paths are the exact
+                # absolute mutation endpoints used by apply_v4a_operations.
+                _mark_verification_stale(
+                    task_id, unique_exact_strings, session_id=session_id
                 )
-            elif "Did you mean one of these sections?" not in str(result_dict["error"]):
-                result_dict["_hint"] = (
-                    "old_string not found. Use read_file to verify the current "
-                    "content, or search_files to locate the text."
-                )
-        return json.dumps(result_dict, ensure_ascii=False)
-    except Exception as e:
-        return tool_error(str(e))
+                for endpoint in unique_endpoint_names:
+                    resolved = resolved_by_name[endpoint]
+                    if resolved is not None:
+                        resolved_text = str(resolved)
+                        _update_read_timestamp(
+                            endpoint, task_id, resolved_path=resolved_text
+                        )
+                        file_state.note_write(task_id, resolved_text)
+                    else:
+                        _update_read_timestamp(endpoint, task_id)
+                _reset_patch_failures(task_id, unique_exact_strings)
+
+            if result_dict.get("error") and "Could not find" in str(result_dict["error"]):
+                failure_count = 0
+                if mode == "replace" and path:
+                    failure_count = _record_patch_failure(task_id, replace_target)
+                if failure_count >= 3:
+                    result_dict["_hint"] = (
+                        f"This is failure #{failure_count} patching {path!r}. "
+                        "Stop retrying with variations of the same old_string. "
+                        "Either re-read the file, use a longer unique old_string, "
+                        "or use write_file for an intentional whole-file replacement."
+                    )
+                elif "Did you mean one of these sections?" not in str(result_dict["error"]):
+                    result_dict["_hint"] = (
+                        "old_string not found. Use read_file to verify the current "
+                        "content, or search_files to locate the text."
+                    )
+
+            return json.dumps(result_dict, ensure_ascii=False)
+    except RepoWriteGuardError as error:
+        return _repo_write_guard_denied(error)
+    except Exception as error:
+        return tool_error(str(error))
 
 
 def search_tool(pattern: str, target: str = "content", path: str = ".",

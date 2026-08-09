@@ -8,8 +8,76 @@ arbitrary toolsets.
 
 from types import SimpleNamespace
 
-from toolsets import TOOLSETS
-from tools.delegate_tool import _strip_blocked_tools, _emit_parent_console
+import model_tools
+import run_agent
+from hermes_cli import repo_writer_context
+
+from toolsets import TOOLSETS, resolve_toolset
+import tools.delegate_tool as delegate_tool
+from tools.delegate_tool import (
+    DELEGATE_BLOCKED_TOOLS,
+    _build_child_agent,
+    _emit_parent_console,
+    _strip_blocked_tools,
+)
+
+
+REPO_WRITER_TOOL_CAPABILITY_CONTRACT_MISSING = (
+    "repo_writer_tool_capability_contract_missing"
+)
+_REPO_WRITER_ENV = "HERMES_KANBAN_REPO_WRITER"
+_WRITER_CHILD_BLOCKED_TOOLS = {"computer_use", "execute_code"}
+
+
+def _capture_child_toolsets(monkeypatch, parent, *, requested=None, role="leaf"):
+    captured = {}
+
+    def fake_agent(**kwargs):
+        captured["enabled_toolsets"] = list(kwargs["enabled_toolsets"])
+        return SimpleNamespace(session_id="", _session_init_model_config={})
+
+    monkeypatch.setattr(run_agent, "AIAgent", fake_agent)
+    monkeypatch.setattr(delegate_tool, "_load_config", lambda: {})
+    monkeypatch.setattr(delegate_tool, "_get_max_spawn_depth", lambda: 2)
+    monkeypatch.setattr(delegate_tool, "_get_orchestrator_enabled", lambda: True)
+    monkeypatch.setattr(
+        delegate_tool, "_resolve_child_credential_pool", lambda *_args: None
+    )
+
+    _build_child_agent(
+        task_index=0,
+        goal="writer child scope",
+        context=None,
+        toolsets=requested,
+        model=None,
+        max_iterations=1,
+        task_count=1,
+        parent_agent=parent,
+        role=role,
+    )
+    return captured["enabled_toolsets"]
+
+
+def _parent(*, enabled_toolsets, valid_tool_names=()):
+    return SimpleNamespace(
+        enabled_toolsets=enabled_toolsets,
+        valid_tool_names=list(valid_tool_names),
+        model="test-model",
+        base_url="https://example.invalid/v1",
+        provider="test-provider",
+        api_key="test-key",
+        _client_kwargs={},
+        _delegate_depth=0,
+        _active_children=[],
+    )
+
+
+def _resolved_child_tools(toolsets):
+    return {
+        tool_name
+        for toolset_name in toolsets
+        for tool_name in resolve_toolset(toolset_name)
+    }
 
 
 class TestToolsetIntersection:
@@ -75,6 +143,24 @@ class TestToolsetIntersection:
         finally:
             TOOLSETS.pop("mixed-review-ledger-test", None)
 
+    def test_toolset_reconstruction_cannot_restore_registered_local_workflow(self):
+        assert "registered_local_workflow" in DELEGATE_BLOCKED_TOOLS
+        parent_tool_names = ["terminal", "registered_local_workflow"]
+        reconstructed = sorted(
+            {
+                toolset
+                for tool_name in parent_tool_names
+                if (toolset := model_tools.get_toolset_for_tool(tool_name)) is not None
+            }
+        )
+        assert "registered-workflow" in reconstructed
+        child_toolsets = _strip_blocked_tools(reconstructed)
+        assert child_toolsets == ["terminal"]
+        assert all(
+            "registered_local_workflow" not in set(TOOLSETS[name].get("tools", []))
+            for name in child_toolsets
+        )
+
     def test_empty_intersection_yields_empty_toolsets(self):
         """If parent has no overlap with requested, child gets nothing extra."""
         parent = SimpleNamespace(enabled_toolsets=["terminal"])
@@ -84,6 +170,109 @@ class TestToolsetIntersection:
         scoped = [t for t in requested if t in parent_toolsets]
 
         assert scoped == []
+
+    def test_writer_context_strips_direct_alias_and_mixed_computer_use(
+        self, monkeypatch
+    ):
+        monkeypatch.setattr(repo_writer_context, "_REPO_WRITER_CONTEXT", True)
+        TOOLSETS["mixed-writer-capability-test"] = {
+            "description": "test-only mixed writer capability composite",
+            "tools": ["terminal", "computer_use"],
+            "includes": [],
+        }
+        try:
+            child = _strip_blocked_tools(
+                [
+                    "terminal",
+                    "computer_use",
+                    "code_execution",
+                    "hermes-cli",
+                    "all",
+                    "*",
+                    "mixed-writer-capability-test",
+                ]
+            )
+        finally:
+            TOOLSETS.pop("mixed-writer-capability-test", None)
+
+        assert child == ["terminal"], (
+            REPO_WRITER_TOOL_CAPABILITY_CONTRACT_MISSING
+        )
+
+    def test_writer_requested_custom_composite_cannot_reach_child(
+        self, monkeypatch
+    ):
+        monkeypatch.setattr(repo_writer_context, "_REPO_WRITER_CONTEXT", True)
+        TOOLSETS["requested-writer-capability-test"] = {
+            "description": "test-only requested writer capability composite",
+            "tools": ["terminal", "computer_use"],
+            "includes": [],
+        }
+        try:
+            child_toolsets = _capture_child_toolsets(
+                monkeypatch,
+                _parent(enabled_toolsets=["requested-writer-capability-test"]),
+                requested=["requested-writer-capability-test"],
+            )
+        finally:
+            TOOLSETS.pop("requested-writer-capability-test", None)
+
+        assert child_toolsets == [], (
+            REPO_WRITER_TOOL_CAPABILITY_CONTRACT_MISSING
+        )
+
+    def test_writer_inherited_toolsets_cannot_reach_child(self, monkeypatch):
+        monkeypatch.setattr(repo_writer_context, "_REPO_WRITER_CONTEXT", True)
+        child_toolsets = _capture_child_toolsets(
+            monkeypatch,
+            _parent(
+                enabled_toolsets=["terminal", "computer_use", "code_execution"]
+            ),
+        )
+
+        assert child_toolsets == ["terminal"]
+        assert not (_resolved_child_tools(child_toolsets) & _WRITER_CHILD_BLOCKED_TOOLS)
+
+    def test_writer_valid_tool_name_reconstruction_cannot_reach_child(
+        self, monkeypatch
+    ):
+        monkeypatch.setattr(repo_writer_context, "_REPO_WRITER_CONTEXT", True)
+        child_toolsets = _capture_child_toolsets(
+            monkeypatch,
+            _parent(
+                enabled_toolsets=None,
+                valid_tool_names=["terminal", "computer_use", "execute_code"],
+            ),
+        )
+
+        assert child_toolsets == ["terminal"]
+        assert not (_resolved_child_tools(child_toolsets) & _WRITER_CHILD_BLOCKED_TOOLS)
+
+    def test_writer_orchestrator_readd_cannot_restore_blocked_tools(
+        self, monkeypatch
+    ):
+        monkeypatch.setattr(repo_writer_context, "_REPO_WRITER_CONTEXT", True)
+        child_toolsets = _capture_child_toolsets(
+            monkeypatch,
+            _parent(
+                enabled_toolsets=["terminal", "computer_use", "code_execution"]
+            ),
+            role="orchestrator",
+        )
+
+        assert "delegation" in child_toolsets
+        assert not (_resolved_child_tools(child_toolsets) & _WRITER_CHILD_BLOCKED_TOOLS)
+
+    def test_normal_context_preserves_computer_use_inheritance(self, monkeypatch):
+        monkeypatch.delenv(_REPO_WRITER_ENV, raising=False)
+        monkeypatch.setattr(repo_writer_context, "_REPO_WRITER_CONTEXT", False)
+        child_toolsets = _capture_child_toolsets(
+            monkeypatch,
+            _parent(enabled_toolsets=["terminal", "computer_use"]),
+        )
+
+        assert child_toolsets == ["terminal", "computer_use"]
+        assert "computer_use" in _resolved_child_tools(child_toolsets)
 
 
 class TestEmitParentConsole:

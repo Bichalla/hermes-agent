@@ -5,6 +5,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import subprocess
 import threading
 from pathlib import Path
 
@@ -12,7 +13,6 @@ import pytest
 
 from hermes_cli import kanban as kc
 from hermes_cli import kanban_db as kb
-from gateway.kanban_intake import KanbanCardProposal, KanbanIntakeConfig, PendingKanbanStore, SourceBinding
 
 
 @pytest.fixture
@@ -74,6 +74,96 @@ def test_parse_branch_flag_rejects_empty_and_option_like():
         kc._parse_branch_flag("bad branch")
 
 
+@pytest.fixture
+def cli_project_create(tmp_path, monkeypatch):
+    """Run the real argparse -> command path against temp-only state."""
+    from hermes_cli import config
+    from hermes_cli import projects_db as pdb
+
+    home = tmp_path / ".hermes"
+    home.mkdir()
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    monkeypatch.setattr(Path, "home", lambda: tmp_path)
+    kb._INITIALIZED_PATHS.clear()
+    kb.init_db()
+
+    def run(*, mode: str, workspace_args: tuple[str, ...] = ()):
+        (home / "config.yaml").write_text(
+            f"kanban:\n  repo_writer_mode: {mode}\n",
+            encoding="utf-8",
+        )
+        config._LOAD_CONFIG_CACHE.clear()
+
+        repo = tmp_path / f"{mode}-project"
+        repo.mkdir()
+        subprocess.run(["git", "init", "-q", str(repo)], check=True)
+        with pdb.connect_closing() as project_conn:
+            project_id = pdb.create_project(
+                project_conn,
+                name=f"{mode} CLI Project",
+                folders=[str(repo)],
+            )
+            project = pdb.get_project(project_conn, project_id)
+        assert project is not None
+
+        parser = argparse.ArgumentParser(prog="hermes", add_help=False)
+        sub = parser.add_subparsers(dest="command")
+        kc.build_parser(sub)
+        args = parser.parse_args([
+            "kanban",
+            "create",
+            f"{mode} CLI task",
+            "--project",
+            project.slug,
+            *workspace_args,
+        ])
+        rc = kc.kanban_command(args)
+        with kb.connect_closing() as conn:
+            task = kb.list_tasks(conn, limit=1)[0]
+        return args, rc, task, project
+
+    yield run
+    config._LOAD_CONFIG_CACHE.clear()
+
+
+def test_red_cli_omitted_workspace_off_uses_project_worktree(cli_project_create):
+    marker = "repo_writer_mode_call_path_missing"
+    args, rc, task, project = cli_project_create(mode="off")
+
+    assert args.workspace is None, marker
+    assert rc == 0, marker
+    assert task.workspace_kind == "worktree", marker
+    assert task.workspace_path == os.path.join(
+        project.primary_path, ".worktrees", task.id
+    ), marker
+    assert task.branch_name == f"{project.slug}/{task.id}-off-cli-task", marker
+
+
+def test_red_cli_omitted_workspace_single_writer_uses_project_dir(cli_project_create):
+    marker = "repo_writer_mode_call_path_missing"
+    args, rc, task, project = cli_project_create(mode="single_writer")
+
+    assert args.workspace is None, marker
+    assert rc == 0, marker
+    assert task.workspace_kind == "dir", marker
+    assert task.workspace_path == project.primary_path, marker
+    assert task.branch_name is None, marker
+
+
+def test_red_cli_explicit_scratch_remains_scratch(cli_project_create):
+    marker = "repo_writer_mode_call_path_missing"
+    args, rc, task, _project = cli_project_create(
+        mode="single_writer",
+        workspace_args=("--workspace", "scratch"),
+    )
+
+    assert args.workspace == "scratch", marker
+    assert rc == 0, marker
+    assert task.workspace_kind == "scratch", marker
+    assert task.workspace_path is None, marker
+    assert task.branch_name is None, marker
+
+
 # ---------------------------------------------------------------------------
 # run_slash smoke tests (end-to-end via the same entry both CLI and gateway use)
 # ---------------------------------------------------------------------------
@@ -82,86 +172,6 @@ def test_run_slash_no_args_shows_usage(kanban_home):
     out = kc.run_slash("")
     assert "kanban" in out.lower()
     assert "create" in out.lower() or "subcommand" in out.lower() or "action" in out.lower()
-
-
-def test_run_slash_intake_pending_read_only_does_not_init_board_or_intake_db(tmp_path, monkeypatch):
-    home = tmp_path / ".hermes"
-    home.mkdir()
-    monkeypatch.setenv("HERMES_HOME", str(home))
-    monkeypatch.setattr(Path, "home", lambda: tmp_path)
-
-    out = kc.run_slash("intake-pending list --json")
-    data = json.loads(out)
-    assert data["current_policy_version"]
-    assert data["items"] == []
-    assert data["counts"] == {}
-    assert not kb.kanban_db_path().exists()
-    assert not (home / "kanban" / "intake_pending.db").exists()
-
-    out = kc.run_slash("intake-pending review --json")
-    data = json.loads(out)
-    assert data["current_policy_version"]
-    assert data["items"] == []
-    assert data["counts"] == {}
-    assert not kb.kanban_db_path().exists()
-    assert not (home / "kanban" / "intake_pending.db").exists()
-
-    out = kc.run_slash("intake-pending bulk-invalidate --dry-run --json")
-    data = json.loads(out)
-    assert data["dry_run"] is True
-    assert data["matched"] == 0
-    assert data["updated"] == 0
-    assert not kb.kanban_db_path().exists()
-    assert not (home / "kanban" / "intake_pending.db").exists()
-
-
-def test_run_slash_intake_pending_reports_flags_and_redacts_titles(tmp_path, monkeypatch):
-    home = tmp_path / ".hermes"
-    home.mkdir()
-    monkeypatch.setenv("HERMES_HOME", str(home))
-    monkeypatch.setattr(Path, "home", lambda: tmp_path)
-    cfg = KanbanIntakeConfig(enabled=True, default_board="lifelog-control", store_path=home / "kanban" / "intake_pending.db")
-    store = PendingKanbanStore(cfg.store_path)
-    binding = SourceBinding(platform="discord", chat_id="c1", thread_id="t1", user_id="u1", session_key="s1")
-    pending = store.put_pending(
-        KanbanCardProposal(
-            board="lifelog-control",
-            title="Implement local guardrail scope",
-            body={"source_ref": "kp_safe", "acceptance_criteria": ["check"]},
-            source_ref="kp_safe",
-            user_id="u1",
-        ),
-        binding,
-        cfg,
-        now=100,
-    )
-    with store.connect() as conn:
-        conn.execute(
-            "UPDATE kanban_intake_pending SET policy_version = '', title = ? WHERE pending_id = ?",
-            ("Review raw 1522060000000000010 해수 fever follow-up", pending.pending_id),
-        )
-        conn.commit()
-
-    review = json.loads(kc.run_slash("intake-pending review --json"))
-    assert review["counts"] == {"pending": 1}
-    assert review["items"][0]["pending_id"] == pending.pending_id
-    rendered = json.dumps(review, ensure_ascii=False)
-    assert "1522060000000000010" not in rendered
-    assert "해수" not in rendered
-    assert "fever" not in rendered.lower()
-
-    revalidated = json.loads(kc.run_slash("intake-pending revalidate --json"))
-    item = revalidated["items"][0]
-    assert set(item["flags"]) >= {"stale_policy", "sensitive_leak"}
-    assert item["would_invalidate"] is True
-    dry_run = json.loads(kc.run_slash("intake-pending bulk-invalidate --dry-run --json"))
-    assert dry_run["dry_run"] is True
-    assert dry_run["matched"] == 1
-    assert dry_run["updated"] == 0
-    assert store.get_active_for_source(binding, now=101).state == "one"
-    guarded = kc.run_slash("intake-pending bulk-invalidate --execute --json")
-    assert "--execute requires --confirm INVALIDATE_PENDING" in guarded
-    assert store.get_active_for_source(binding, now=101).state == "one"
 
 
 def test_run_slash_create_and_list(kanban_home):

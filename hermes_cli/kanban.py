@@ -312,9 +312,9 @@ def build_parser(parent_subparsers: argparse._SubParsersAction) -> argparse.Argu
     p_create.add_argument("--assignee", default=None, help="Profile name to assign")
     p_create.add_argument("--parent", action="append", default=[],
                           help="Parent task id (repeatable)")
-    p_create.add_argument("--workspace", default="scratch",
+    p_create.add_argument("--workspace", default=None,
                           help="scratch | worktree | worktree:<path> | dir:<path> "
-                               "(default: scratch)")
+                               "(default: project/config dependent; otherwise scratch)")
     p_create.add_argument("--branch", default=None,
                           help="Branch name for worktree tasks, e.g. wt/t6-wire")
     p_create.add_argument("--project", default=None,
@@ -1343,7 +1343,10 @@ def _cmd_assignees(args: argparse.Namespace) -> int:
 
 def _cmd_create(args: argparse.Namespace) -> int:
     try:
-        ws_kind, ws_path = _parse_workspace_flag(args.workspace)
+        if args.workspace is None:
+            ws_kind, ws_path = None, None
+        else:
+            ws_kind, ws_path = _parse_workspace_flag(args.workspace)
         branch_name = _parse_branch_flag(getattr(args, "branch", None))
     except argparse.ArgumentTypeError as exc:
         print(f"kanban: {exc}", file=sys.stderr)
@@ -1872,10 +1875,18 @@ def _cmd_unlink(args: argparse.Namespace) -> int:
 def _cmd_claim(args: argparse.Namespace) -> int:
     with kb.connect_closing() as conn:
         try:
-            task = kb.claim_task(conn, args.task_id, ttl_seconds=args.ttl)
+            task = kb.claim_task_for_manual_writer(
+                conn, args.task_id, ttl_seconds=args.ttl,
+            )
         except kb.ChangeGateBlocked as exc:
             print(
                 f"cannot claim {args.task_id}: {', '.join(exc.reason_codes)}",
+                file=sys.stderr,
+            )
+            return 1
+        except kb.RepoBusyError:
+            print(
+                f"cannot claim {args.task_id}: {kb.REPO_BUSY_REASON}",
                 file=sys.stderr,
             )
             return 1
@@ -2245,6 +2256,10 @@ def _cmd_dispatch(args: argparse.Namespace) -> int:
                 for (tid, who, current) in res.skipped_per_profile_capped
             ],
             "auto_assigned_default": res.auto_assigned_default,
+            "skipped_repo_busy": [
+                {"task_id": tid, "repo_identity": identity}
+                for (tid, identity) in res.skipped_repo_busy
+            ],
         }, indent=2))
         return 0
     print(f"Reclaimed:    {res.reclaimed}")
@@ -2288,6 +2303,10 @@ def _cmd_dispatch(args: argparse.Namespace) -> int:
                 f"Skipped (Change Gate): {item['task_id']} "
                 f"({', '.join(item['reason_codes'])})"
             )
+    if res.skipped_repo_busy:
+        print("Skipped (repo busy):")
+        for tid, _identity in res.skipped_repo_busy:
+            print(f"  - {tid}")
     return 0
 
 

@@ -277,7 +277,7 @@ import shutil
 import stat
 import subprocess
 from pathlib import Path
-from typing import Optional
+from typing import NoReturn, Optional
 
 
 from hermes_cli.subcommands._shared import add_accept_hooks_flag as _add_accept_hooks_flag
@@ -526,6 +526,182 @@ def _apply_profile_override() -> None:
 
 
 _apply_profile_override()
+
+# Capture the dispatcher-provided restriction exactly once after profile
+# selection and before the Task 4 bootstrap/dotenv sequence. The tiny owner
+# module exposes no production setter, so later dotenv reloads cannot change
+# the process-local decision.
+from hermes_cli import repo_writer_context as _repo_writer_context  # noqa: F401
+
+
+_KANBAN_REPO_LOCK_BOOTSTRAP_MARKER = "HERMES_KANBAN_REPO_LOCK_BOOTSTRAP"
+_KANBAN_REPO_LOCK_LIFETIME_OWNER = None
+
+
+def _deny_repo_lock_bootstrap() -> NoReturn:
+    """Exit before logging with one constant-safe bootstrap denial."""
+    try:
+        os.write(2, b"repo_lock_bootstrap_denied\n")
+    except OSError:
+        pass
+    raise SystemExit(77)
+
+
+def _repo_lock_bootstrap_markers() -> tuple[str, int, str] | None:
+    task_id = os.environ.get("HERMES_KANBAN_TASK")
+    run_raw = os.environ.get("HERMES_KANBAN_RUN_ID")
+    claim_lock = os.environ.get("HERMES_KANBAN_CLAIM_LOCK")
+    if not (
+        isinstance(task_id, str)
+        and task_id == task_id.strip()
+        and 0 < len(task_id) <= 256
+        and "\x00" not in task_id
+        and isinstance(run_raw, str)
+        and 0 < len(run_raw) <= 19
+        and run_raw.isascii()
+        and run_raw.isdecimal()
+        and not run_raw.startswith("0")
+        and isinstance(claim_lock, str)
+        and claim_lock == claim_lock.strip()
+        and 0 < len(claim_lock) <= 1024
+        and "\x00" not in claim_lock
+    ):
+        return None
+    run_id = int(run_raw)
+    if run_id > 9223372036854775807:
+        return None
+    return task_id, run_id, claim_lock
+
+
+def _release_repo_busy_before_dotenv(
+    db_path: Path,
+    *,
+    task_id: str,
+    run_id: int,
+    claim_lock: str,
+    repo_identity: str,
+) -> bool:
+    """Apply Task 4A's exact CAS without ordinary DB initialization."""
+    import sqlite3
+
+    from hermes_cli import kanban_db as _kanban_bootstrap_db
+
+    conn = sqlite3.connect(str(db_path), timeout=5.0)
+    try:
+        conn.row_factory = sqlite3.Row
+        result = _kanban_bootstrap_db.release_worker_for_repo_busy(
+            conn,
+            task_id=task_id,
+            run_id=run_id,
+            claim_lock=claim_lock,
+            repo_identity=repo_identity,
+        )
+    finally:
+        conn.close()
+    return result in {
+        _kanban_bootstrap_db.REPO_BUSY_RELEASE_APPLIED,
+        _kanban_bootstrap_db.REPO_BUSY_RELEASE_ALREADY_APPLIED,
+    }
+
+
+def _bootstrap_kanban_repo_lock() -> None:
+    """Consume and acquire one dispatcher's exact worker lock before dotenv."""
+    global _KANBAN_REPO_LOCK_LIFETIME_OWNER
+
+    marker = os.environ.pop(_KANBAN_REPO_LOCK_BOOTSTRAP_MARKER, None)
+    if marker is None:
+        return
+    if marker != "1":
+        _deny_repo_lock_bootstrap()
+    exact = _repo_lock_bootstrap_markers()
+    if exact is None:
+        _deny_repo_lock_bootstrap()
+    task_id, run_id, claim_lock = exact
+
+    try:
+        from hermes_cli import kanban_db as _kanban_bootstrap_db
+        from hermes_cli.repo_write_lock import (
+            RepoLockBusy,
+            RepoLockError,
+            RepoWriteLock,
+        )
+
+        db_path = _kanban_bootstrap_db.kanban_db_path().expanduser().resolve(
+            strict=True
+        )
+        authority = _kanban_bootstrap_db.resolve_worker_repo_authority(
+            db_path,
+            task_id=task_id,
+            run_id=run_id,
+            claim_lock=claim_lock,
+        )
+        if authority is None:
+            _deny_repo_lock_bootstrap()
+        handle = RepoWriteLock(authority.workspace_path, blocking=False)
+        if handle.identity != authority.repo_identity:
+            _deny_repo_lock_bootstrap()
+        try:
+            handle.acquire()
+        except RepoLockBusy:
+            if _release_repo_busy_before_dotenv(
+                db_path,
+                task_id=task_id,
+                run_id=run_id,
+                claim_lock=claim_lock,
+                repo_identity=authority.repo_identity,
+            ):
+                raise SystemExit(_kanban_bootstrap_db.KANBAN_REPO_BUSY_EXIT_CODE)
+            _deny_repo_lock_bootstrap()
+        except RepoLockError:
+            _deny_repo_lock_bootstrap()
+        # Close the resolver→flock race: the exact task/run/claim must still be
+        # current after kernel ownership is established. No DB mutation occurs.
+        current_authority = _kanban_bootstrap_db.resolve_worker_repo_authority(
+            db_path,
+            task_id=task_id,
+            run_id=run_id,
+            claim_lock=claim_lock,
+        )
+        if current_authority != authority:
+            try:
+                handle.release()
+            except RepoLockError:
+                pass
+            _deny_repo_lock_bootstrap()
+        _KANBAN_REPO_LOCK_LIFETIME_OWNER = handle
+    except SystemExit:
+        raise
+    except Exception:
+        _deny_repo_lock_bootstrap()
+
+
+def _repo_lock_bootstrap_test_wait() -> None:
+    """Bounded subprocess lifetime hook, available only under pytest."""
+    raw_fd = os.environ.pop(
+        "HERMES_KANBAN_REPO_LOCK_BOOTSTRAP_TEST_FD", None
+    )
+    if raw_fd is None:
+        return
+    if "PYTEST_CURRENT_TEST" not in os.environ:
+        _deny_repo_lock_bootstrap()
+    command = b""
+    try:
+        if not raw_fd.isascii() or not raw_fd.isdecimal():
+            raise ValueError
+        fd = int(raw_fd)
+        if fd < 3:
+            raise ValueError
+        os.write(fd, b"R")
+        command = os.read(fd, 1)
+    except (OSError, ValueError):
+        _deny_repo_lock_bootstrap()
+    if command != b"X":
+        _deny_repo_lock_bootstrap()
+    raise SystemExit(0)
+
+
+_bootstrap_kanban_repo_lock()
+_repo_lock_bootstrap_test_wait()
 
 # Load .env from ~/.hermes/.env first, then project root as dev fallback.
 # User-managed env files should override stale shell exports on restart.

@@ -5523,6 +5523,15 @@ def refresh_agent_mcp_tools(
     # this rebuild actually appended (matching agent_init's dedup-aware add).
     staged_engine_names = _reinject_post_build_tools(agent, new_defs, new_names)
 
+    # Registry schemas and both post-build injectors are independently
+    # extensible. Final-filter the staged locals before equality checks or the
+    # atomic publish, including the context-engine routing-name set.
+    from hermes_cli.repo_writer_context import filter_repo_writer_tool_surface
+    new_defs, new_names, staged_engine_names = filter_repo_writer_tool_surface(
+        new_defs,
+        staged_engine_names,
+    )
+
     # Single atomic read-diff-publish so the returned ``added`` is consistent
     # with what was actually published, even under concurrent callers, and a
     # stale (older-generation) rebuild can't overwrite a newer published one.

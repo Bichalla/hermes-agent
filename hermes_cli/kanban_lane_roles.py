@@ -93,6 +93,8 @@ class _StableFileSnapshot:
     path: Path
     data: bytes
     sha256: str
+    root_identity: tuple[int, int, int, int, int, int]
+    directory_identities: tuple[tuple[int, int, int, int, int, int], ...]
     identity: tuple[int, int, int, int, int, int]
 
 
@@ -365,6 +367,11 @@ def _read_trusted_file(root: Path, target: Path, *, limit: int) -> _StableFileSn
     parent_fd = root_fd
     opened_dirs: list[int] = []
     try:
+        root_info = os.fstat(root_fd)
+        if not stat.S_ISDIR(root_info.st_mode):
+            raise _TrustedReadError("trusted root is not a directory")
+        root_identity = _stat_identity(root_info)
+        directory_identities: list[tuple[int, int, int, int, int, int]] = []
         for component in components[:-1]:
             next_fd = os.open(
                 component,
@@ -375,6 +382,7 @@ def _read_trusted_file(root: Path, target: Path, *, limit: int) -> _StableFileSn
             if not stat.S_ISDIR(info.st_mode):
                 os.close(next_fd)
                 raise _TrustedReadError("intermediate component is not a directory")
+            directory_identities.append(_stat_identity(info))
             opened_dirs.append(next_fd)
             parent_fd = next_fd
         final_fd = os.open(
@@ -404,6 +412,8 @@ def _read_trusted_file(root: Path, target: Path, *, limit: int) -> _StableFileSn
                 path=target_abs,
                 data=data,
                 sha256=hashlib.sha256(data).hexdigest(),
+                root_identity=root_identity,
+                directory_identities=tuple(directory_identities),
                 identity=after_identity,
             )
         finally:
@@ -423,6 +433,8 @@ def _read_trusted_file(root: Path, target: Path, *, limit: int) -> _StableFileSn
 def _snapshot_same(left: _StableFileSnapshot, right: _StableFileSnapshot) -> bool:
     return (
         left.path == right.path
+        and left.root_identity == right.root_identity
+        and left.directory_identities == right.directory_identities
         and left.identity == right.identity
         and left.sha256 == right.sha256
     )

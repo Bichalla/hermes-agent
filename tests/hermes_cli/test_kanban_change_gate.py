@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 import sqlite3
 import shutil
 import uuid
@@ -528,25 +529,66 @@ def test_validator_source_a_to_b_reloads_between_readiness_validations(canonical
     assert source_reads["count"] >= 4
 
 
-def test_intermediate_directory_replacement_between_snapshots_is_unsafe(canonical_kanban_home, monkeypatch):
+def test_intermediate_directory_identity_is_bound_to_snapshot(canonical_kanban_home):
+    with kb.connect() as conn:
+        task_id, stored = _prepare_gate_task(conn, canonical_kanban_home)
+        root = stored.parent.parent
+        replacement_dir = stored.parent.with_name(stored.parent.name + "-replacement")
+        replacement_dir.mkdir()
+        os.link(stored, replacement_dir / stored.name)
+        pre = lane_roles._read_trusted_file(root, stored, limit=1024 * 1024)
+        old_dir = stored.parent.with_name(stored.parent.name + "-old")
+        os.rename(stored.parent, old_dir)
+        os.rename(replacement_dir, stored.parent)
+        post = lane_roles._read_trusted_file(root, stored, limit=1024 * 1024)
+
+    assert pre.path == post.path
+    assert pre.identity == post.identity
+    assert pre.sha256 == post.sha256
+    assert pre.directory_identities != post.directory_identities
+    assert lane_roles._snapshot_same(pre, post) is False
+
+
+def test_claim_fails_on_real_intermediate_directory_replacement(canonical_kanban_home, monkeypatch):
     with kb.connect() as conn:
         task_id, stored = _prepare_gate_task(conn, canonical_kanban_home)
         original_read = lane_roles._read_trusted_file
-        reads = {"handoff": 0}
+        original_load = lane_roles._load_change_gate_validator
+        state = {"validated": False, "handoff_reads": 0, "swapped": False}
+        replacement_dir = stored.parent.with_name(stored.parent.name + "-replacement")
+        replacement_dir.mkdir()
+        os.link(stored, replacement_dir / stored.name)
 
-        def changed_intermediate_snapshot(root, path, *, limit):
-            snapshot = original_read(root, path, limit=limit)
-            if Path(path) == stored:
-                reads["handoff"] += 1
-                if reads["handoff"] == 2:
-                    changed_identity = tuple(snapshot.identity[:-1]) + (snapshot.identity[-1] + 1,)
-                    return replace(snapshot, identity=changed_identity)
-            return snapshot
+        def load_proxy(source):
+            actual = original_load(source)
 
-        monkeypatch.setattr(lane_roles, "_read_trusted_file", changed_intermediate_snapshot)
+            class Proxy:
+                ValidationError = actual.ValidationError
+
+                @staticmethod
+                def validate_artifact(*args, **kwargs):
+                    result = actual.validate_artifact(*args, **kwargs)
+                    state["validated"] = True
+                    return result
+
+            lane_roles._validator_module_digest = source.sha256
+            return Proxy()
+
+        def swap_before_post_snapshot(root, path, *, limit):
+            if Path(path) == stored and state["validated"]:
+                state["handoff_reads"] += 1
+                if state["handoff_reads"] == 1 and not state["swapped"]:
+                    old_dir = stored.parent.with_name(stored.parent.name + "-old")
+                    os.rename(stored.parent, old_dir)
+                    os.rename(replacement_dir, stored.parent)
+                    state["swapped"] = True
+            return original_read(root, path, limit=limit)
+
+        monkeypatch.setattr(lane_roles, "_load_change_gate_validator", load_proxy)
+        monkeypatch.setattr(lane_roles, "_read_trusted_file", swap_before_post_snapshot)
         _claim_blocked_without_side_effects(conn, task_id, "CHANGE_GATE_ARTIFACT_UNSAFE")
 
-    assert reads["handoff"] == 2
+    assert state == {"validated": True, "handoff_reads": 1, "swapped": True}
 
 
 def test_handoff_final_and_intermediate_symlinks_fail_closed(canonical_kanban_home):

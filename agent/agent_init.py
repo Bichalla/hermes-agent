@@ -1991,6 +1991,9 @@ def init_agent(
                 )
                 continue
             _tname = _schema["name"]
+            from hermes_cli.repo_writer_context import is_repo_writer_blocked_tool
+            if is_repo_writer_blocked_tool(_tname):
+                continue
             if _tname in _existing_tool_names:
                 continue  # already registered via plugin/cache path
             _wrapped = {"type": "function", "function": _schema}
@@ -1998,6 +2001,12 @@ def init_agent(
             agent.valid_tool_names.add(_tname)
             agent._context_engine_tool_names.add(_tname)
             _existing_tool_names.add(_tname)
+
+    # Memory/context providers are post-build injection points and may emit a
+    # final name that bypasses the registry-derived schema filter. Close the
+    # complete usable surface before init can return it to any caller.
+    from hermes_cli.repo_writer_context import filter_agent_tool_surface
+    filter_agent_tool_surface(agent)
 
     # Notify context engine of session start
     if hasattr(agent, "context_compressor") and agent.context_compressor:

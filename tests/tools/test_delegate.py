@@ -11,12 +11,17 @@ Run with:  python -m pytest tests/test_delegate.py -v
 
 import json
 import os
+from pathlib import Path
+import subprocess
+import sys
+import tempfile
 import threading
 import time
 import types
 import unittest
 from unittest.mock import MagicMock, patch
 
+import hermes_cli.repo_write_lock as lock_module
 from tools.delegate_tool import (
     DELEGATE_BLOCKED_TOOLS,
     DELEGATE_TASK_SCHEMA,
@@ -36,6 +41,20 @@ from tools.delegate_tool import (
     _resolve_delegation_credentials,
     _inherit_parent_base_url,
 )
+
+
+def reference_count(identity: str) -> int:
+    """Return this process's held-reference count for one repository identity."""
+    with lock_module._registry_changed:
+        for key, entry in lock_module._registry.items():
+            if (
+                isinstance(key, tuple)
+                and identity in key
+                and isinstance(entry, lock_module._HeldLock)
+                and entry.pid == os.getpid()
+            ):
+                return entry.references
+    return 0
 
 
 def _make_mock_parent(depth=0):
@@ -157,6 +176,13 @@ class TestChildSystemPrompt(unittest.TestCase):
 
 
 class TestStripBlockedTools(unittest.TestCase):
+    def test_registered_local_workflow_is_a_real_blocked_tool(self):
+        self.assertIn("registered_local_workflow", DELEGATE_BLOCKED_TOOLS)
+
+    def test_strips_registered_local_workflow_toolset_directly(self):
+        result = _strip_blocked_tools(["terminal", "registered-workflow"])
+        self.assertEqual(result, ["terminal"])
+
     def test_removes_blocked_toolsets(self):
         result = _strip_blocked_tools(["terminal", "file", "delegation", "clarify", "memory", "code_execution"])
         self.assertEqual(sorted(result), ["file", "terminal"])
@@ -3197,6 +3223,369 @@ class TestFallbackModelInheritance(unittest.TestCase):
 
         _, kwargs = MockAgent.call_args
         self.assertIsNone(kwargs["fallback_model"])
+
+
+class TestRealDelegationRepositoryAuthority(unittest.TestCase):
+    _CONTRACT_MISSING = "task8_real_delegation_authority_contract_missing"
+
+    def _assert_child_guard_acquired(self, child_guard, parent_identity: str) -> None:
+        self.assertEqual(
+            child_guard.identities,
+            (parent_identity,),
+            self._CONTRACT_MISSING,
+        )
+        self.assertTrue(child_guard._frames, self._CONTRACT_MISSING)
+        frame_items = tuple(
+            item for frame in child_guard._frames for item in frame
+        )
+        self.assertTrue(frame_items, self._CONTRACT_MISSING)
+        self.assertTrue(
+            all(item.lock.locked for item in frame_items),
+            self._CONTRACT_MISSING,
+        )
+        self.assertEqual(
+            reference_count(parent_identity),
+            2,
+            self._CONTRACT_MISSING,
+        )
+
+    @staticmethod
+    def _git(repo: Path, *args: str) -> bytes:
+        completed = subprocess.run(
+            ["git", *args],
+            cwd=repo,
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            check=False,
+        )
+        if completed.returncode != 0:
+            raise AssertionError((args, completed.stdout, completed.stderr))
+        return completed.stdout
+
+    @staticmethod
+    def _external_lock_state(repo: Path, hermes_home: Path) -> str:
+        source_root = Path(__file__).parents[2]
+        script = """
+import sys
+from hermes_cli.repo_write_lock import RepoLockBusy, RepoWriteLock
+
+lock = RepoWriteLock(sys.argv[1], blocking=False)
+try:
+    lock.acquire()
+except RepoLockBusy:
+    print("busy")
+else:
+    try:
+        print("acquired")
+    finally:
+        lock.release()
+"""
+        env = dict(os.environ)
+        env["HERMES_HOME"] = str(hermes_home)
+        env["PYTHONPATH"] = os.pathsep.join(
+            [str(source_root), env.get("PYTHONPATH", "")]
+        )
+        completed = subprocess.run(
+            [sys.executable, "-c", script, str(repo)],
+            cwd=source_root,
+            env=env,
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            timeout=20,
+            check=False,
+        )
+        if completed.returncode != 0:
+            raise AssertionError((completed.stdout, completed.stderr))
+        return completed.stdout.strip()
+
+    def test_real_delegate_worker_shares_parent_authority_without_touching_dirty_files(self):
+        from hermes_cli.repo_write_guard import RepoWriteGuard
+        from hermes_cli.repo_write_lock import RepoWriteLock
+
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            # macOS exposes /var as a symlink; the production lock intentionally
+            # refuses every symlinked upper component, so anchor the fixture at
+            # the canonical /private/var/... path before creating HERMES_HOME.
+            root = Path(temporary_directory).resolve(strict=True)
+            repo = root / "repo"
+            repo.mkdir()
+            hermes_home = root / "hermes-home"
+
+            self._git(repo, "init", "-q")
+            self._git(repo, "config", "user.email", "task8@example.invalid")
+            self._git(repo, "config", "user.name", "Task8 Test")
+
+            modified = repo / "unrelated-modified.bin"
+            staged = repo / "unrelated-staged.bin"
+            untracked = repo / "unrelated-untracked.bin"
+            task_file = repo / "designated-task.bin"
+            modified.write_bytes(b"tracked-base\x00\n")
+            task_file.write_bytes(b"task-base\x00\n")
+            self._git(repo, "add", "--", modified.name, task_file.name)
+            self._git(repo, "commit", "-q", "-m", "base")
+
+            modified.write_bytes(b"tracked-dirty\x00\xff\n")
+            modified.chmod(0o751)
+            staged.write_bytes(b"staged-dirty\x00\xfe\n")
+            staged.chmod(0o640)
+            self._git(repo, "add", "--", staged.name)
+            untracked.write_bytes(b"untracked-dirty\x00\xfd\n")
+            untracked.chmod(0o705)
+
+            unrelated = (modified, staged, untracked)
+            unrelated_names = tuple(path.name for path in unrelated)
+
+            def payload_snapshot() -> dict[str, tuple[bytes, int]]:
+                return {
+                    path.name: (path.read_bytes(), path.stat().st_mode & 0o7777)
+                    for path in unrelated
+                }
+
+            def git_snapshot() -> tuple[bytes, bytes, bytes]:
+                return (
+                    self._git(
+                        repo,
+                        "status",
+                        "--porcelain=v2",
+                        "-z",
+                        "--",
+                        *unrelated_names,
+                    ),
+                    self._git(repo, "diff", "--binary", "--", *unrelated_names),
+                    self._git(
+                        repo,
+                        "diff",
+                        "--cached",
+                        "--binary",
+                        "--",
+                        staged.name,
+                    ),
+                )
+
+            unrelated_payload_before = payload_snapshot()
+            unrelated_git_before = git_snapshot()
+            expected_task_bytes = b"task-delegated\x00\xfc\n"
+            parent_thread = threading.get_ident()
+            parent_pid = os.getpid()
+            worker_observations: list[tuple[int, int]] = []
+            child_received_parent_handle: list[bool] = []
+            while_both_held: list[str] = []
+            reference_transitions: list[int] = []
+
+            parent_lock = RepoWriteLock(repo, blocking=False)
+            with patch.dict(os.environ, {"HERMES_HOME": str(hermes_home)}):
+                parent_lock.acquire()
+                parent_identity = parent_lock.identity
+                parent_handle_id = id(parent_lock)
+                reference_transitions.append(reference_count(parent_identity))
+                self.assertEqual(
+                    reference_transitions[-1], 1, self._CONTRACT_MISSING
+                )
+                try:
+                    def fake_run_single_child(*args, **kwargs):
+                        task_index = kwargs.get(
+                            "task_index", args[0] if args else None
+                        )
+                        if task_index != 0:
+                            return {
+                                "task_index": task_index,
+                                "status": "completed",
+                                "summary": "companion complete",
+                                "api_calls": 0,
+                                "duration_seconds": 0.0,
+                            }
+
+                        worker_observations.append(
+                            (threading.get_ident(), os.getpid())
+                        )
+                        child_received_parent_handle.append(
+                            any(id(value) == parent_handle_id for value in args)
+                            or any(
+                                id(value) == parent_handle_id
+                                for value in kwargs.values()
+                            )
+                        )
+                        child_guard = RepoWriteGuard([task_file])
+                        self.assertEqual(
+                            child_guard.identities,
+                            (parent_identity,),
+                            self._CONTRACT_MISSING,
+                        )
+                        try:
+                            child_guard.acquire()
+                            self._assert_child_guard_acquired(
+                                child_guard, parent_identity
+                            )
+                            reference_transitions.append(
+                                reference_count(parent_identity)
+                            )
+                            while_both_held.append(
+                                self._external_lock_state(repo, hermes_home)
+                            )
+                            task_file.write_bytes(expected_task_bytes)
+                        finally:
+                            child_guard.release()
+                            reference_transitions.append(
+                                reference_count(parent_identity)
+                            )
+                            self.assertEqual(
+                                reference_transitions[-1],
+                                1,
+                                self._CONTRACT_MISSING,
+                            )
+                        return {
+                            "task_index": task_index,
+                            "status": "completed",
+                            "summary": "task file changed",
+                            "api_calls": 0,
+                            "duration_seconds": 0.0,
+                        }
+
+                    closure_values = tuple(
+                        cell.cell_contents
+                        for cell in (fake_run_single_child.__closure__ or ())
+                    )
+                    self.assertFalse(
+                        any(id(value) == parent_handle_id for value in closure_values),
+                        self._CONTRACT_MISSING,
+                    )
+
+                    credentials = {
+                        "model": None,
+                        "provider": None,
+                        "base_url": None,
+                        "api_key": None,
+                        "api_mode": None,
+                    }
+                    parent = _make_mock_parent()
+                    parent._memory_manager = None
+                    with (
+                        patch("tools.delegate_tool._load_config", return_value={}),
+                        patch(
+                            "tools.delegate_tool._resolve_delegation_credentials",
+                            return_value=credentials,
+                        ),
+                        patch(
+                            "tools.delegate_tool._build_child_agent",
+                            side_effect=lambda **_kwargs: MagicMock(),
+                        ),
+                        patch(
+                            "tools.delegate_tool._run_single_child",
+                            side_effect=fake_run_single_child,
+                        ),
+                    ):
+                        result = json.loads(
+                            delegate_task(
+                                tasks=[
+                                    {"goal": "mutate the designated task file"},
+                                    {"goal": "companion delegation worker"},
+                                ],
+                                parent_agent=parent,
+                            )
+                        )
+
+                    self.assertEqual(
+                        [entry["status"] for entry in result["results"]],
+                        ["completed", "completed"],
+                        self._CONTRACT_MISSING,
+                    )
+                    self.assertEqual(len(worker_observations), 1)
+                    worker_thread, worker_pid = worker_observations[0]
+                    self.assertNotEqual(
+                        worker_thread, parent_thread, self._CONTRACT_MISSING
+                    )
+                    self.assertEqual(worker_pid, parent_pid, self._CONTRACT_MISSING)
+                    self.assertEqual(child_received_parent_handle, [False])
+                    self.assertEqual(while_both_held, ["busy"])
+                    self.assertTrue(parent_lock.locked, self._CONTRACT_MISSING)
+                    self.assertEqual(
+                        reference_count(parent_identity),
+                        1,
+                        self._CONTRACT_MISSING,
+                    )
+                    self.assertEqual(
+                        self._external_lock_state(repo, hermes_home), "busy"
+                    )
+                finally:
+                    parent_lock.release()
+                    reference_transitions.append(reference_count(parent_identity))
+
+            self.assertFalse(parent_lock.locked)
+            self.assertEqual(
+                reference_count(parent_identity), 0, self._CONTRACT_MISSING
+            )
+            self.assertEqual(
+                reference_transitions, [1, 2, 1, 0], self._CONTRACT_MISSING
+            )
+            self.assertEqual(
+                self._external_lock_state(repo, hermes_home), "acquired"
+            )
+            self.assertEqual(task_file.read_bytes(), expected_task_bytes)
+            self.assertEqual(payload_snapshot(), unrelated_payload_before)
+            self.assertEqual(git_snapshot(), unrelated_git_before)
+
+    def test_child_guard_contract_rejects_no_op_acquire_release_mutant(self):
+        from hermes_cli.repo_write_guard import RepoWriteGuard
+        from hermes_cli.repo_write_lock import RepoWriteLock
+
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory).resolve(strict=True)
+            repo = root / "repo"
+            repo.mkdir()
+            hermes_home = root / "hermes-home"
+            task_file = repo / "designated-task.bin"
+
+            self._git(repo, "init", "-q")
+            task_file.write_bytes(b"task-base\x00\n")
+
+            parent_lock = RepoWriteLock(repo, blocking=False)
+            with patch.dict(os.environ, {"HERMES_HOME": str(hermes_home)}):
+                parent_lock.acquire()
+                parent_identity = parent_lock.identity
+                self.assertEqual(
+                    reference_count(parent_identity), 1, self._CONTRACT_MISSING
+                )
+                try:
+                    child_guard = RepoWriteGuard([task_file])
+                    with (
+                        patch.object(
+                            RepoWriteGuard,
+                            "acquire",
+                            autospec=True,
+                            side_effect=lambda guard: guard,
+                        ),
+                        patch.object(
+                            RepoWriteGuard,
+                            "release",
+                            autospec=True,
+                            return_value=None,
+                        ),
+                    ):
+                        child_guard.acquire()
+                        self.assertFalse(
+                            child_guard._frames, self._CONTRACT_MISSING
+                        )
+                        self.assertEqual(
+                            reference_count(parent_identity),
+                            1,
+                            self._CONTRACT_MISSING,
+                        )
+                        with self.assertRaisesRegex(
+                            AssertionError, self._CONTRACT_MISSING
+                        ):
+                            self._assert_child_guard_acquired(
+                                child_guard, parent_identity
+                            )
+                        child_guard.release()
+                finally:
+                    parent_lock.release()
+
+            self.assertEqual(
+                reference_count(parent_identity), 0, self._CONTRACT_MISSING
+            )
 
 
 if __name__ == "__main__":

@@ -31,6 +31,7 @@ from concurrent.futures import (
 from typing import Any, Dict, List, Optional
 
 from toolsets import TOOLSETS, resolve_toolset
+from hermes_cli.repo_writer_context import is_repo_writer_context
 
 # Sentinel value used by the runtime provider system for providers that are
 # not natively known (named custom providers, third-party aggregators, etc.).
@@ -50,9 +51,12 @@ DELEGATE_BLOCKED_TOOLS = frozenset(
         "send_message",  # no cross-platform side effects
         "execute_code",  # children should reason step-by-step, not write scripts
         "cronjob",  # no scheduling more work in the parent's name
+        "registered_local_workflow",  # foreground owner route stays parent-bound
         "registered_review_ledger",  # owner-only governance route stays parent-bound
     ]
 )
+
+_REPO_WRITER_DELEGATE_BLOCKED_TOOLS = frozenset({"computer_use"})
 
 
 # ---------------------------------------------------------------------------
@@ -798,13 +802,17 @@ def _strip_blocked_tools(toolsets: List[str]) -> List[str]:
     Checking the fully-resolved tool list closes aliases (for example ``all``)
     and mixed/composite toolsets, not just dedicated one-tool bundles.
     """
+    blocked_tools = DELEGATE_BLOCKED_TOOLS
+    if is_repo_writer_context():
+        blocked_tools = blocked_tools | _REPO_WRITER_DELEGATE_BLOCKED_TOOLS
+
     kept: List[str] = []
     for name in toolsets:
         try:
             resolved = set(resolve_toolset(name))
         except Exception:
             resolved = set(TOOLSETS.get(name, {}).get("tools", []))
-        if resolved.intersection(DELEGATE_BLOCKED_TOOLS):
+        if resolved.intersection(blocked_tools):
             continue
         kept.append(name)
     return kept

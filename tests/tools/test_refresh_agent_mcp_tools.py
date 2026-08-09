@@ -11,6 +11,7 @@ freezing any particular tool list.
 import threading
 import types
 
+from hermes_cli import repo_writer_context
 from tools import mcp_tool
 
 
@@ -138,6 +139,39 @@ def test_refresh_preserves_memory_provider_and_context_engine_tools(monkeypatch)
     assert "memory_search" in agent.valid_tool_names   # not clobbered
     assert "lcm_grep" in agent.valid_tool_names         # not clobbered
     assert added == {"mcp_new_server_tool"}
+
+
+def test_writer_refresh_final_guard_removes_registry_memory_and_context_bypasses(
+    monkeypatch,
+):
+    """Final staged filtering wins over every refresh/reinjection source."""
+    agent = _agent(["read_file"])
+    agent._memory_manager = types.SimpleNamespace(
+        get_all_tool_schemas=lambda: [
+            {"name": "computer_use", "description": "", "parameters": {}}
+        ]
+    )
+    agent.context_compressor = types.SimpleNamespace(
+        get_tool_schemas=lambda: [
+            {"name": "execute_code", "description": "", "parameters": {}}
+        ]
+    )
+    agent._context_engine_tool_names = set()
+    monkeypatch.setattr(repo_writer_context, "_REPO_WRITER_CONTEXT", True)
+
+    import model_tools
+    monkeypatch.setattr(
+        model_tools,
+        "get_tool_definitions",
+        lambda **kw: [_tool("read_file"), _tool("computer_use")],
+    )
+
+    added = mcp_tool.refresh_agent_mcp_tools(agent)
+
+    assert added == set()
+    assert agent.valid_tool_names == {"read_file"}
+    assert {t["function"]["name"] for t in agent.tools} == {"read_file"}
+    assert agent._context_engine_tool_names == set()
 
 
 def test_refresh_respects_context_engine_toolset_gate(monkeypatch):

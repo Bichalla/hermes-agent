@@ -976,13 +976,15 @@ def _handle_create(args: dict, **kw) -> str:
     # dir:/worktree project that spawns a follow-up child keeps the child
     # in that project instead of a throwaway scratch dir. Orchestrators
     # (kanban toolset, no HERMES_KANBAN_TASK) and CLI/dashboard callers
-    # fall back to scratch as before. Explicit None path stays None.
+    # fall back to scratch as before. Keep an omitted kind as None until the
+    # DB module is available, then pass its opaque omission sentinel through
+    # create_task. The sentinel is not a public enum member.
     workspace_kind = args.get("workspace_kind")
     workspace_path = args.get("workspace_path")
     project_id = args.get("project") or args.get("project_id")
-    _inherit_workspace = workspace_kind is None and workspace_path is None
-    if workspace_kind is None:
-        workspace_kind = "scratch"
+    _inherit_workspace = (
+        workspace_kind is None and workspace_path is None and project_id is None
+    )
     triage, bool_error = _parse_bool_arg(args, "triage")
     if bool_error:
         return tool_error(bool_error)
@@ -1070,6 +1072,8 @@ def _handle_create(args: dict, **kw) -> str:
                         # whole subtree shares one repo + branch convention.
                         if project_id is None and _self_task.project_id:
                             project_id = _self_task.project_id
+            if workspace_kind is None:
+                workspace_kind = kb._WORKSPACE_KIND_OMITTED
             new_tid = kb.create_task(
                 conn,
                 title=str(title).strip(),
@@ -1078,7 +1082,7 @@ def _handle_create(args: dict, **kw) -> str:
                 parents=tuple(parents),
                 tenant=tenant,
                 priority=int(priority) if priority is not None else 0,
-                workspace_kind=str(workspace_kind),
+                workspace_kind=workspace_kind,
                 workspace_path=workspace_path,
                 project_id=project_id,
                 triage=triage,
@@ -1677,9 +1681,12 @@ KANBAN_CREATE_SCHEMA = {
                 "type": "string",
                 "enum": ["scratch", "dir", "worktree"],
                 "description": (
-                    "Workspace flavor: 'scratch' (fresh tmp dir, "
-                    "default), 'dir' (shared directory, requires "
-                    "absolute workspace_path), 'worktree' (git worktree)."
+                    "Workspace flavor. Explicit 'scratch', 'dir', and 'worktree' "
+                    "always remain explicit. For a resolved project with omitted "
+                    "workspace_kind, kanban.repo_writer_mode='off' keeps the "
+                    "historical per-task worktree, while 'single_writer' uses the "
+                    "project primary checkout as 'dir'. Without a resolvable "
+                    "project, omission falls back to 'scratch'."
                 ),
             },
             "workspace_path": {
@@ -1692,10 +1699,11 @@ KANBAN_CREATE_SCHEMA = {
             "project": {
                 "type": "string",
                 "description": (
-                    "Optional project id or slug to link the task to. When "
-                    "set, the task becomes a git worktree under the project's "
-                    "primary repo with a deterministic branch (project slug + "
-                    "task id), instead of a random branch."
+                    "Optional project id or slug. With omitted workspace_kind, "
+                    "kanban.repo_writer_mode selects the project worktree ('off') "
+                    "or primary checkout ('single_writer'); an unknown project "
+                    "falls back to scratch. Explicit workspace kinds are not "
+                    "rewritten."
                 ),
             },
             "triage": {

@@ -32,6 +32,12 @@ from typing import Dict, Any, List, Optional, Tuple
 
 from tools.registry import discover_builtin_tools, registry
 from toolsets import resolve_toolset, validate_toolset
+from hermes_cli.repo_writer_context import (
+    REPO_WRITER_BLOCKED_TOOL_NAMES,
+    filter_repo_writer_tool_definitions,
+    is_repo_writer_blocked_tool,
+    is_repo_writer_context,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -323,6 +329,7 @@ def get_tool_definitions(
             registry._generation,
             cfg_fp,
             bool(os.environ.get("HERMES_KANBAN_TASK")),
+            is_repo_writer_context(),
             bool(skip_tool_search_assembly),
         )
         cached = _tool_defs_cache.get(cache_key)
@@ -450,8 +457,20 @@ def _compute_tool_definitions(
     # needed; plugins respect enabled_toolsets / disabled_toolsets like any
     # other toolset.
 
-    # Ask the registry for schemas (only returns tools whose check_fn passes)
-    filtered_tools = registry.get_definitions(tools_to_include, quiet=quiet_mode)
+    # A dispatcher-authenticated repository writer has a persistently narrowed
+    # model surface. Apply this to final resolved names before registry schema
+    # lookup so aliases, composites, plugins, and execute_code's dynamic schema
+    # cannot reintroduce either high-bypass capability. The marker grants no
+    # authority; a spoof can only over-restrict the current process.
+    if is_repo_writer_context():
+        tools_to_include.difference_update(REPO_WRITER_BLOCKED_TOOL_NAMES)
+
+    # Ask the registry for schemas (only returns tools whose check_fn passes).
+    # In writer context, drop malformed output immediately so downstream
+    # dynamic-schema bookkeeping cannot dereference a missing emitted name.
+    filtered_tools = filter_repo_writer_tool_definitions(
+        registry.get_definitions(tools_to_include, quiet=quiet_mode)
+    )
 
     # The set of tool names that actually passed check_fn filtering.
     # Use this (not tools_to_include) for any downstream schema that references
@@ -521,16 +540,6 @@ def _compute_tool_definitions(
                     }
                     break
 
-    if not quiet_mode:
-        if filtered_tools:
-            tool_names = [t["function"]["name"] for t in filtered_tools]
-            print(f"🛠️  Final tool selection ({len(filtered_tools)} tools): {', '.join(tool_names)}")
-        else:
-            print("🛠️  No tools selected (all filtered out or unavailable)")
-
-    global _last_resolved_tool_names
-    _last_resolved_tool_names = [t["function"]["name"] for t in filtered_tools]
-
     # Sanitize schemas for broad backend compatibility. llama.cpp's
     # json-schema-to-grammar converter (used by its OAI server to build
     # GBNF tool-call parsers) rejects some shapes that cloud providers
@@ -542,6 +551,18 @@ def _compute_tool_definitions(
         filtered_tools = sanitize_tool_schemas(filtered_tools)
     except Exception as e:  # pragma: no cover — defensive
         logger.warning("Schema sanitization skipped: %s", e)
+
+    # Final emitted-name guard: registry callbacks and dynamic schema rebuilds
+    # can rename an otherwise-allowed selected entry. Filter after all such
+    # rebuilding and before the lazy catalog sees, caches, or publishes it.
+    filtered_tools = filter_repo_writer_tool_definitions(filtered_tools)
+
+    if not quiet_mode:
+        if filtered_tools:
+            tool_names = [t["function"]["name"] for t in filtered_tools]
+            print(f"🛠️  Final tool selection ({len(filtered_tools)} tools): {', '.join(tool_names)}")
+        else:
+            print("🛠️  No tools selected (all filtered out or unavailable)")
 
     # ── Tool Search (progressive disclosure) ────────────────────────────
     # Conditionally replace MCP + plugin (non-core) tools with three bridge
@@ -572,6 +593,12 @@ def _compute_tool_definitions(
             filtered_tools = assembly.tool_defs
     except Exception as e:  # pragma: no cover — never break tool loading
         logger.warning("Tool search assembly skipped: %s", e)
+
+    # Keep the returned/cache-published surface closed even if a future lazy
+    # assembler emits a malformed or blocked final name itself.
+    filtered_tools = filter_repo_writer_tool_definitions(filtered_tools)
+    global _last_resolved_tool_names
+    _last_resolved_tool_names = [t["function"]["name"] for t in filtered_tools]
 
     return filtered_tools
 
@@ -1071,6 +1098,15 @@ def handle_function_call(
     Returns:
         Function result as a JSON string.
     """
+    # Direct callers and stale/tool-search snapshots bypass schema omission.
+    # Deny before coercion, bridge resolution, middleware, hooks, or registry
+    # access, and never reflect attacker-controlled arguments in the result.
+    if is_repo_writer_blocked_tool(function_name):
+        return json.dumps(
+            {"status": "blocked", "error": "repo_writer_tool_blocked"},
+            ensure_ascii=False,
+        )
+
     # Coerce string arguments to their schema-declared types (e.g. "42"→42)
     function_args = coerce_tool_args(function_name, function_args)
     if not isinstance(function_args, dict):

@@ -43,12 +43,28 @@ import threading
 import atexit
 import shutil
 import subprocess
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Optional, Dict, Any, List
 
 from utils import env_var_enabled
+from hermes_cli.repo_write_guard import (
+    RepoWriteGuard,
+    RepoWriteGuardCode,
+    RepoWriteGuardError,
+    RepoWriteGuardOperationError,
+    RepoWriteGuardPathError,
+)
+from hermes_cli.repo_writer_context import is_repo_writer_context
 
 logger = logging.getLogger(__name__)
+
+_REPO_WRITER_BACKGROUND_BLOCKED_RESULT = {
+    "output": "",
+    "exit_code": -1,
+    "error": "Blocked: background terminal is unavailable in repository-writer context",
+    "status": "blocked",
+}
 
 
 # ---------------------------------------------------------------------------
@@ -1928,7 +1944,7 @@ def _command_requires_pipe_stdin(command: str) -> bool:
 
 
 _SHELL_LEVEL_BACKGROUND_RE = re.compile(
-    r"(?:^|[;&|]\s*|&&\s*|\|\|\s*|\$\(\s*)(?:nohup|disown|setsid)\b", re.IGNORECASE | re.MULTILINE
+    r"(?:^|[;&|]\s*|&&\s*|\|\|\s*|\$\(\s*)(?:nohup|disown)\b", re.IGNORECASE | re.MULTILINE
 )
 _INLINE_BACKGROUND_AMP_RE = re.compile(r"\s&\s")
 _TRAILING_BACKGROUND_AMP_RE = re.compile(r"\s&\s*(?:#.*)?$")
@@ -2083,6 +2099,103 @@ def _resolve_command_cwd(
     return get_session_cwd(session_key) or default_cwd
 
 
+@dataclass(frozen=True)
+class _LocalForegroundDirectory:
+    requested_directory: Path
+    guard_probe_directory: Path
+    requested_cwd_is_exact_existing: bool
+
+
+def _resolve_local_foreground_directory(
+    *,
+    workdir: Optional[str],
+    default_cwd: str,
+    session_key: Optional[str],
+) -> _LocalForegroundDirectory:
+    """Resolve the local Popen fallback used for repository guard discovery."""
+    try:
+        raw = _resolve_command_cwd(
+            workdir=workdir,
+            default_cwd=default_cwd,
+            session_key=session_key,
+        )
+        if not isinstance(raw, str) or not raw:
+            raise RepoWriteGuardPathError()
+        expanded = os.path.expanduser(raw)
+        from tools.environments.local import (
+            _resolve_local_initial_cwd,
+            _resolve_safe_cwd,
+        )
+
+        if workdir and not os.path.isabs(expanded):
+            # Explicit relative workdir is interpreted from the local
+            # session/config cwd, never from this controller process's cwd.
+            local_base = _resolve_command_cwd(
+                workdir=None,
+                default_cwd=default_cwd,
+                session_key=session_key,
+            )
+            if not isinstance(local_base, str) or not local_base:
+                raise RepoWriteGuardPathError()
+            candidate = Path(_resolve_local_initial_cwd(local_base)) / expanded
+        else:
+            candidate = Path(_resolve_local_initial_cwd(expanded))
+        guard_probe = Path(_resolve_safe_cwd(str(candidate))).resolve(strict=True)
+        if not guard_probe.is_absolute() or not guard_probe.is_dir():
+            raise RepoWriteGuardPathError()
+        try:
+            requested_cwd_is_exact_existing = (
+                candidate.is_dir()
+                and candidate.resolve(strict=True) == guard_probe
+            )
+        except (OSError, RuntimeError, TypeError, ValueError):
+            # The requested path can disappear after LocalEnvironment has
+            # already derived a usable Popen fallback. That is legacy recovery,
+            # not a guard path denial and not a cwd we may safely pin.
+            requested_cwd_is_exact_existing = False
+        return _LocalForegroundDirectory(
+            requested_directory=candidate,
+            guard_probe_directory=guard_probe,
+            requested_cwd_is_exact_existing=requested_cwd_is_exact_existing,
+        )
+    except RepoWriteGuardError:
+        raise
+    except (OSError, RuntimeError, TypeError, ValueError):
+        raise RepoWriteGuardPathError() from None
+
+
+def _revalidate_local_foreground_guard(
+    directory: _LocalForegroundDirectory,
+    expected_identities: tuple[str, ...],
+) -> Path:
+    """Re-derive the guarded probe and require the exact repository identity set.
+
+    This closes deterministic swaps at the cleanup/approval/retry seams. A
+    same-UID replacement after the final check remains outside the guarantee.
+    """
+    try:
+        from tools.environments.local import _resolve_safe_cwd
+
+        probe_source = (
+            directory.guard_probe_directory
+            if directory.requested_cwd_is_exact_existing
+            else Path(_resolve_safe_cwd(str(directory.requested_directory)))
+        )
+        current_probe = probe_source.resolve(strict=True)
+        if not current_probe.is_absolute() or not current_probe.is_dir():
+            raise RepoWriteGuardPathError()
+        current_identities = RepoWriteGuard(
+            [current_probe], directories=True
+        ).identities
+    except RepoWriteGuardError:
+        raise
+    except (OSError, RuntimeError, TypeError, ValueError):
+        raise RepoWriteGuardPathError() from None
+    if current_identities != expected_identities:
+        raise RepoWriteGuardOperationError()
+    return current_probe
+
+
 def terminal_tool(
     command: str,
     background: bool = False,
@@ -2126,7 +2239,21 @@ def terminal_tool(
         # Force run after user confirmation
         # Note: force parameter is internal only, not exposed to model API
     """
+    repo_terminal_guard: RepoWriteGuard | None = None
+    foreground_directory: _LocalForegroundDirectory | None = None
+    guarded_probe_cwd: str | None = None
+    pinned_command_cwd: str | None = None
     try:
+        # Repository writers must remain a single foreground execution lane.
+        # Deny background work before config/task/session/environment lookup,
+        # approval, subprocess creation, or process-registry mutation. The
+        # response is constant-safe and never reflects command or path input.
+        if is_repo_writer_context() and background:
+            return json.dumps(
+                _REPO_WRITER_BACKGROUND_BLOCKED_RESULT,
+                ensure_ascii=False,
+            )
+
         if not isinstance(command, str):
             logger.warning(
                 "Rejected invalid terminal command value: %s",
@@ -2231,8 +2358,77 @@ def terminal_tool(
                     "status": "error",
                 }, ensure_ascii=False)
 
+        # Validate workdir against shell injection before any managed runtime
+        # state, environment cache, approval, or process-registry access.
+        if workdir:
+            workdir_error = _validate_workdir(workdir)
+            if workdir_error:
+                logger.warning("Blocked dangerous workdir")
+                return json.dumps({
+                    "output": "",
+                    "exit_code": -1,
+                    "error": workdir_error,
+                    "status": "blocked"
+                }, ensure_ascii=False)
+
+        # The session key that drives cwd records: get_current_session_key()'s
+        # contextvar doesn't cross tool-worker threads, so use raw task_id as
+        # its stable fallback.
+        from tools.approval import get_current_session_key
+
+        session_key = get_current_session_key(default="") or (task_id or "")
+
+        # Local foreground commands cooperate with file and worker writers by
+        # locking the repository containing LocalEnvironment's existing Popen
+        # cwd (the requested directory or its nearest existing fallback).
+        # Acquire before cleanup/environment/approval/process state. Missing
+        # requested paths and paths outside Git retain legacy execute cwd flow.
+        if not background and env_type == "local":
+            try:
+                foreground_directory = _resolve_local_foreground_directory(
+                    workdir=workdir,
+                    default_cwd=cwd,
+                    session_key=session_key,
+                )
+                candidate_guard = RepoWriteGuard(
+                    [foreground_directory.guard_probe_directory], directories=True
+                )
+                if candidate_guard.identities:
+                    repo_terminal_guard = candidate_guard
+                    repo_terminal_guard.acquire()
+                    guarded_probe_cwd = str(
+                        foreground_directory.guard_probe_directory
+                    )
+                    if foreground_directory.requested_cwd_is_exact_existing:
+                        pinned_command_cwd = str(
+                            foreground_directory.guard_probe_directory
+                        )
+            except RepoWriteGuardError as denied:
+                return json.dumps({
+                    "status": "blocked",
+                    "error": "repo_terminal_guard_denied",
+                    "code": denied.code.value,
+                }, ensure_ascii=False)
+
         # Start cleanup thread
         _start_cleanup_thread()
+
+        # Cleanup may race a same-UID path move/replacement. Re-derive the
+        # repository identity immediately before touching environment state.
+        if repo_terminal_guard is not None and foreground_directory is not None:
+            try:
+                guarded_probe_cwd = str(
+                    _revalidate_local_foreground_guard(
+                        foreground_directory,
+                        repo_terminal_guard.identities,
+                    )
+                )
+            except RepoWriteGuardError as denied:
+                return json.dumps({
+                    "status": "blocked",
+                    "error": "repo_terminal_guard_denied",
+                    "code": denied.code.value,
+                }, ensure_ascii=False)
 
         # Get or create environment.
         # Use a per-task creation lock so concurrent tool calls for the same
@@ -2318,7 +2514,7 @@ def terminal_tool(
                         new_env = _create_environment(
                             env_type=env_type,
                             image=image,
-                            cwd=cwd,
+                            cwd=guarded_probe_cwd or cwd,
                             timeout=effective_timeout,
                             ssh_config=ssh_config,
                             container_config=container_config,
@@ -2422,19 +2618,6 @@ def terminal_tool(
                 desc = approval.get("description", "flagged as dangerous")
                 approval_note = f"Command was flagged ({desc}) and auto-approved by smart approval."
 
-        # Validate workdir against shell injection
-        if workdir:
-            workdir_error = _validate_workdir(workdir)
-            if workdir_error:
-                logger.warning("Blocked dangerous workdir: %s (command: %s)",
-                               workdir[:200], _safe_command_preview(command))
-                return json.dumps({
-                    "output": "",
-                    "exit_code": -1,
-                    "error": workdir_error,
-                    "status": "blocked"
-                }, ensure_ascii=False)
-
         # Prepare command for execution
         pty_disabled_reason = None
         effective_pty = pty
@@ -2446,14 +2629,6 @@ def terminal_tool(
                 "processes, call process(action='close') after writing so it receives "
                 "EOF."
             )
-
-        # The session key that drives cwd records: get_current_session_key()'s
-        # contextvar doesn't cross tool-worker threads, so fall back to the raw
-        # task_id (which IS the session_key for the top-level agent) — a
-        # stable, thread-safe anchor.
-        from tools.approval import get_current_session_key
-
-        session_key = get_current_session_key(default="") or (task_id or "")
 
         if background:
             # Spawn a tracked background process via the process registry.
@@ -2703,8 +2878,9 @@ def terminal_tool(
                     "error": f"Failed to start background process: {str(e)}"
                 }, ensure_ascii=False)
         else:
-            # Run foreground command with retry logic
-            max_retries = 3
+            # Repository-guarded commands may already have mutated the checkout
+            # before an executor/postprocess exception. Never replay them.
+            max_retries = 0 if repo_terminal_guard is not None else 3
             retry_count = 0
             result = None
             command_cwd = None
@@ -2721,7 +2897,24 @@ def terminal_tool(
 
             while retry_count <= max_retries:
                 try:
-                    command_cwd = _resolve_command_cwd(
+                    if (
+                        repo_terminal_guard is not None
+                        and foreground_directory is not None
+                    ):
+                        try:
+                            guarded_probe_cwd = str(
+                                _revalidate_local_foreground_guard(
+                                    foreground_directory,
+                                    repo_terminal_guard.identities,
+                                )
+                            )
+                        except RepoWriteGuardError as denied:
+                            return json.dumps({
+                                "status": "blocked",
+                                "error": "repo_terminal_guard_denied",
+                                "code": denied.code.value,
+                            }, ensure_ascii=False)
+                    command_cwd = pinned_command_cwd or _resolve_command_cwd(
                         workdir=workdir,
                         default_cwd=cwd,
                         session_key=session_key,
@@ -2908,6 +3101,20 @@ def terminal_tool(
             "traceback": tb_str,
             "status": "error"
         }, ensure_ascii=False)
+    finally:
+        if repo_terminal_guard is not None:
+            try:
+                repo_terminal_guard.release()
+            except RepoWriteGuardError as release_error:
+                logger.error(
+                    "repo_terminal_guard_release_failed code=%s",
+                    release_error.code.value,
+                )
+            except Exception:
+                logger.error(
+                    "repo_terminal_guard_release_failed code=%s",
+                    RepoWriteGuardCode.OPERATION.value,
+                )
 
 
 def check_terminal_requirements() -> bool:

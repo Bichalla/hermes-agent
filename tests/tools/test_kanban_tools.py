@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import json
 import os
+import subprocess
 
 import pytest
 
@@ -80,6 +81,30 @@ def test_kanban_comment_schema_marks_existing_card_metadata_approval_free():
     ]
     for fragment in required_fragments:
         assert fragment in desc
+
+
+def test_red_kanban_create_schema_documents_repo_writer_mode_matrix():
+    from tools.kanban_tools import KANBAN_CREATE_SCHEMA
+
+    marker = "repo_writer_mode_contract_missing"
+    props = KANBAN_CREATE_SCHEMA["parameters"]["properties"]
+    wording = " ".join(
+        (
+            KANBAN_CREATE_SCHEMA["description"],
+            props["workspace_kind"]["description"],
+            props["project"]["description"],
+        )
+    )
+    for fragment in (
+        "kanban.repo_writer_mode",
+        "off",
+        "single_writer",
+        "omitted workspace_kind",
+        "primary checkout",
+        "Explicit 'scratch', 'dir', and 'worktree'",
+        "unknown project",
+    ):
+        assert fragment in wording, f"{marker}: missing {fragment!r}"
 
 
 def test_kanban_worker_env_overrides_profile_toolset_filter(monkeypatch, tmp_path):
@@ -1602,6 +1627,81 @@ def test_create_explicit_workspace_beats_inheritance(monkeypatch, worker_env):
         conn.close()
 
 
+@pytest.mark.parametrize(
+    ("repo_writer_mode", "expected_workspace_kind"),
+    [("off", "worktree"), ("single_writer", "dir")],
+)
+def test_red_create_explicit_project_beats_parent_workspace_inheritance(
+    monkeypatch, worker_env, tmp_path, repo_writer_mode, expected_workspace_kind
+):
+    """An explicit child project resolves its own omitted workspace."""
+    from hermes_cli import config
+    from hermes_cli import kanban_db as kb
+    from hermes_cli import projects_db as pdb
+    from tools import kanban_tools as kt
+
+    marker = "repo_writer_mode_call_path_missing"
+    home = tmp_path / ".hermes"
+    (home / "config.yaml").write_text(
+        f"kanban:\n  repo_writer_mode: {repo_writer_mode}\n",
+        encoding="utf-8",
+    )
+    config._LOAD_CONFIG_CACHE.clear()
+
+    projects = {}
+    with pdb.connect_closing() as project_conn:
+        for label in ("a", "b"):
+            repo = tmp_path / f"project-{label}"
+            repo.mkdir()
+            subprocess.run(["git", "init", "-q", str(repo)], check=True)
+            project_id = pdb.create_project(
+                project_conn,
+                name=f"Project {label.upper()}",
+                folders=[str(repo)],
+            )
+            projects[label] = pdb.get_project(project_conn, project_id)
+    project_a = projects["a"]
+    project_b = projects["b"]
+    assert project_a is not None
+    assert project_b is not None
+
+    with kb.connect_closing() as conn:
+        current_task_id = kb.create_task(
+            conn,
+            title="Project A worker",
+            assignee="test-worker",
+            project_id=project_a.slug,
+            workspace_kind="dir",
+            workspace_path=project_a.primary_path,
+        )
+        kb.claim_task(conn, current_task_id)
+    monkeypatch.setenv("HERMES_KANBAN_TASK", current_task_id)
+
+    result = json.loads(
+        kt._handle_create(
+            {
+                "title": f"Project B child ({repo_writer_mode})",
+                "assignee": "peer",
+                "parents": [current_task_id],
+                "project": project_b.slug,
+            }
+        )
+    )
+    assert result["ok"] is True, marker
+    with kb.connect_closing() as conn:
+        child = kb.get_task(conn, result["task_id"])
+    assert child is not None
+    expected_path = (
+        os.path.join(project_b.primary_path, ".worktrees", child.id)
+        if repo_writer_mode == "off"
+        else project_b.primary_path
+    )
+    assert child.project_id == project_b.id, marker
+    assert child.workspace_kind == expected_workspace_kind, marker
+    assert child.workspace_path == expected_path, marker
+    assert project_a.primary_path not in (child.workspace_path or ""), marker
+
+
 def test_create_no_worker_task_stays_scratch(monkeypatch, worker_env):
     """Orchestrator/CLI callers (no HERMES_KANBAN_TASK) still default to
     scratch — inheritance only applies to task-scoped workers."""
@@ -1616,6 +1716,66 @@ def test_create_no_worker_task_stays_scratch(monkeypatch, worker_env):
         child = kb.get_task(conn, d["task_id"])
         assert child.workspace_kind == "scratch"
         assert child.workspace_path is None
+    finally:
+        conn.close()
+
+
+def test_red_create_preserves_omitted_workspace_until_project_resolution(
+    monkeypatch, worker_env, tmp_path
+):
+    """RED: the tool must not collapse omitted workspace_kind to scratch early."""
+    from hermes_cli import config
+    from hermes_cli import kanban_db as kb
+    from hermes_cli import projects_db as pdb
+    from tools import kanban_tools as kt
+
+    marker = "repo_writer_mode_contract_missing"
+    home = tmp_path / ".hermes"
+    (home / "config.yaml").write_text(
+        "kanban:\n  repo_writer_mode: single_writer\n",
+        encoding="utf-8",
+    )
+    config._LOAD_CONFIG_CACHE.clear()
+    repo = tmp_path / "tool-project"
+    repo.mkdir()
+    subprocess.run(["git", "init", "-q", str(repo)], check=True)
+    with pdb.connect_closing() as project_conn:
+        project_id = pdb.create_project(
+            project_conn,
+            name="Tool Project",
+            folders=[str(repo)],
+        )
+        project = pdb.get_project(project_conn, project_id)
+    assert project is not None
+    monkeypatch.delenv("HERMES_KANBAN_TASK", raising=False)
+
+    omitted = json.loads(
+        kt._handle_create(
+            {"title": "Omitted workspace", "assignee": "peer", "project": project.slug}
+        )
+    )
+    explicit = json.loads(
+        kt._handle_create(
+            {
+                "title": "Explicit scratch",
+                "assignee": "peer",
+                "project": project.slug,
+                "workspace_kind": "scratch",
+            }
+        )
+    )
+    assert omitted["ok"] is True, marker
+    assert explicit["ok"] is True, marker
+    conn = kb.connect()
+    try:
+        omitted_task = kb.get_task(conn, omitted["task_id"])
+        explicit_task = kb.get_task(conn, explicit["task_id"])
+        assert omitted_task is not None
+        assert explicit_task is not None
+        assert omitted_task.workspace_kind == "dir", marker
+        assert omitted_task.workspace_path == str(repo), marker
+        assert explicit_task.workspace_kind == "scratch", marker
+        assert explicit_task.workspace_path is None, marker
     finally:
         conn.close()
 
@@ -2197,13 +2357,30 @@ def test_worker_complete_rejects_stale_run_id(worker_env, monkeypatch):
     conn = kb.connect()
     try:
         run1 = kb.latest_run(conn, worker_env)
-        kb._set_worker_pid(conn, worker_env, 98765)
+        assert run1 is not None
+        generation_a = kb.get_task(conn, worker_env)
+        assert generation_a is not None
+        assert generation_a.current_run_id is not None
+        assert generation_a.current_run_id == run1.id
+        assert generation_a.claim_lock is not None
+        assert kb._set_worker_pid(
+            conn,
+            worker_env,
+            98765,
+            run_id=generation_a.current_run_id,
+            claim_lock=generation_a.claim_lock,
+        )
         monkeypatch.setenv("HERMES_KANBAN_CRASH_GRACE_SECONDS", "0")
         monkeypatch.setattr(_kb, "_pid_alive", lambda pid: False)
         assert kb.detect_crashed_workers(conn) == [worker_env]
 
-        kb.claim_task(conn, worker_env)
+        generation_b = kb.claim_task(conn, worker_env)
+        assert generation_b is not None
+        assert generation_b.current_run_id is not None
+        assert generation_b.claim_lock is not None
         run2 = kb.latest_run(conn, worker_env)
+        assert run2 is not None
+        assert generation_b.current_run_id == run2.id
         assert run2.id != run1.id
     finally:
         conn.close()

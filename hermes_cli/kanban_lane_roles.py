@@ -464,7 +464,17 @@ def _load_change_gate_validator(source: Optional[_StableFileSnapshot] = None) ->
     return module
 
 
-def _map_validator_failure(code: str, handoff: Optional[dict[str, Any]], task: Any) -> str:
+def _map_validator_failure(
+    code: str,
+    handoff: Optional[dict[str, Any]],
+    task: Any,
+    error_path: Optional[str] = None,
+) -> str:
+    evidence_ref = str(handoff.get("evidence_ref", "")) if isinstance(handoff, dict) else ""
+    if code in {"EVIDENCE_DIGEST_MISMATCH", "EVIDENCE_TASK_ID_MISMATCH"} or (
+        evidence_ref and error_path and evidence_ref in error_path
+    ):
+        return "CHANGE_GATE_EVIDENCE_INVALID"
     if code == "POLICY_VERSION_MISMATCH":
         return "CHANGE_GATE_POLICY_VERSION_MISMATCH"
     if code == "BLOCKING_UNKNOWN":
@@ -580,7 +590,7 @@ def check_change_gate_readiness(
     except _TrustedReadError:
         return ChangeGateReadiness(False, ["CHANGE_GATE_ARTIFACT_UNSAFE"])
     if evidence_snapshot.sha256 != evidence_sha256:
-        return ChangeGateReadiness(False, ["CHANGE_GATE_DIGEST_MISMATCH"])
+        return ChangeGateReadiness(False, ["CHANGE_GATE_EVIDENCE_INVALID"])
 
     validator = None
     try:
@@ -595,7 +605,15 @@ def check_change_gate_readiness(
     except Exception as exc:
         validation_error = getattr(validator, "ValidationError", None)
         if validation_error is not None and isinstance(exc, validation_error):
-            return ChangeGateReadiness(False, [_map_validator_failure(getattr(exc, "code", ""), handoff, task)])
+            return ChangeGateReadiness(
+                False,
+                [_map_validator_failure(
+                    getattr(exc, "code", ""),
+                    handoff,
+                    task,
+                    getattr(exc, "path", None),
+                )],
+            )
         return ChangeGateReadiness(False, ["CHANGE_GATE_VALIDATOR_UNAVAILABLE"])
 
     try:

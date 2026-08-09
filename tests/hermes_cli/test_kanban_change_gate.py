@@ -131,6 +131,42 @@ def _prepare_gate_task(conn, home: Path, *, bootstrap: bool = False, model: str 
     return task_id, stored
 
 
+def _claim_blocked_without_side_effects(conn, task_id, expected_code):
+    before = kb.get_task(conn, task_id)
+    assert before is not None
+    before_events = len(kb.list_events(conn, task_id))
+    before_runs = len(kb.list_runs(conn, task_id))
+    with pytest.raises(kb.ChangeGateBlocked) as exc_info:
+        kb.claim_task(conn, task_id)
+    after = kb.get_task(conn, task_id)
+    assert after is not None
+    assert after.status == "ready"
+    assert after.claim_lock is None
+    assert len(kb.list_events(conn, task_id)) == before_events
+    assert len(kb.list_runs(conn, task_id)) == before_runs
+    assert after.workspace_path == before.workspace_path
+    assert exc_info.value.reason_codes == [expected_code]
+
+
+def _rewrite_handoff(conn, task_id, stored: Path, mutate_handoff=None, mutate_evidence=None):
+    handoff = json.loads(stored.read_text(encoding="utf-8"))
+    evidence_path = Path(handoff["evidence_ref"])
+    evidence = json.loads(evidence_path.read_text(encoding="utf-8"))
+    if mutate_evidence is not None:
+        mutate_evidence(evidence)
+        evidence_path.write_text(json.dumps(evidence, indent=2) + "\n", encoding="utf-8")
+        handoff["evidence_sha256"] = hashlib.sha256(evidence_path.read_bytes()).hexdigest()
+    if mutate_handoff is not None:
+        mutate_handoff(handoff)
+    stored.write_text(json.dumps(handoff, indent=2) + "\n", encoding="utf-8")
+    task = kb.get_task(conn, task_id)
+    assert task is not None and task.body is not None
+    body = json.loads(task.body)
+    body["contract"]["change_gate"]["artifact_sha256"] = hashlib.sha256(stored.read_bytes()).hexdigest()
+    conn.execute("UPDATE tasks SET body = ? WHERE id = ?", (json.dumps(body), task_id))
+    conn.commit()
+
+
 def test_lane_contract_exposes_bounded_change_gate_object():
     contract = parse_contract_body(
         implementation_body(
@@ -269,6 +305,123 @@ def test_attachment_authority_and_digest_fail_closed(canonical_kanban_home):
         with pytest.raises(kb.ChangeGateBlocked) as exc_info:
             kb.claim_task(conn, unattached_id)
         assert exc_info.value.reason_codes == ["CHANGE_GATE_ARTIFACT_NOT_ATTACHED"]
+
+
+def test_evidence_missing_and_canonical_root_escape_fail_closed(canonical_kanban_home):
+    with kb.connect() as conn:
+        missing_id, missing_stored = _prepare_gate_task(conn, canonical_kanban_home)
+        missing_handoff = json.loads(missing_stored.read_text(encoding="utf-8"))
+        Path(missing_handoff["evidence_ref"]).unlink()
+        _claim_blocked_without_side_effects(conn, missing_id, "CHANGE_GATE_ARTIFACT_UNSAFE")
+
+        escape_id, escape_stored = _prepare_gate_task(conn, canonical_kanban_home)
+        _rewrite_handoff(
+            conn,
+            escape_id,
+            escape_stored,
+            mutate_handoff=lambda handoff: handoff.update({"evidence_ref": "/tmp/change-gate-escape.json"}),
+        )
+        _claim_blocked_without_side_effects(conn, escape_id, "CHANGE_GATE_ARTIFACT_UNSAFE")
+
+
+def test_evidence_digest_mismatch_maps_to_evidence_invalid(canonical_kanban_home):
+    with kb.connect() as conn:
+        task_id, stored = _prepare_gate_task(conn, canonical_kanban_home)
+        handoff = json.loads(stored.read_text(encoding="utf-8"))
+        evidence_path = Path(handoff["evidence_ref"])
+        evidence_path.write_text(evidence_path.read_text(encoding="utf-8") + "\n", encoding="utf-8")
+        _claim_blocked_without_side_effects(conn, task_id, "CHANGE_GATE_EVIDENCE_INVALID")
+
+
+def test_evidence_schema_and_blocking_unknown_fail_closed(canonical_kanban_home):
+    with kb.connect() as conn:
+        schema_id, schema_stored = _prepare_gate_task(conn, canonical_kanban_home)
+        _rewrite_handoff(conn, schema_id, schema_stored, mutate_evidence=lambda evidence: evidence.clear())
+        _claim_blocked_without_side_effects(conn, schema_id, "CHANGE_GATE_EVIDENCE_INVALID")
+
+        unknown_id, unknown_stored = _prepare_gate_task(conn, canonical_kanban_home)
+        _rewrite_handoff(
+            conn,
+            unknown_id,
+            unknown_stored,
+            mutate_evidence=lambda evidence: evidence.update({
+                "unknowns": [{
+                    "item": "blocking unknown",
+                    "blocking": True,
+                    "impact": "cannot verify",
+                    "required_resolution": "planner decision",
+                }]
+            }),
+        )
+        _claim_blocked_without_side_effects(conn, unknown_id, "CHANGE_GATE_BLOCKING_UNKNOWN")
+
+
+def test_handoff_card_digest_mismatch_remains_distinct(canonical_kanban_home):
+    with kb.connect() as conn:
+        task_id, _ = _prepare_gate_task(conn, canonical_kanban_home)
+        task = kb.get_task(conn, task_id)
+        assert task is not None and task.body is not None
+        body = json.loads(task.body)
+        body["contract"]["change_gate"]["artifact_sha256"] = "0" * 64
+        conn.execute("UPDATE tasks SET body = ? WHERE id = ?", (json.dumps(body), task_id))
+        conn.commit()
+        _claim_blocked_without_side_effects(conn, task_id, "CHANGE_GATE_DIGEST_MISMATCH")
+
+
+def test_task_profile_model_effort_and_handoff_identity_mismatches_fail_closed(canonical_kanban_home):
+    with kb.connect() as conn:
+        task_id, _ = _prepare_gate_task(conn, canonical_kanban_home, handoff_task_id="other-task")
+        _claim_blocked_without_side_effects(conn, task_id, "CHANGE_GATE_TASK_MISMATCH")
+
+        profile_id, _ = _prepare_gate_task(conn, canonical_kanban_home)
+        conn.execute("UPDATE tasks SET assignee = 'other-profile' WHERE id = ?", (profile_id,))
+        conn.commit()
+        _claim_blocked_without_side_effects(conn, profile_id, "CHANGE_GATE_PROFILE_MISMATCH")
+
+        model_id, _ = _prepare_gate_task(conn, canonical_kanban_home)
+        conn.execute("UPDATE tasks SET model_override = 'gpt-5.6-sol' WHERE id = ?", (model_id,))
+        conn.commit()
+        _claim_blocked_without_side_effects(conn, model_id, "CHANGE_GATE_MODEL_MISMATCH")
+
+        effort_id, effort_stored = _prepare_gate_task(conn, canonical_kanban_home)
+        _rewrite_handoff(
+            conn,
+            effort_id,
+            effort_stored,
+            mutate_handoff=lambda handoff: handoff["execution_route"].update({"reasoning_effort": "high"}),
+        )
+        _claim_blocked_without_side_effects(conn, effort_id, "CHANGE_GATE_EFFORT_MISMATCH")
+
+
+def test_wrong_stage_and_role_fail_before_artifact_authority(canonical_kanban_home):
+    with kb.connect() as conn:
+        stage_id = kb.create_task(
+            conn,
+            title="wrong stage",
+            body=implementation_body(
+                stage="DRAFT",
+                artifact_ref=str(canonical_kanban_home / "missing.json"),
+                artifact_sha256="a" * 64,
+                role="EXECUTOR",
+            ),
+            assignee="change-gate-xhigh",
+            model_override="gpt-5.6-luna",
+        )
+        _claim_blocked_without_side_effects(conn, stage_id, "CHANGE_GATE_STAGE_INVALID")
+
+        role_id = kb.create_task(
+            conn,
+            title="wrong role",
+            body=implementation_body(
+                stage="PLAN_APPROVED",
+                artifact_ref=str(canonical_kanban_home / "missing.json"),
+                artifact_sha256="a" * 64,
+                role="REVIEWER",
+            ),
+            assignee="change-gate-xhigh",
+            model_override="gpt-5.6-luna",
+        )
+        _claim_blocked_without_side_effects(conn, role_id, "CHANGE_GATE_ROLE_INVALID")
 
 
 def test_handoff_final_and_intermediate_symlinks_fail_closed(canonical_kanban_home):
@@ -529,6 +682,53 @@ def test_schema_mutation_during_canonical_validation_is_unsafe(canonical_kanban_
         canonical_kanban_home,
         monkeypatch,
         "policies/change-gate/frozen-handoff.schema.json",
+    )
+
+
+def test_evidence_mutation_during_canonical_validation_is_unsafe(canonical_kanban_home, monkeypatch):
+    with kb.connect() as conn:
+        task_id, stored = _prepare_gate_task(conn, canonical_kanban_home)
+        handoff = json.loads(stored.read_text(encoding="utf-8"))
+        evidence_path = Path(handoff["evidence_ref"])
+        original_read = lane_roles._read_trusted_file
+        original_load = lane_roles._load_change_gate_validator
+        mutated = {"done": False, "reads": 0}
+
+        def load_proxy(source):
+            actual = original_load(source)
+
+            class Proxy:
+                ValidationError = actual.ValidationError
+
+                @staticmethod
+                def validate_artifact(*args, **kwargs):
+                    result = actual.validate_artifact(*args, **kwargs)
+                    mutated["done"] = True
+                    return result
+
+            lane_roles._validator_module_digest = source.sha256
+            return Proxy()
+
+        def changed_post_snapshot(root, path, *, limit):
+            snapshot = original_read(root, path, limit=limit)
+            if Path(path) == evidence_path:
+                mutated["reads"] += 1
+                if mutated["done"] and mutated["reads"] == 2:
+                    changed = snapshot.data + b"\n# simulated evidence replacement\n"
+                    return replace(snapshot, data=changed, sha256=hashlib.sha256(changed).hexdigest())
+            return snapshot
+
+        monkeypatch.setattr(lane_roles, "_load_change_gate_validator", load_proxy)
+        monkeypatch.setattr(lane_roles, "_read_trusted_file", changed_post_snapshot)
+        _claim_blocked_without_side_effects(conn, task_id, "CHANGE_GATE_ARTIFACT_UNSAFE")
+
+    assert mutated["done"] is True
+    assert mutated["reads"] == 2
+
+
+def test_validator_source_mutation_during_canonical_validation_is_unsafe(canonical_kanban_home, monkeypatch):
+    _assert_authority_input_mutation_is_unsafe(
+        canonical_kanban_home, monkeypatch, "scripts/change_gate_validate.py"
     )
 
 

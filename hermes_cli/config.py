@@ -1540,6 +1540,8 @@ DEFAULT_CONFIG = {
             "default_status": "blocked",
             "proposal_ttl_seconds": 1800,
             "max_pending_per_session": 1,
+            "short_approval_phrases": ["승인", "ㅇㅇ", "고고", "그렇게 해", "좋아", "진행"],
+            "deny_phrases": ["취소", "ㄴㄴ", "하지마", "보류"],
             "detector": "heuristic",
             "auxiliary_detector_enabled": False,
             "redact_before_auxiliary": True,

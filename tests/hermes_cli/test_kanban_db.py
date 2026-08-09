@@ -1940,7 +1940,7 @@ def test_dispatch_max_spawn_fills_remaining_capacity(
         assert kb.get_task(conn, ready_b).status == "ready"
 
 
-def test_dispatch_reclaims_stale_before_spawning(kanban_home):
+def test_dispatch_dry_run_does_not_reclaim_stale(kanban_home):
     with kb.connect() as conn:
         t = kb.create_task(conn, title="x", assignee="alice")
         kb.claim_task(conn, t)
@@ -1949,7 +1949,11 @@ def test_dispatch_reclaims_stale_before_spawning(kanban_home):
             (int(time.time()) - 1, t),
         )
         res = kb.dispatch_once(conn, dry_run=True)
-    assert res.reclaimed == 1
+    assert res.reclaimed == 0
+    with kb.connect() as conn:
+        task = kb.get_task(conn, t)
+        assert task is not None and task.status == "running"
+        assert task.claim_expires is not None and task.claim_expires < int(time.time())
 
 
 # ---------------------------------------------------------------------------

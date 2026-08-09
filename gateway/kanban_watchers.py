@@ -109,6 +109,25 @@ def _release_singleton_lock(handle) -> None:
         pass
 
 
+def _gate_skip_changed(state: dict[str, tuple], slug: str, skips: list[dict]) -> bool:
+    """Return true once per board/gate-state fingerprint; keep telemetry quiet."""
+    fingerprint = tuple(
+        sorted(
+            (
+                item.get("task_id"),
+                tuple(item.get("reason_codes", ())),
+            )
+            for item in skips
+        )
+    )
+    if not skips:
+        state.pop(slug, None)
+        return False
+    changed = state.get(slug) != fingerprint
+    state[slug] = fingerprint
+    return changed
+
+
 class GatewayKanbanWatchersMixin:
     """Kanban watcher / notifier / dispatcher loops for GatewayRunner."""
 
@@ -940,6 +959,7 @@ class GatewayKanbanWatchersMixin:
         HEALTH_WINDOW = 6
         bad_ticks = 0
         last_warn_at = 0
+        last_gate_skip_fingerprint: dict[str, tuple] = {}
         # Avoid hot-looping corrupt-looking board DBs, but do not suppress
         # same-fingerprint retries forever: transient WAL/open races can
         # surface as "database disk image is malformed" for one tick.
@@ -1098,7 +1118,7 @@ class GatewayKanbanWatchersMixin:
                 conn = None
                 try:
                     conn = _kb.connect(board=slug)
-                    if _kb.has_spawnable_ready(conn):
+                    if _kb.has_spawnable_ready(conn, board=slug):
                         return True
                     if _kb.has_spawnable_review(conn):
                         return True
@@ -1235,13 +1255,21 @@ class GatewayKanbanWatchersMixin:
                 results = await asyncio.to_thread(_tick_once)
                 any_spawned = False
                 for slug, res in (results or []):
-                    if res is not None and getattr(res, "spawned", None):
-                        any_spawned = True
+                    gate_skips = getattr(res, "skipped_change_gate", []) if res is not None else []
+                    gate_changed = _gate_skip_changed(
+                        last_gate_skip_fingerprint, slug, gate_skips
+                    )
+                    if res is not None and (
+                        getattr(res, "spawned", None) or gate_changed
+                    ):
+                        any_spawned = any_spawned or bool(getattr(res, "spawned", None))
                         # Quiet by default — only log when something actually
-                        # happened, so an idle gateway stays silent.
+                        # happened, so an idle gateway stays silent. Change Gate
+                        # telemetry is bounded to task ids and counts only.
                         logger.info(
                             "kanban dispatcher [%s]: spawned=%d reclaimed=%d "
-                            "crashed=%d timed_out=%d promoted=%d auto_blocked=%d",
+                            "crashed=%d timed_out=%d promoted=%d auto_blocked=%d "
+                            "skipped_change_gate=%d gate_task_ids=%s",
                             slug,
                             len(res.spawned),
                             res.reclaimed,
@@ -1249,6 +1277,8 @@ class GatewayKanbanWatchersMixin:
                             len(res.timed_out) if hasattr(res.timed_out, "__len__") else 0,
                             res.promoted,
                             len(res.auto_blocked) if hasattr(res.auto_blocked, "__len__") else 0,
+                            len(gate_skips),
+                            [item.get("task_id") for item in gate_skips],
                         )
                 # Health telemetry (aggregate across boards)
                 ready_pending = await asyncio.to_thread(_ready_nonempty)

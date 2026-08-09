@@ -661,6 +661,12 @@ def _lane_contract(**overrides):
         "recommended_assignee": "default",
         "recommended_skills": ["software-development-lifecycle-operations"],
         "subagent_task_role": "implementer",
+        "change_gate": {
+            "stage": "PLAN_APPROVED",
+            "artifact_ref": "/tmp/handoff.json",
+            "artifact_sha256": "a" * 64,
+            "role": "EXECUTOR",
+        },
     }
     body.update(overrides)
     return body

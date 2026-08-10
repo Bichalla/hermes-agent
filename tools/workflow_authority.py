@@ -760,13 +760,18 @@ def _host_authority_payload(authority: CurrentTurnUserAuthority) -> bytes:
     return "\0".join(values).encode("utf-8")
 
 
-def _mint_host_current_turn_user_authority(**kwargs) -> CurrentTurnUserAuthority:
-    """Mint authority inside the trusted turn prologue, never from tool input."""
-    authority = CurrentTurnUserAuthority(**kwargs)
+def _seal_host_current_turn_user_authority(
+    authority: CurrentTurnUserAuthority,
+) -> CurrentTurnUserAuthority:
     seal = hmac.new(
         _HOST_AUTHORITY_KEY, _host_authority_payload(authority), hashlib.sha256
     ).hexdigest()
     return replace(authority, host_seal=seal)
+
+
+def _mint_host_current_turn_user_authority(**kwargs) -> CurrentTurnUserAuthority:
+    """Mint authority inside the trusted turn prologue, never from tool input."""
+    return _seal_host_current_turn_user_authority(CurrentTurnUserAuthority(**kwargs))
 
 
 def is_host_issued_current_turn_authority(
@@ -869,6 +874,8 @@ def extend_current_turn_user_authority_from_interactive_response(
             or infer_coarse_estimate_authority(user_response)
         ),
     )
+    if is_host_issued_current_turn_authority(current):
+        updated = _seal_host_current_turn_user_authority(updated)
     bind_current_turn_user_authority(updated)
     return updated
 

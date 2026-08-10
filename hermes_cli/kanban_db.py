@@ -8667,6 +8667,15 @@ def _dispatch_single_writer_queue(
         task = get_task(conn, row["id"])
         if task is None:
             continue
+        if status == "ready":
+            try:
+                _check_change_gate_before_claim(conn, task.id, board=board)
+            except ChangeGateBlocked as exc:
+                result.skipped_change_gate.append({
+                    "task_id": task.id,
+                    "reason_codes": list(exc.reason_codes),
+                })
+                continue
         try:
             identity, repo_busy = _repo_busy_for_task(
                 conn,
@@ -8715,6 +8724,12 @@ def _dispatch_single_writer_queue(
                     conn, task.id, ttl_seconds=ttl_seconds, _repo_aware=True,
                 )
             )
+        except ChangeGateBlocked as exc:
+            result.skipped_change_gate.append({
+                "task_id": task.id,
+                "reason_codes": list(exc.reason_codes),
+            })
+            continue
         except RepoBusyError:
             # The preliminary queue check is only an ordering optimization.
             # This claim-local check owns the invariant: BEGIN IMMEDIATE keeps

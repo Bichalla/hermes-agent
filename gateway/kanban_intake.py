@@ -30,7 +30,7 @@ NONE = "none"
 _DELIVERY_AUTHORITY_EPOCH = uuid.uuid4().hex
 _DENIED_DELIVERY_AUTHORITIES: set[tuple[str, str]] = set()
 _DENIED_DELIVERY_AUTHORITIES_LOCK = threading.RLock()
-_ALLOWED_STATUSES = {"triage", "blocked"}
+_ALLOWED_STATUSES = {"blocked"}
 _RAW_TRANSCRIPT_KEYS = {
     "raw_transcript",
     "transcript",
@@ -52,7 +52,7 @@ _SENSITIVE_PATTERNS = (
 _ID_LIKE_RE = re.compile(r"\b\d{8,}\b")
 _TITLE_MAX_CHARS = 72
 _PENDING_DB_INIT_LOCK = threading.RLock()
-CURRENT_POLICY_VERSION = "kanban-intake-policy/v3"
+CURRENT_POLICY_VERSION = "kanban-intake-policy/v6"
 POST_TURN_POLICY_TITLE = "Fix post-turn intake policy for Kanban"
 PERSONAL_CONTEXT_TITLE = "Improve personal context workflow"
 _SAFE_SENSITIVE_TITLE_PHRASES = (
@@ -969,7 +969,11 @@ class PendingKanbanStore:
         existing_body.pop("source_ref", None)
         proposed_body.pop("source_ref", None)
         return bool(
-            existing.policy_version == CURRENT_POLICY_VERSION
+            (
+                existing.status != "pending"
+                or self._pending_runtime_authority_is_current(existing)
+            )
+            and existing.policy_version == CURRENT_POLICY_VERSION
             and bool(existing.proposal_digest)
             and hmac.compare_digest(
                 existing.proposal_digest,
@@ -992,6 +996,24 @@ class PendingKanbanStore:
         )
 
     def put_pending(
+        self,
+        proposal: KanbanCardProposal,
+        binding: SourceBinding,
+        cfg: KanbanIntakeConfig,
+        *,
+        now: Optional[float] = None,
+        source_ids: Optional[dict[str, Any]] = None,
+    ) -> PendingKanbanApproval:
+        with _DENIED_DELIVERY_AUTHORITIES_LOCK:
+            return self._put_pending_locked(
+                proposal,
+                binding,
+                cfg,
+                now=now,
+                source_ids=source_ids,
+            )
+
+    def _put_pending_locked(
         self,
         proposal: KanbanCardProposal,
         binding: SourceBinding,
@@ -1049,13 +1071,15 @@ class PendingKanbanStore:
                 if self._same_effect_contract(existing, proposal, binding):
                     conn.commit()
                     return existing
-            active_count = conn.execute(
-                """SELECT COUNT(*) AS n FROM kanban_intake_pending
-                   WHERE status IN ('pending', 'executing')
-                     AND platform = ? AND chat_id = ?
-                     AND COALESCE(thread_id, '') = COALESCE(?, '')
-                     AND user_id = ? AND session_key = ? AND expires_at > ?
-                     AND policy_version = ? AND proposal_digest <> ?""",
+            active_rows = conn.execute(
+                """
+                SELECT * FROM kanban_intake_pending
+                WHERE status IN ('pending', 'executing')
+                  AND platform = ? AND chat_id = ?
+                  AND COALESCE(thread_id, '') = COALESCE(?, '')
+                  AND user_id = ? AND session_key = ?
+                  AND ((status = 'pending' AND expires_at > ?) OR status = 'executing')
+                """,
                 (
                     binding.platform,
                     binding.chat_id,
@@ -1063,11 +1087,26 @@ class PendingKanbanStore:
                     binding.user_id,
                     binding.session_key,
                     now,
-                    CURRENT_POLICY_VERSION,
-                    "",
                 ),
-            ).fetchone()["n"]
-            if int(active_count or 0) >= cfg.max_pending_per_session:
+            ).fetchall()
+            active_count = 0
+            for row in active_rows:
+                active = self._from_row(row)
+                if (
+                    active.status == "pending"
+                    and not self._pending_runtime_authority_is_current(active)
+                ):
+                    continue
+                if (
+                    active.policy_version == CURRENT_POLICY_VERSION
+                    and bool(active.proposal_digest)
+                    and hmac.compare_digest(
+                        active.proposal_digest,
+                        self._proposal_digest(active),
+                    )
+                ):
+                    active_count += 1
+            if active_count >= cfg.max_pending_per_session:
                 raise ValueError("active pending proposal limit exceeded")
             conn.execute(
                 """INSERT INTO kanban_intake_pending (
@@ -1925,7 +1964,7 @@ def execute_pending_approval(pending: PendingKanbanApproval, cfg: KanbanIntakeCo
     if proposal.proposed_status != "blocked" or not proposal.idempotency_key:
         return ApprovalResult(
             True,
-            f"Kanban 카드 생성 차단: unsupported status {proposal.proposed_status!r}",
+            "Kanban 카드 생성 차단: blocked-only owner contract mismatch",
             action=APPROVAL,
         )
     from hermes_cli import kanban_db as kb
@@ -1943,10 +1982,7 @@ def execute_pending_approval(pending: PendingKanbanApproval, cfg: KanbanIntakeCo
             "board": proposal.board,
             "session_id": pending.binding.session_key,
         }
-        if proposal.proposed_status == "blocked":
-            kwargs["initial_status"] = "blocked"
-        else:
-            kwargs["triage"] = True
+        kwargs["initial_status"] = "blocked"
         task_id = kb.create_task(conn, **kwargs)
         task = kb.get_task(conn, task_id)
         verified = bool(task and _task_matches_execution_contract(task, pending))

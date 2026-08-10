@@ -1,8 +1,9 @@
 from __future__ import annotations
 
+import asyncio
 import types
 from datetime import datetime, timezone
-from unittest.mock import patch
+from unittest.mock import AsyncMock, patch
 
 import pytest
 
@@ -17,7 +18,16 @@ from gateway.kanban_intake import (
     apply_typed_proposal_decision,
 )
 from gateway.platforms.base import MessageEvent, MessageType
+from gateway.config import Platform
+from gateway.session import SessionSource
 from gateway.session_context import clear_session_vars
+from hermes_cli import kanban_db as kb
+from plugins.platforms.discord.adapter import DiscordAdapter
+from tests.e2e.conftest import (
+    _make_discord_adapter_wired,
+    make_discord_message,
+    make_fake_dm_channel,
+)
 from tools.kanban_tools import KANBAN_INTAKE_DECISION_SCHEMA
 from tools.workflow_authority import (
     _mint_host_current_turn_user_authority,
@@ -172,11 +182,35 @@ def test_interactive_extension_reseals_changed_authority_and_keeps_active_turn()
     assert "검증 결과 댓글" not in repr(updated)
 
 
+def test_interactive_reseal_rejects_wrong_active_turn_binding():
+    current = _mint_host_current_turn_user_authority(
+        turn_id="turn-d",
+        source_role="user",
+        session_scope="session-d",
+        platform_scope="cli",
+        user_message_index=0,
+        user_action_fingerprint=fingerprint_user_action("clarify"),
+    )
+    bind_current_turn_user_authority(current)
+    bind_active_workflow_turn("turn-d", "cli", "session-d")
+    updated = extend_current_turn_user_authority_from_interactive_response(
+        "t_deadbeef 카드에 결과 댓글 기록해줘"
+    )
+
+    assert updated is not None
+    assert is_host_issued_current_turn_authority(updated) is True
+    assert matches_active_workflow_turn(updated) is True
+
+    bind_active_workflow_turn("different-turn", "cli", "different-session")
+    assert matches_active_workflow_turn(updated) is False
+
+
 def _cfg(tmp_path):
     return KanbanIntakeConfig(
         enabled=True,
         default_board="lifelog-control",
         store_path=tmp_path / "pending.db",
+        max_pending_per_session=4,
     )
 
 
@@ -201,7 +235,13 @@ def _proposal(*, source_ref="source-1", title="Implement v6 intake"):
     )
 
 
-def test_v6_blocked_only_stale_rows_fail_closed_and_semantic_duplicate_replays(tmp_path):
+@pytest.mark.parametrize(
+    "stale_policy",
+    ["kanban-intake-policy/v3", "kanban-intake-policy/v5"],
+)
+def test_v6_blocked_only_stale_rows_fail_closed_and_semantic_duplicate_replays(
+    tmp_path, stale_policy
+):
     assert CURRENT_POLICY_VERSION == "kanban-intake-policy/v6"
     cfg = _cfg(tmp_path)
     store = PendingKanbanStore(cfg.store_path)
@@ -218,7 +258,7 @@ def test_v6_blocked_only_stale_rows_fail_closed_and_semantic_duplicate_replays(t
     with store.connect() as conn:
         conn.execute(
             "UPDATE kanban_intake_pending SET policy_version=? WHERE pending_id=?",
-            ("kanban-intake-policy/v5", first.pending_id),
+            (stale_policy, first.pending_id),
         )
         conn.commit()
     result = apply_typed_proposal_decision(
@@ -230,8 +270,50 @@ def test_v6_blocked_only_stale_rows_fail_closed_and_semantic_duplicate_replays(t
         now=102,
     )
     assert result.verified is False
+    assert result.task_id is None
+    stale_lookup = store.get_active_by_proposal_ref(
+        first.pending_id, _binding(), now=103
+    )
+    assert stale_lookup.state == "invalid"
+    assert stale_lookup.reason_code == "policy_version_mismatch"
     row = store.review_pending(include_all=True, now=103)["items"][0]
     assert row["status"] == "needs_revalidation"
+
+
+def test_changed_effect_contract_is_distinct_from_semantic_replay(tmp_path):
+    cfg = _cfg(tmp_path)
+    store = PendingKanbanStore(cfg.store_path)
+    binding = _binding()
+
+    first = store.put_pending(
+        _proposal(source_ref="source-a", title="Implement stable intake card"),
+        binding,
+        cfg,
+        now=100,
+    )
+    replay = store.put_pending(
+        _proposal(source_ref="source-b", title="Implement stable intake card"),
+        binding,
+        cfg,
+        now=101,
+    )
+    changed = store.put_pending(
+        _proposal(source_ref="source-c", title="Implement changed intake card contract"),
+        binding,
+        cfg,
+        now=102,
+    )
+
+    assert replay.pending_id == first.pending_id
+    assert changed.pending_id != first.pending_id
+    assert changed.proposal_digest != first.proposal_digest
+    assert store.get_active_by_proposal_ref(
+        first.pending_id, binding, now=103
+    ).state == "one"
+    assert store.get_active_by_proposal_ref(
+        changed.pending_id, binding, now=103
+    ).state == "one"
+
 
 
 def test_digest_delivery_replacement_and_typed_only_contract(tmp_path):
@@ -270,7 +352,69 @@ def test_digest_delivery_replacement_and_typed_only_contract(tmp_path):
     assert set(params["properties"]) == {"action", "proposal_ref"}
 
 
-def test_discord_event_keeps_direct_created_at_and_reply_provenance():
+def test_typed_approval_creates_one_blocked_task_with_session_readback(
+    tmp_path, monkeypatch
+):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / ".hermes"))
+    for name in (
+        "HERMES_KANBAN_DB",
+        "HERMES_KANBAN_HOME",
+        "HERMES_KANBAN_BOARD",
+        "HERMES_KANBAN_WORKSPACES_ROOT",
+    ):
+        monkeypatch.delenv(name, raising=False)
+
+    board = "lifelog-control"
+    kb.create_board(board, name="Lifelog Control")
+    cfg = KanbanIntakeConfig(
+        enabled=True,
+        default_board=board,
+        store_path=tmp_path / "pending.db",
+    )
+    binding = _binding(session="composed-approval-session")
+    proposal = _proposal(
+        source_ref="approved-source",
+        title="Implement composed blocked intake card",
+    )
+    store = PendingKanbanStore(cfg.store_path)
+    pending = store.put_pending(proposal, binding, cfg, now=100)
+    message_id = "1521423652547990001"
+    assert store.bind_outbound_proposal_messages(
+        pending.pending_id, binding, [message_id], now=100.5
+    )
+
+    canonical = store.get_active_by_proposal_ref(
+        pending.pending_id, binding, now=101
+    )
+    assert canonical.state == "one"
+    assert canonical.pending is not None
+    result = apply_typed_proposal_decision(
+        action=APPROVAL,
+        proposal_ref=pending.pending_id,
+        binding=binding,
+        cfg=cfg,
+        store=store,
+        now=102,
+        expected_proposal_digest=canonical.pending.proposal_digest,
+        expected_reply_message_id=message_id,
+    )
+
+    assert result.verified is True
+    assert result.task_id is not None
+    conn = kb.connect(board=board)
+    try:
+        tasks = kb.list_tasks(conn, include_archived=True)
+    finally:
+        conn.close()
+    effect_tasks = [task for task in tasks if task.id == result.task_id]
+    assert len(effect_tasks) == 1
+    task = effect_tasks[0]
+    assert task.status == "blocked"
+    assert task.session_id == binding.session_key
+    assert task.status not in {"ready", "running"}
+    assert task.worker_pid is None
+    assert task.claim_lock is None
+
     created_at = datetime(2026, 8, 10, 12, 30, tzinfo=timezone.utc)
     event = MessageEvent(
         text="latest batch",
@@ -285,3 +429,95 @@ def test_discord_event_keeps_direct_created_at_and_reply_provenance():
     assert event.timestamp == created_at
     assert event.reply_to_message_id == "1521423652547989704"
     assert event.reply_to_is_own_message is True
+
+
+@pytest.mark.asyncio
+async def test_discord_adapter_direct_event_preserves_source_provenance():
+    adapter, _runner = _make_discord_adapter_wired()
+    assert isinstance(adapter, DiscordAdapter)
+    adapter.handle_message = AsyncMock()
+    adapter._text_batch_delay_seconds = 0
+    client = adapter._client
+    assert client is not None
+    bot_user = client.user
+    assert bot_user is not None
+    created_at = datetime(2026, 8, 10, 12, 31, tzinfo=timezone.utc)
+    message = make_discord_message(
+        content="direct provenance",
+        channel=make_fake_dm_channel(),
+        message_id=1521423652547990002,
+    )
+    message.created_at = created_at
+    resolved = types.SimpleNamespace(
+        content="earlier bot message",
+        author=bot_user,
+    )
+    message.reference = types.SimpleNamespace(
+        message_id=1521423652547990003,
+        resolved=resolved,
+    )
+
+    await adapter._handle_message(message)
+    call = adapter.handle_message.await_args
+    assert call is not None
+    event = call.args[0]
+    assert event.message_id == str(message.id)
+    assert event.timestamp == message.created_at
+    assert event.reply_to_message_id == "1521423652547990003"
+    assert event.reply_to_author_id == str(bot_user.id)
+    assert event.reply_to_is_own_message is True
+
+
+@pytest.mark.asyncio
+async def test_discord_batch_event_uses_latest_authenticated_provenance():
+    adapter, _runner = _make_discord_adapter_wired()
+    assert isinstance(adapter, DiscordAdapter)
+    adapter.handle_message = AsyncMock()
+    adapter._text_batch_delay_seconds = 60
+    adapter._text_batch_split_delay_seconds = 60
+    source = SessionSource(
+        platform=Platform.DISCORD,
+        chat_id="batch-chat",
+        chat_type="dm",
+        user_id="batch-user",
+    )
+    first = MessageEvent(
+        text="first chunk",
+        source=source,
+        message_id="1521423652547990004",
+        timestamp=datetime(2026, 8, 10, 12, 32, tzinfo=timezone.utc),
+        reply_to_message_id="1521423652547990005",
+        reply_to_author_id="old-author",
+        reply_to_is_own_message=False,
+    )
+    latest = MessageEvent(
+        text="latest chunk",
+        source=source,
+        message_id="1521423652547990006",
+        timestamp=datetime(2026, 8, 10, 12, 33, tzinfo=timezone.utc),
+        reply_to_message_id="1521423652547990007",
+        reply_to_author_id="latest-author",
+        reply_to_is_own_message=True,
+    )
+
+    first_timestamp = first.timestamp
+    first_reply_to_message_id = first.reply_to_message_id
+    adapter._enqueue_text_event(first)
+    adapter._enqueue_text_event(latest)
+    key = adapter._text_batch_key(first)
+    buffered = adapter._pending_text_batches[key]
+    assert buffered.text == "first chunk\nlatest chunk"
+    assert buffered.message_id == latest.message_id
+    assert buffered.timestamp == latest.timestamp
+    assert buffered.reply_to_message_id == latest.reply_to_message_id
+    assert buffered.reply_to_author_id == latest.reply_to_author_id
+    assert buffered.reply_to_is_own_message is True
+    assert buffered.timestamp != first_timestamp
+    assert buffered.reply_to_message_id != first_reply_to_message_id
+
+    for task in list(adapter._pending_text_batch_tasks.values()):
+        task.cancel()
+    await asyncio.gather(
+        *list(adapter._pending_text_batch_tasks.values()),
+        return_exceptions=True,
+    )

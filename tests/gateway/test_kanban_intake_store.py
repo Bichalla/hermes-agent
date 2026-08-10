@@ -3,13 +3,15 @@ import threading
 from concurrent.futures import ThreadPoolExecutor
 
 from gateway.kanban_intake import (
+    APPROVAL,
+    DENY,
     ApprovalResult,
     CURRENT_POLICY_VERSION,
     KanbanCardProposal,
     KanbanIntakeConfig,
     PendingKanbanStore,
     SourceBinding,
-    handle_reply,
+    apply_typed_proposal_decision,
 )
 
 
@@ -135,7 +137,13 @@ def test_old_policy_pending_requires_revalidation_after_policy_bump(tmp_path):
     with store.connect() as conn:
         conn.execute("UPDATE kanban_intake_pending SET policy_version = ? WHERE pending_id = ?", ("kanban-intake-policy/v2", pending.pending_id))
         conn.commit()
-    result = handle_reply("승인", binding(), c, store)
+    result = apply_typed_proposal_decision(
+        action=APPROVAL,
+        proposal_ref=pending.pending_id,
+        binding=binding(),
+        cfg=c,
+        store=store,
+    )
     assert result.handled is True
     assert result.action == "approve"
     assert result.verified is False
@@ -285,8 +293,20 @@ def test_denial_and_policy_revalidation_transitions_audit_atomically(
     capsys.readouterr()
     monkeypatch.setattr("gateway.kanban_intake.time.time", lambda: 101.0)
 
-    denied_result = handle_reply("취소", binding(thread="deny"), c, store)
-    stale_result = handle_reply("승인", binding(thread="stale"), c, store)
+    denied_result = apply_typed_proposal_decision(
+        action=DENY,
+        proposal_ref=denied.pending_id,
+        binding=binding(thread="deny"),
+        cfg=c,
+        store=store,
+    )
+    stale_result = apply_typed_proposal_decision(
+        action=APPROVAL,
+        proposal_ref=stale.pending_id,
+        binding=binding(thread="stale"),
+        cfg=c,
+        store=store,
+    )
 
     assert denied_result.handled is True
     assert stale_result.handled is True
@@ -302,6 +322,19 @@ def test_approval_claim_and_finalize_are_separate_audited_transitions(tmp_path, 
     c = cfg(tmp_path)
     store = PendingKanbanStore(c.store_path)
     pending = store.put_pending(proposal(title="Implement approval transition tests"), binding(), c, now=100)
+    delivery_id = "1521423652547989701"
+    assert store.bind_outbound_proposal_messages(
+        pending.pending_id,
+        binding(),
+        [delivery_id],
+        now=100.5,
+    )
+    pending = store.get_active_by_proposal_ref(
+        pending.pending_id,
+        binding(),
+        now=100.6,
+    ).pending
+    assert pending is not None
     _migrate_audit(c)
     capsys.readouterr()
     monkeypatch.setattr("gateway.kanban_intake.time.time", lambda: 101.0)
@@ -310,7 +343,15 @@ def test_approval_claim_and_finalize_are_separate_audited_transitions(tmp_path, 
         lambda *_: ApprovalResult(True, "ok", task_id="t_test", verified=True, action="approve"),
     )
 
-    result = handle_reply("승인", binding(), c, store)
+    result = apply_typed_proposal_decision(
+        action=APPROVAL,
+        proposal_ref=pending.pending_id,
+        binding=binding(),
+        cfg=c,
+        store=store,
+        expected_proposal_digest=pending.proposal_digest,
+        expected_reply_message_id=delivery_id,
+    )
 
     assert result.verified is True
     assert [row[:3] for row in _transition_rows(store, pending.pending_id)] == [
@@ -363,7 +404,13 @@ def test_retry_resumes_execution_after_crash_before_board_commit(
             True, "resumed", task_id="t_resumed", verified=True, action="approve"
         ),
     )
-    result = handle_reply("승인", binding(), c, store)
+    result = apply_typed_proposal_decision(
+        action=APPROVAL,
+        proposal_ref=pending.pending_id,
+        binding=binding(),
+        cfg=c,
+        store=store,
+    )
     assert result.verified is True
     assert _transition_rows(store, pending.pending_id)[-1][:3] == (
         "executing",
@@ -412,7 +459,13 @@ def test_retry_reconciles_execution_after_crash_after_board_commit(
         "gateway.kanban_intake.execute_pending_approval",
         lambda *_: (_ for _ in ()).throw(AssertionError("must not execute again")),
     )
-    result = handle_reply("승인", binding(), c, store)
+    result = apply_typed_proposal_decision(
+        action=APPROVAL,
+        proposal_ref=pending.pending_id,
+        binding=binding(),
+        cfg=c,
+        store=store,
+    )
     assert result.verified is True
     assert result.task_id == "t_committed"
     assert _transition_rows(store, pending.pending_id)[-1][:3] == (

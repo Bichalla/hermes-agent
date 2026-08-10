@@ -17,6 +17,7 @@ from contextvars import ContextVar, Token
 from dataclasses import dataclass, replace
 
 _FINGERPRINT_RE = re.compile(r"^[a-f0-9]{64}$")
+_HOST_AUTHORITY_KEY = secrets.token_bytes(32)
 _TASK_ID_RE = re.compile(r"(?<![a-z0-9])t_[a-z0-9]{6,64}(?![a-z0-9])", re.IGNORECASE)
 _PENDING_ID_RE = re.compile(r"(?<![a-f0-9])kp_[a-f0-9]{16}(?![a-f0-9])")
 _QUOTED_TARGET_RE = re.compile(
@@ -666,6 +667,7 @@ class CurrentTurnUserAuthority:
     blocked_create_target_fingerprints: frozenset[str] = frozenset()
     blocked_create_generated_title: str = ""
     coarse_estimate_authorized: bool = False
+    host_seal: str = ""
 
     def __post_init__(self) -> None:
         if self.source_role != "user":
@@ -688,6 +690,8 @@ class CurrentTurnUserAuthority:
             raise ValueError("allowed_operations contains an unknown operation")
         if type(self.coarse_estimate_authorized) is not bool:
             raise ValueError("coarse_estimate_authorized must be bool")
+        if self.host_seal and not _FINGERPRINT_RE.fullmatch(self.host_seal):
+            raise ValueError("host_seal must be a SHA-256 token")
         for grant in self.operation_target_grants:
             if (
                 type(grant) is not tuple
@@ -731,6 +735,49 @@ class CurrentTurnUserAuthority:
             operation,
             fingerprint_workflow_target(target),
         ) in self.operation_target_grants
+
+
+def _host_authority_payload(authority: CurrentTurnUserAuthority) -> bytes:
+    values = (
+        authority.turn_id,
+        authority.source_role,
+        authority.session_scope,
+        authority.platform_scope,
+        str(authority.user_message_index),
+        authority.user_action_fingerprint,
+        authority.source_event_fingerprint,
+        "\x1f".join(sorted(authority.allowed_action_classes)),
+        "\x1f".join(sorted(authority.allowed_operations)),
+        "\x1f".join(
+            f"{operation}\x1e{target}"
+            for operation, target in sorted(authority.operation_target_grants)
+        ),
+        "\x1f".join(sorted(authority.target_fingerprints)),
+        "\x1f".join(sorted(authority.blocked_create_target_fingerprints)),
+        authority.blocked_create_generated_title,
+        "1" if authority.coarse_estimate_authorized else "0",
+    )
+    return "\0".join(values).encode("utf-8")
+
+
+def _mint_host_current_turn_user_authority(**kwargs) -> CurrentTurnUserAuthority:
+    """Mint authority inside the trusted turn prologue, never from tool input."""
+    authority = CurrentTurnUserAuthority(**kwargs)
+    seal = hmac.new(
+        _HOST_AUTHORITY_KEY, _host_authority_payload(authority), hashlib.sha256
+    ).hexdigest()
+    return replace(authority, host_seal=seal)
+
+
+def is_host_issued_current_turn_authority(
+    authority: CurrentTurnUserAuthority | None,
+) -> bool:
+    if authority is None or not authority.host_seal:
+        return False
+    expected = hmac.new(
+        _HOST_AUTHORITY_KEY, _host_authority_payload(authority), hashlib.sha256
+    ).hexdigest()
+    return hmac.compare_digest(authority.host_seal, expected)
 
 
 def select_blocked_create_target_fingerprint(

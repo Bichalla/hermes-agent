@@ -36,8 +36,49 @@ needs to replace the import + call site:
     platform = get_session_env("HERMES_SESSION_PLATFORM", "")
 """
 
-from contextvars import ContextVar
+from contextvars import ContextVar, Token
+from dataclasses import dataclass
+import re
 from typing import Any
+
+
+_SNOWFLAKE_RE = re.compile(r"^[0-9]{17,20}$")
+_ATTACHMENT_SHA_RE = re.compile(r"^[a-f0-9]{64}$")
+_KANBAN_PROPOSAL_REF_RE = re.compile(r"^kp_[a-f0-9]{16}$")
+
+
+@dataclass(frozen=True, slots=True)
+class TrustedKanbanProposalCapability:
+    """Host-bound exact Kanban proposal selected from authenticated reply state."""
+
+    proposal_ref: str
+    proposal_digest: str
+    platform: str
+    chat_id: str
+    thread_id: str
+    authenticated_sender_id: str
+    current_message_id: str
+    replied_to_message_id: str
+
+    def __post_init__(self) -> None:
+        if _KANBAN_PROPOSAL_REF_RE.fullmatch(self.proposal_ref) is None:
+            raise ValueError("trusted proposal ref is invalid")
+        if _ATTACHMENT_SHA_RE.fullmatch(self.proposal_digest) is None:
+            raise ValueError("trusted proposal digest is invalid")
+        if self.platform != "discord":
+            raise ValueError("trusted proposal platform must be discord")
+        if any(
+            _SNOWFLAKE_RE.fullmatch(value) is None
+            for value in (
+                self.chat_id,
+                self.thread_id,
+                self.authenticated_sender_id,
+                self.current_message_id,
+                self.replied_to_message_id,
+            )
+        ):
+            raise ValueError("trusted proposal route identity is invalid")
+
 
 # Sentinel to distinguish "never set in this context" from "explicitly set to empty".
 # When a contextvar holds _UNSET, we fall back to os.environ (CLI/cron compat).
@@ -104,6 +145,9 @@ _TRUSTED_CURRENT_USER_TEXT: ContextVar[str | None] = ContextVar(
 _SESSION_CONTROLLER_ROLE: ContextVar[str] = ContextVar(
     "session_controller_role", default=""
 )
+_TRUSTED_KANBAN_PROPOSAL_CAPABILITY: ContextVar[
+    TrustedKanbanProposalCapability | None
+] = ContextVar("trusted_kanban_proposal_capability", default=None)
 
 _SESSION_PROFILE: ContextVar = ContextVar("HERMES_SESSION_PROFILE", default=_UNSET)
 
@@ -185,6 +229,7 @@ def set_session_vars(
     ui_session_id: str = "",
     user_text: str | None = None,
     controller_role: str = "",
+    trusted_kanban_proposal: TrustedKanbanProposalCapability | None = None,
 ) -> list:
     """Set all session context variables and return reset tokens.
 
@@ -224,6 +269,11 @@ def set_session_vars(
             user_text if isinstance(user_text, str) else None
         ),
         _SESSION_CONTROLLER_ROLE.set(controller_role),
+        _TRUSTED_KANBAN_PROPOSAL_CAPABILITY.set(
+            trusted_kanban_proposal
+            if type(trusted_kanban_proposal) is TrustedKanbanProposalCapability
+            else None
+        ),
     ]
     try:
         from agent.runtime_cwd import set_session_cwd
@@ -262,6 +312,7 @@ def clear_session_vars(tokens: list) -> None:
         var.set("")
     _TRUSTED_CURRENT_USER_TEXT.set(None)
     _SESSION_CONTROLLER_ROLE.set("")
+    _TRUSTED_KANBAN_PROPOSAL_CAPABILITY.set(None)
     # Reset async-delivery capability to the "never set" sentinel rather than a
     # falsy value: a cleared context should fall back to the default-supported
     # behavior (CLI / unaware paths), not be mistaken for an opted-out
@@ -317,6 +368,7 @@ def reset_session_vars() -> None:
     _SESSION_ASYNC_DELIVERY.set(_UNSET)
     _TRUSTED_CURRENT_USER_TEXT.set(None)
     _SESSION_CONTROLLER_ROLE.set("")
+    _TRUSTED_KANBAN_PROPOSAL_CAPABILITY.set(None)
     try:
         from agent.runtime_cwd import clear_session_cwd
 
@@ -334,9 +386,36 @@ def get_trusted_current_user_text() -> str | None:
     return _TRUSTED_CURRENT_USER_TEXT.get()
 
 
+def get_trusted_kanban_proposal_capability(
+) -> TrustedKanbanProposalCapability | None:
+    return _TRUSTED_KANBAN_PROPOSAL_CAPABILITY.get()
+
+
 def get_session_controller_role() -> str:
     """Return the host-bound controller role with no environment fallback."""
     return _SESSION_CONTROLLER_ROLE.get()
+
+
+def bind_queued_event_kanban_context(
+    *,
+    message_id: str | None,
+    capability: TrustedKanbanProposalCapability | None,
+) -> tuple[Token, Token]:
+    """Temporarily bind a queued event's message identity and capability."""
+    message_token = _SESSION_MESSAGE_ID.set(
+        str(message_id) if message_id is not None else _UNSET
+    )
+    capability_token = _TRUSTED_KANBAN_PROPOSAL_CAPABILITY.set(
+        capability if type(capability) is TrustedKanbanProposalCapability else None
+    )
+    return message_token, capability_token
+
+
+def reset_queued_event_kanban_context(tokens: tuple[Token, Token]) -> None:
+    """Restore the foreground context after one queued event recursion."""
+    message_token, capability_token = tokens
+    _TRUSTED_KANBAN_PROPOSAL_CAPABILITY.reset(capability_token)
+    _SESSION_MESSAGE_ID.reset(message_token)
 
 
 def get_session_env(name: str, default: str = "") -> str:

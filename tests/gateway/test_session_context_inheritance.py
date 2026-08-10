@@ -260,3 +260,33 @@ def test_reset_session_vars_restores_async_delivery_unset():
         f"_SESSION_ASYNC_DELIVERY is {_SESSION_ASYNC_DELIVERY.get()!r}, expected _UNSET"
     )
     assert async_delivery_supported() is True
+
+
+def test_queued_event_temporarily_rebinds_message_and_clears_capability():
+    original = sc.TrustedKanbanProposalCapability(
+        proposal_ref="kp_aaaaaaaaaaaaaaaa",
+        proposal_digest="a" * 64,
+        platform="discord",
+        chat_id="33333333333333333",
+        thread_id="33333333333333333",
+        authenticated_sender_id="11111111111111111",
+        current_message_id="66666666666666666",
+        replied_to_message_id="55555555555555555",
+    )
+    tokens = set_session_vars(
+        platform="discord",
+        message_id="66666666666666666",
+        trusted_kanban_proposal=original,
+    )
+    queued_tokens = sc.bind_queued_event_kanban_context(
+        message_id="77777777777777777",
+        capability=None,
+    )
+    try:
+        assert sc.get_session_env("HERMES_SESSION_MESSAGE_ID") == "77777777777777777"
+        assert sc.get_trusted_kanban_proposal_capability() is None
+    finally:
+        sc.reset_queued_event_kanban_context(queued_tokens)
+        assert sc.get_session_env("HERMES_SESSION_MESSAGE_ID") == "66666666666666666"
+        assert sc.get_trusted_kanban_proposal_capability() == original
+        sc.clear_session_vars(tokens)

@@ -1,3 +1,4 @@
+import gateway.kanban_intake as intake
 from gateway.kanban_intake import (
     APPROVAL,
     DENY,
@@ -5,8 +6,7 @@ from gateway.kanban_intake import (
     KanbanIntakeConfig,
     PendingKanbanStore,
     SourceBinding,
-    classify_reply,
-    handle_reply,
+    apply_typed_proposal_decision,
     validate_proposal,
 )
 
@@ -29,28 +29,36 @@ def valid_proposal():
     )
 
 
-def test_short_reply_classifier(tmp_path):
+def test_phrase_classifier_is_not_an_effect_authority():
+    assert not hasattr(intake, "classify_reply")
+    assert not hasattr(intake, "handle_reply")
+
+
+def test_approval_without_exact_pending_fails_closed(tmp_path):
     c = cfg(tmp_path)
-    assert classify_reply("승인", c) == APPROVAL
-    assert classify_reply("ㅇㅇ", c) == APPROVAL
-    assert classify_reply("고고", c) == APPROVAL
-    assert classify_reply("그렇게 해", c) == APPROVAL
-    assert classify_reply("취소", c) == DENY
-    assert classify_reply("보류", c) == DENY
-    assert classify_reply("그냥 설명해줘", c) == "none"
+    result = apply_typed_proposal_decision(
+        action=APPROVAL,
+        proposal_ref="kp_0000000000000000",
+        binding=binding(),
+        cfg=c,
+        store=PendingKanbanStore(c.store_path),
+    )
+    assert result.handled is True
+    assert result.verified is False
+    assert "proposal_ref" in result.message
 
 
-def test_approval_without_pending_is_not_handled(tmp_path):
-    c = cfg(tmp_path)
-    result = handle_reply("승인", binding(), c, PendingKanbanStore(c.store_path))
-    assert result.handled is False
-
-
-def test_deny_marks_pending_without_mutation(tmp_path):
+def test_deny_marks_exact_pending_without_card_mutation(tmp_path):
     c = cfg(tmp_path)
     store = PendingKanbanStore(c.store_path)
-    store.put_pending(valid_proposal(), binding(), c)
-    result = handle_reply("취소", binding(), c, store)
+    pending = store.put_pending(valid_proposal(), binding(), c)
+    result = apply_typed_proposal_decision(
+        action=DENY,
+        proposal_ref=pending.pending_id,
+        binding=binding(),
+        cfg=c,
+        store=store,
+    )
     assert result.handled is True
     assert result.action == DENY
     assert store.get_active_for_source(binding()).state == "none"

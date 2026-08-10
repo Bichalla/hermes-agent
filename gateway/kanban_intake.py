@@ -7,6 +7,7 @@ phrases can execute only an exact, source-bound pending proposal.
 
 from __future__ import annotations
 
+import hashlib
 import hmac
 import json
 import re
@@ -23,6 +24,9 @@ from hermes_constants import get_hermes_home
 APPROVAL = "approve"
 DENY = "deny"
 NONE = "none"
+_DELIVERY_AUTHORITY_EPOCH = uuid.uuid4().hex
+_DENIED_DELIVERY_AUTHORITIES: set[tuple[str, str]] = set()
+_DENIED_DELIVERY_AUTHORITIES_LOCK = threading.RLock()
 _ALLOWED_STATUSES = {"triage", "blocked"}
 _RAW_TRANSCRIPT_KEYS = {
     "raw_transcript",
@@ -143,8 +147,6 @@ class KanbanIntakeConfig:
     default_status: str = "blocked"
     proposal_ttl_seconds: int = 1800
     max_pending_per_session: int = 1
-    short_approval_phrases: tuple[str, ...] = ("승인", "ㅇㅇ", "고고", "그렇게 해", "좋아", "진행")
-    deny_phrases: tuple[str, ...] = ("취소", "ㄴㄴ", "하지마", "보류")
     detector: str = "heuristic"
     auxiliary_detector_enabled: bool = False
     redact_before_auxiliary: bool = True
@@ -200,17 +202,6 @@ def parse_config(config: Optional[dict[str, Any]]) -> KanbanIntakeConfig:
     else:
         platforms = ("discord",)
 
-    def phrases(key: str, default: tuple[str, ...]) -> tuple[str, ...]:
-        raw = block.get(key, default)
-        if isinstance(raw, str):
-            items = [raw]
-        elif isinstance(raw, Iterable):
-            items = list(raw)
-        else:
-            items = list(default)
-        cleaned = tuple(str(item).strip() for item in items if str(item).strip())
-        return cleaned or default
-
     store_path = block.get("store_path")
     path_obj = Path(store_path).expanduser() if store_path else None
     title_generator_mode = str(block.get("title_generator_mode") or "fallback_only").strip().lower() or "fallback_only"
@@ -229,8 +220,6 @@ def parse_config(config: Optional[dict[str, Any]]) -> KanbanIntakeConfig:
         default_status=status,
         proposal_ttl_seconds=_bounded_int(block.get("proposal_ttl_seconds"), 1800, minimum=60, maximum=86400),
         max_pending_per_session=_bounded_int(block.get("max_pending_per_session"), 1, minimum=1, maximum=10),
-        short_approval_phrases=phrases("short_approval_phrases", KanbanIntakeConfig.short_approval_phrases),
-        deny_phrases=phrases("deny_phrases", KanbanIntakeConfig.deny_phrases),
         detector=str(block.get("detector") or "heuristic").strip().lower() or "heuristic",
         auxiliary_detector_enabled=_as_bool(block.get("auxiliary_detector_enabled"), False),
         redact_before_auxiliary=_as_bool(block.get("redact_before_auxiliary"), True),
@@ -309,13 +298,15 @@ class PendingKanbanApproval:
     purge_after: float = 0.0
     policy_version: str = CURRENT_POLICY_VERSION
     updated_at: float = 0.0
+    proposal_digest: str = ""
 
 
 @dataclass(frozen=True)
 class ActiveLookup:
-    state: Literal["none", "one", "ambiguous"]
+    state: Literal["none", "one", "ambiguous", "invalid"]
     pending: Optional[PendingKanbanApproval] = None
     count: int = 0
+    reason_code: str = ""
 
 
 @dataclass(frozen=True)
@@ -442,19 +433,6 @@ class KanbanIntakeDetector(Protocol):
     def detect(self, request: IntakeDetectionRequest) -> DetectorDecision: ...
 
 
-def classify_reply(text: str, cfg: KanbanIntakeConfig) -> str:
-    normalized = " ".join((text or "").strip().lower().split())
-    if not normalized or normalized.startswith("/"):
-        return NONE
-    approvals = {" ".join(p.lower().split()) for p in cfg.short_approval_phrases}
-    denies = {" ".join(p.lower().split()) for p in cfg.deny_phrases}
-    if normalized in approvals:
-        return APPROVAL
-    if normalized in denies:
-        return DENY
-    return NONE
-
-
 def _contains_sensitive_payload(text: str) -> bool:
     value = str(text or "")
     if not value:
@@ -549,10 +527,15 @@ def _task_matches_execution_contract(
     return all(getattr(task, key, None) == value for key, value in expected.items())
 
 
-def render_proposal_message(proposal: KanbanCardProposal) -> str:
+def render_proposal_message(
+    proposal: KanbanCardProposal, *, proposal_ref: str
+) -> str:
+    if re.fullmatch(r"kp_[a-f0-9]{16}", proposal_ref) is None:
+        raise ValueError("invalid proposal_ref")
     status_label = "blocked review" if proposal.proposed_status == "blocked" else proposal.proposed_status
     return (
         f"카드 후보 감지: 이건 Kanban에 {status_label} 카드로 남기는 게 좋다.\n"
+        f"- proposal_ref: {proposal_ref}\n"
         f"- board: {proposal.board}\n"
         f"- title: {proposal.title}\n"
         f"- domain: {proposal.domain}\n"
@@ -560,7 +543,7 @@ def render_proposal_message(proposal: KanbanCardProposal) -> str:
         f"- status: {proposal.proposed_status}\n"
         f"- why: {proposal.why}\n"
         "- safety: dispatch 없음, ready/running 아님, live DB/cron/Graphify/JÖKL public mutation 없음\n\n"
-        "승인하려면 “승인/ㅇㅇ/고고”, 취소하려면 “취소”."
+        "이 후보에 대한 다음 답변은 main LLM이 closed typed action으로 해석한다."
     )
 
 
@@ -587,6 +570,7 @@ _TRANSITION_REASONS = frozenset(
         "approval_execution_claimed",
         "approval_execution_succeeded",
         "approval_execution_invalid",
+        "proposal_run_invalidated",
         "bulk_invalidated",
     }
 )
@@ -821,6 +805,54 @@ class PendingKanbanStore:
     def __init__(self, path: Optional[Path] = None):
         self.path = path or (get_hermes_home() / "kanban" / "intake_pending.db")
 
+    def _delivery_authority_key(self, pending_id: str) -> tuple[str, str]:
+        return (str(self.path.expanduser().resolve()), str(pending_id))
+
+    def deny_delivery_authority(self, pending_id: str) -> None:
+        with _DENIED_DELIVERY_AUTHORITIES_LOCK:
+            _DENIED_DELIVERY_AUTHORITIES.add(
+                self._delivery_authority_key(pending_id)
+            )
+
+    def _clear_delivery_authority_denial(self, pending_id: str) -> None:
+        with _DENIED_DELIVERY_AUTHORITIES_LOCK:
+            _DENIED_DELIVERY_AUTHORITIES.discard(
+                self._delivery_authority_key(pending_id)
+            )
+
+    def _delivery_authority_denied(self, pending_id: str) -> bool:
+        with _DENIED_DELIVERY_AUTHORITIES_LOCK:
+            return self._delivery_authority_key(pending_id) in _DENIED_DELIVERY_AUTHORITIES
+
+    def _delivery_authority_is_current(self, pending: PendingKanbanApproval) -> bool:
+        message_ids = pending.source_ids.get("proposal_message_ids", [])
+        return bool(
+            isinstance(message_ids, list)
+            and message_ids
+            and not self._delivery_authority_denied(pending.pending_id)
+            and hmac.compare_digest(
+                str(pending.source_ids.get("proposal_delivery_epoch", "")),
+                _DELIVERY_AUTHORITY_EPOCH,
+            )
+        )
+
+    @staticmethod
+    def _proposal_origin_is_current(pending: PendingKanbanApproval) -> bool:
+        return hmac.compare_digest(
+            str(pending.source_ids.get("proposal_origin_epoch", "")),
+            _DELIVERY_AUTHORITY_EPOCH,
+        )
+
+    def _pending_runtime_authority_is_current(
+        self, pending: PendingKanbanApproval
+    ) -> bool:
+        if self._delivery_authority_denied(pending.pending_id):
+            return False
+        message_ids = pending.source_ids.get("proposal_message_ids", [])
+        if isinstance(message_ids, list) and message_ids:
+            return self._delivery_authority_is_current(pending)
+        return self._proposal_origin_is_current(pending)
+
     def connect(self) -> sqlite3.Connection:
         with _PENDING_DB_INIT_LOCK:
             self.path.parent.mkdir(parents=True, exist_ok=True)
@@ -854,7 +886,107 @@ class PendingKanbanStore:
             conn.execute(
                 "UPDATE kanban_intake_pending SET policy_version = '' WHERE policy_version IS NULL"
             )
+        if "proposal_digest" not in columns:
+            conn.execute(
+                "ALTER TABLE kanban_intake_pending ADD COLUMN proposal_digest TEXT NOT NULL DEFAULT ''"
+            )
         conn.commit()
+
+    @staticmethod
+    def _idempotency_key(
+        proposal: KanbanCardProposal, binding: SourceBinding
+    ) -> str:
+        effect_body = dict(proposal.body or {})
+        effect_body.pop("source_ref", None)
+        payload = {
+            "schema": "kanban-intake-effect/v1",
+            "platform": binding.platform,
+            "chat_id": binding.chat_id,
+            "thread_id": binding.thread_id or "",
+            "user_id": binding.user_id,
+            "board": proposal.board,
+            "title": proposal.title.strip(),
+            "body": effect_body,
+            "domain": proposal.domain,
+            "tenant": proposal.tenant,
+            "assignee": proposal.assignee,
+            "priority": int(proposal.priority),
+            "why": proposal.why,
+            "proposed_status": "blocked",
+        }
+        canonical = json.dumps(
+            payload,
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode("utf-8")
+        return "kanban-intake:v1:" + hashlib.sha256(canonical).hexdigest()
+
+    @staticmethod
+    def _proposal_digest(pending: PendingKanbanApproval) -> str:
+        proposal = pending.proposal
+        payload = {
+            "schema": "kanban-intake-proposal-seal/v1",
+            "pending_id": pending.pending_id,
+            "created_at": pending.created_at,
+            "expires_at": pending.expires_at,
+            "platform": pending.binding.platform,
+            "chat_id": pending.binding.chat_id,
+            "thread_id": pending.binding.thread_id or "",
+            "user_id": pending.binding.user_id,
+            "source_ids": pending.source_ids,
+            "source_ref": proposal.source_ref,
+            "board": proposal.board,
+            "title": proposal.title,
+            "body": proposal.body,
+            "domain": proposal.domain,
+            "tenant": proposal.tenant,
+            "assignee": proposal.assignee,
+            "priority": int(proposal.priority),
+            "proposed_status": proposal.proposed_status,
+            "why": proposal.why,
+            "idempotency_key": proposal.idempotency_key or "",
+        }
+        canonical = json.dumps(
+            payload,
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode("utf-8")
+        return hashlib.sha256(canonical).hexdigest()
+
+    def _same_effect_contract(
+        self,
+        existing: PendingKanbanApproval,
+        proposal: KanbanCardProposal,
+        binding: SourceBinding,
+    ) -> bool:
+        existing_body = dict(existing.proposal.body or {})
+        proposed_body = dict(proposal.body or {})
+        existing_body.pop("source_ref", None)
+        proposed_body.pop("source_ref", None)
+        return bool(
+            existing.policy_version == CURRENT_POLICY_VERSION
+            and bool(existing.proposal_digest)
+            and hmac.compare_digest(
+                existing.proposal_digest,
+                PendingKanbanStore._proposal_digest(existing),
+            )
+            and existing.binding.platform == binding.platform
+            and existing.binding.chat_id == binding.chat_id
+            and (existing.binding.thread_id or "") == (binding.thread_id or "")
+            and existing.binding.user_id == binding.user_id
+            and existing.proposal.board == proposal.board
+            and existing.proposal.title == proposal.title
+            and existing_body == proposed_body
+            and existing.proposal.domain == proposal.domain
+            and existing.proposal.tenant == proposal.tenant
+            and existing.proposal.assignee == proposal.assignee
+            and int(existing.proposal.priority) == int(proposal.priority)
+            and existing.proposal.why == proposal.why
+            and existing.proposal.proposed_status == "blocked"
+            and existing.proposal.idempotency_key == proposal.idempotency_key
+        )
 
     def put_pending(
         self,
@@ -870,9 +1002,14 @@ class PendingKanbanStore:
         now = time.time() if now is None else float(now)
         proposal.user_id = binding.user_id
         proposal.normalized(cfg)
+        proposal.idempotency_key = self._idempotency_key(proposal, binding)
         ok, reason = validate_proposal(proposal, cfg)
         if not ok:
             raise ValueError(reason)
+        if proposal.proposed_status != "blocked":
+            raise ValueError(f"unsupported status {proposal.proposed_status!r}")
+        trusted_source_ids = dict(source_ids or {})
+        trusted_source_ids["proposal_origin_epoch"] = _DELIVERY_AUTHORITY_EPOCH
         pending = PendingKanbanApproval(
             pending_id="kp_" + uuid.uuid4().hex[:16],
             binding=binding,
@@ -880,45 +1017,189 @@ class PendingKanbanStore:
             created_at=now,
             expires_at=now + cfg.proposal_ttl_seconds,
             status="pending",
-            source_ids=dict(source_ids or {}),
+            source_ids=trusted_source_ids,
             purge_after=now + cfg.pending_retention_seconds,
         )
+        pending.proposal_digest = self._proposal_digest(pending)
         with self.connect() as conn:
             conn.execute("BEGIN IMMEDIATE")
+            prior_rows = conn.execute(
+                """SELECT * FROM kanban_intake_pending
+                   WHERE platform=? AND chat_id=? AND COALESCE(thread_id,'')=?
+                     AND user_id=? AND idempotency_key=?
+                     AND ((status='pending' AND expires_at>?)
+                          OR status IN ('executing','executed'))
+                     AND purge_after>?
+                   ORDER BY created_at DESC LIMIT 2""",
+                (
+                    binding.platform,
+                    binding.chat_id,
+                    binding.thread_id or "",
+                    binding.user_id,
+                    proposal.idempotency_key,
+                    now,
+                    now,
+                ),
+            ).fetchall()
+            if prior_rows:
+                existing = self._from_row(prior_rows[0])
+                if self._same_effect_contract(existing, proposal, binding):
+                    conn.commit()
+                    return existing
             active_count = conn.execute(
-                """
-                SELECT COUNT(*) AS n FROM kanban_intake_pending
-                WHERE status IN ('pending', 'executing')
-                  AND platform = ? AND chat_id = ? AND COALESCE(thread_id, '') = COALESCE(?, '')
-                  AND user_id = ? AND session_key = ? AND expires_at > ?
-                """,
-                (binding.platform, binding.chat_id, binding.thread_id, binding.user_id, binding.session_key, now),
+                """SELECT COUNT(*) AS n FROM kanban_intake_pending
+                   WHERE status IN ('pending', 'executing')
+                     AND platform = ? AND chat_id = ?
+                     AND COALESCE(thread_id, '') = COALESCE(?, '')
+                     AND user_id = ? AND session_key = ? AND expires_at > ?
+                     AND policy_version = ? AND proposal_digest <> ?""",
+                (
+                    binding.platform,
+                    binding.chat_id,
+                    binding.thread_id,
+                    binding.user_id,
+                    binding.session_key,
+                    now,
+                    CURRENT_POLICY_VERSION,
+                    "",
+                ),
             ).fetchone()["n"]
             if int(active_count or 0) >= cfg.max_pending_per_session:
                 raise ValueError("active pending proposal limit exceeded")
             conn.execute(
-                """
-                INSERT INTO kanban_intake_pending (
+                """INSERT INTO kanban_intake_pending (
                   pending_id, created_at, expires_at, status,
                   platform, chat_id, thread_id, user_id, session_key,
                   source_ref, source_ids_json, board, title, body_json,
                   domain, tenant, assignee, priority, proposed_status,
-                  why, idempotency_key, redaction_version, policy_version, purge_after, updated_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                """,
+                  why, idempotency_key, redaction_version, policy_version,
+                  proposal_digest, purge_after, updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
                 (
-                    pending.pending_id, pending.created_at, pending.expires_at, pending.status,
-                    binding.platform, binding.chat_id, binding.thread_id, binding.user_id, binding.session_key,
-                    proposal.source_ref, json.dumps(pending.source_ids, ensure_ascii=False, sort_keys=True),
-                    proposal.board, proposal.title, json.dumps(proposal.body, ensure_ascii=False, sort_keys=True),
-                    proposal.domain, proposal.tenant, proposal.assignee, int(proposal.priority), proposal.proposed_status,
-                    proposal.why, proposal.idempotency_key, "kanban-intake-redaction/v1", CURRENT_POLICY_VERSION, pending.purge_after, now,
+                    pending.pending_id,
+                    pending.created_at,
+                    pending.expires_at,
+                    pending.status,
+                    binding.platform,
+                    binding.chat_id,
+                    binding.thread_id,
+                    binding.user_id,
+                    binding.session_key,
+                    proposal.source_ref,
+                    json.dumps(pending.source_ids, ensure_ascii=False, sort_keys=True),
+                    proposal.board,
+                    proposal.title,
+                    json.dumps(proposal.body, ensure_ascii=False, sort_keys=True),
+                    proposal.domain,
+                    proposal.tenant,
+                    proposal.assignee,
+                    int(proposal.priority),
+                    proposal.proposed_status,
+                    proposal.why,
+                    proposal.idempotency_key,
+                    "kanban-intake-redaction/v1",
+                    CURRENT_POLICY_VERSION,
+                    pending.proposal_digest,
+                    pending.purge_after,
+                    now,
                 ),
             )
             conn.commit()
         return pending
 
-    def get_active_for_source(self, binding: SourceBinding, *, now: Optional[float] = None) -> ActiveLookup:
+    def bind_outbound_proposal_messages(
+        self,
+        pending_id: str,
+        binding: SourceBinding,
+        message_ids: list[str],
+        *,
+        now: Optional[float] = None,
+    ) -> bool:
+        with _DENIED_DELIVERY_AUTHORITIES_LOCK:
+            return self._bind_outbound_proposal_messages_locked(
+                pending_id, binding, message_ids, now=now
+            )
+
+    def _bind_outbound_proposal_messages_locked(
+        self,
+        pending_id: str,
+        binding: SourceBinding,
+        message_ids: list[str],
+        *,
+        now: Optional[float] = None,
+    ) -> bool:
+        normalized_ids = []
+        for value in message_ids:
+            candidate = str(value or "").strip()
+            if re.fullmatch(r"[0-9]{17,20}", candidate) and candidate not in normalized_ids:
+                normalized_ids.append(candidate)
+        if not normalized_ids or len(normalized_ids) > 16:
+            return False
+        timestamp = time.time() if now is None else float(now)
+        with self.connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            row = conn.execute(
+                "SELECT * FROM kanban_intake_pending WHERE pending_id=?",
+                (pending_id,),
+            ).fetchone()
+            if row is None:
+                conn.rollback()
+                return False
+            pending = self._from_row(row)
+            if (
+                pending.status not in {"pending", "executing", "executed"}
+                or pending.binding.platform != binding.platform
+                or pending.binding.chat_id != binding.chat_id
+                or (pending.binding.thread_id or "") != (binding.thread_id or "")
+                or pending.binding.user_id != binding.user_id
+                or pending.policy_version != CURRENT_POLICY_VERSION
+                or not pending.proposal_digest
+                or not hmac.compare_digest(
+                    pending.proposal_digest, self._proposal_digest(pending)
+                )
+            ):
+                conn.rollback()
+                return False
+            existing_ids = pending.source_ids.get("proposal_message_ids", [])
+            if not isinstance(existing_ids, list):
+                existing_ids = []
+            existing_epoch_is_current = hmac.compare_digest(
+                str(pending.source_ids.get("proposal_delivery_epoch", "")),
+                _DELIVERY_AUTHORITY_EPOCH,
+            )
+            candidates = (
+                [*existing_ids, *normalized_ids]
+                if existing_epoch_is_current and not self._delivery_authority_denied(pending.pending_id)
+                else list(normalized_ids)
+            )
+            merged = []
+            for value in candidates:
+                candidate = str(value or "").strip()
+                if re.fullmatch(r"[0-9]{17,20}", candidate) and candidate not in merged:
+                    merged.append(candidate)
+            pending.source_ids["proposal_message_ids"] = merged[-32:]
+            pending.source_ids["proposal_delivery_epoch"] = _DELIVERY_AUTHORITY_EPOCH
+            new_digest = self._proposal_digest(pending)
+            changed = conn.execute(
+                "UPDATE kanban_intake_pending SET source_ids_json=?, proposal_digest=?, updated_at=? WHERE pending_id=? AND proposal_digest=?",
+                (
+                    json.dumps(pending.source_ids, ensure_ascii=False, sort_keys=True),
+                    new_digest,
+                    timestamp,
+                    pending.pending_id,
+                    pending.proposal_digest,
+                ),
+            ).rowcount
+            if changed != 1:
+                conn.rollback()
+                return False
+            conn.commit()
+            self._clear_delivery_authority_denial(pending.pending_id)
+            return True
+
+    def get_active_for_source(
+        self, binding: SourceBinding, *, now: Optional[float] = None
+    ) -> ActiveLookup:
         now = time.time() if now is None else float(now)
         with self.connect() as conn:
             rows = conn.execute(
@@ -931,11 +1212,170 @@ class PendingKanbanStore:
                 """,
                 (binding.platform, binding.chat_id, binding.thread_id, binding.user_id, binding.session_key, now),
             ).fetchall()
-        if not rows:
+        pending_rows = []
+        for row in rows:
+            candidate = self._from_row(row)
+            if not self._pending_runtime_authority_is_current(candidate):
+                continue
+            pending_rows.append(candidate)
+        if not pending_rows:
             return ActiveLookup("none", None, 0)
-        if len(rows) > 1:
-            return ActiveLookup("ambiguous", None, len(rows))
-        return ActiveLookup("one", self._from_row(rows[0]), 1)
+        if len(pending_rows) > 1:
+            return ActiveLookup("ambiguous", None, len(pending_rows))
+        return ActiveLookup("one", pending_rows[0], 1)
+
+    def get_pending_capability_for_reply(
+        self,
+        binding: SourceBinding,
+        reply_to_message_id: str,
+        *,
+        now: Optional[float] = None,
+    ) -> ActiveLookup:
+        target_id = str(reply_to_message_id or "").strip()
+        if re.fullmatch(r"[0-9]{17,20}", target_id) is None:
+            return ActiveLookup("none", None, 0)
+        timestamp = time.time() if now is None else float(now)
+        with self.connect() as conn:
+            rows = conn.execute(
+                """SELECT * FROM kanban_intake_pending
+                   WHERE platform=? AND chat_id=? AND COALESCE(thread_id,'')=?
+                     AND user_id=? AND status IN ('pending','executing','executed')
+                     AND (status!='pending' OR expires_at>?) AND purge_after>?
+                   ORDER BY created_at DESC LIMIT 100""",
+                (
+                    binding.platform,
+                    binding.chat_id,
+                    binding.thread_id or "",
+                    binding.user_id,
+                    timestamp,
+                    timestamp,
+                ),
+            ).fetchall()
+        matches = []
+        for row in rows:
+            candidate = self._from_row(row)
+            if not self._delivery_authority_is_current(candidate):
+                continue
+            message_ids = candidate.source_ids.get("proposal_message_ids", [])
+            if isinstance(message_ids, list) and any(
+                hmac.compare_digest(str(value), target_id) for value in message_ids
+            ):
+                matches.append(candidate)
+        if len(matches) != 1:
+            return ActiveLookup("ambiguous" if len(matches) > 1 else "none", None, len(matches))
+        pending = matches[0]
+        if pending.policy_version != CURRENT_POLICY_VERSION:
+            if pending.status == "pending":
+                self.transition_status(
+                    pending.pending_id,
+                    expected_status="pending",
+                    status="needs_revalidation",
+                    reason_code="policy_version_mismatch",
+                    invocation_key=f"capability:v1:{pending.pending_id}:policy",
+                    now=timestamp,
+                )
+            return ActiveLookup("invalid", pending, 1, "policy_version_mismatch")
+        if not pending.proposal_digest or not hmac.compare_digest(
+            pending.proposal_digest, self._proposal_digest(pending)
+        ):
+            return ActiveLookup("invalid", pending, 1, "proposal_digest_mismatch")
+        return ActiveLookup("one", pending, 1)
+
+    def get_active_by_proposal_ref(
+        self,
+        proposal_ref: str,
+        binding: SourceBinding,
+        *,
+        now: Optional[float] = None,
+    ) -> ActiveLookup:
+        if re.fullmatch(r"kp_[a-f0-9]{16}", proposal_ref or "") is None:
+            return ActiveLookup("none", None, 0)
+        timestamp = time.time() if now is None else float(now)
+        with self.connect() as conn:
+            row = conn.execute(
+                "SELECT * FROM kanban_intake_pending WHERE pending_id=?",
+                (proposal_ref,),
+            ).fetchone()
+        if row is None:
+            return ActiveLookup("none", None, 0)
+        route_pairs = (
+            (row["platform"] or "", binding.platform or ""),
+            (row["chat_id"] or "", binding.chat_id or ""),
+            (row["thread_id"] or "", binding.thread_id or ""),
+            (row["user_id"] or "", binding.user_id or ""),
+        )
+        if not all(hmac.compare_digest(str(left), str(right)) for left, right in route_pairs):
+            return ActiveLookup("none", None, 0)
+        pending = self._from_row(row)
+        if pending.purge_after <= timestamp:
+            return ActiveLookup("none", None, 0)
+        if pending.expires_at <= timestamp and pending.status == "pending":
+            return ActiveLookup("none", None, 0)
+        if pending.policy_version != CURRENT_POLICY_VERSION:
+            if pending.status == "pending":
+                self.transition_status(
+                    pending.pending_id,
+                    expected_status="pending",
+                    status="needs_revalidation",
+                    reason_code="policy_version_mismatch",
+                    invocation_key=f"capability:v1:{pending.pending_id}:policy",
+                    now=timestamp,
+                )
+            return ActiveLookup("invalid", pending, 1, "policy_version_mismatch")
+        expected = self._proposal_digest(pending)
+        if not pending.proposal_digest:
+            if pending.status == "pending":
+                self.transition_status(
+                    pending.pending_id,
+                    expected_status="pending",
+                    status="needs_revalidation",
+                    reason_code="policy_version_mismatch",
+                    invocation_key=f"capability:v1:{pending.pending_id}:digest",
+                    now=timestamp,
+                )
+            return ActiveLookup("invalid", pending, 1, "proposal_digest_missing")
+        if not hmac.compare_digest(pending.proposal_digest, expected):
+            return ActiveLookup("invalid", pending, 1, "proposal_digest_mismatch")
+        if pending.status not in {"pending", "executing", "executed"}:
+            return ActiveLookup("none", None, 0)
+        return ActiveLookup("one", pending, 1)
+
+    def claim_delivery_authorized_execution(
+        self,
+        pending_id: str,
+        binding: SourceBinding,
+        *,
+        expected_proposal_digest: str,
+        expected_reply_message_id: str,
+        now: Optional[float] = None,
+    ) -> dict[str, Any]:
+        with _DENIED_DELIVERY_AUTHORITIES_LOCK:
+            lookup = self.get_active_by_proposal_ref(pending_id, binding, now=now)
+            if (
+                lookup.state != "one"
+                or lookup.pending is None
+                or lookup.pending.status != "pending"
+                or not self._delivery_authority_is_current(lookup.pending)
+            ):
+                raise ValueError("delivery authority is not current")
+            if not hmac.compare_digest(
+                lookup.pending.proposal_digest, str(expected_proposal_digest or "")
+            ):
+                raise ValueError("delivery authority digest mismatch")
+            message_ids = lookup.pending.source_ids.get("proposal_message_ids", [])
+            if not isinstance(message_ids, list) or not any(
+                hmac.compare_digest(str(value), str(expected_reply_message_id or ""))
+                for value in message_ids
+            ):
+                raise ValueError("delivery authority reply target mismatch")
+            return self.transition_status(
+                lookup.pending.pending_id,
+                expected_status="pending",
+                status="executing",
+                reason_code="approval_execution_claimed",
+                invocation_key=f"typed:v1:{lookup.pending.pending_id}:claim",
+                now=now,
+            )
 
     def get_executing_for_source(self, binding: SourceBinding) -> ActiveLookup:
         conn = self.connect_readonly()
@@ -1029,6 +1469,7 @@ class PendingKanbanStore:
         reason_code: str,
         invocation_key: str,
         now: Optional[float] = None,
+        require_undelivered: bool = False,
     ) -> dict[str, Any]:
         if reason_code not in _TRANSITION_REASONS:
             raise ValueError("invalid transition reason")
@@ -1037,6 +1478,17 @@ class PendingKanbanStore:
         timestamp = time.time() if now is None else float(now)
         with self.connect() as conn:
             conn.execute("BEGIN IMMEDIATE")
+            if require_undelivered:
+                delivery_row = conn.execute(
+                    "SELECT * FROM kanban_intake_pending WHERE pending_id=?",
+                    (pending_id,),
+                ).fetchone()
+                if delivery_row is None or delivery_row["status"] != expected_status:
+                    conn.rollback()
+                    raise ValueError("pending transition state mismatch")
+                if self._delivery_authority_is_current(self._from_row(delivery_row)):
+                    conn.rollback()
+                    raise ValueError("already delivered")
             ready = transition_audit_ready(conn)
             if not ready:
                 cur = conn.execute(
@@ -1424,6 +1876,7 @@ class PendingKanbanStore:
             status=row["status"], source_ids=source_ids, purge_after=float(row["purge_after"]),
             policy_version=(row["policy_version"] or ""),
             updated_at=float(row["updated_at"] or 0.0),
+            proposal_digest=(row["proposal_digest"] or ""),
         )
 
 
@@ -1452,6 +1905,7 @@ CREATE TABLE IF NOT EXISTS kanban_intake_pending (
   idempotency_key TEXT,
   redaction_version TEXT NOT NULL,
   policy_version TEXT NOT NULL DEFAULT '',
+  proposal_digest TEXT NOT NULL DEFAULT '',
   purge_after REAL NOT NULL,
   updated_at REAL NOT NULL
 );
@@ -1465,6 +1919,12 @@ def execute_pending_approval(pending: PendingKanbanApproval, cfg: KanbanIntakeCo
     ok, reason = validate_proposal(proposal, cfg)
     if not ok:
         return ApprovalResult(True, f"Kanban 카드 생성 차단: {reason}", action=APPROVAL)
+    if proposal.proposed_status != "blocked" or not proposal.idempotency_key:
+        return ApprovalResult(
+            True,
+            f"Kanban 카드 생성 차단: unsupported status {proposal.proposed_status!r}",
+            action=APPROVAL,
+        )
     from hermes_cli import kanban_db as kb
 
     conn = kb.connect(board=proposal.board)
@@ -1572,44 +2032,112 @@ def reconcile_or_resume_pending_execution(
     return result
 
 
-def handle_reply(
-    text: str,
+def readback_executed_pending(
+    pending: PendingKanbanApproval,
+    cfg: KanbanIntakeConfig,
+) -> ApprovalResult:
+    proposal = pending.proposal.normalized(cfg)
+    if not proposal.idempotency_key:
+        return ApprovalResult(
+            True,
+            "Kanban executed replay에 canonical idempotency key가 없다.",
+            action=APPROVAL,
+        )
+    from hermes_cli import kanban_db as kb
+
+    conn = kb.connect(board=proposal.board)
+    try:
+        rows = conn.execute(
+            "SELECT id FROM tasks WHERE idempotency_key=? AND status != 'archived' ORDER BY created_at DESC LIMIT 2",
+            (proposal.idempotency_key,),
+        ).fetchall()
+        task = kb.get_task(conn, rows[0]["id"]) if len(rows) == 1 else None
+    finally:
+        conn.close()
+    if len(rows) != 1 or task is None:
+        return ApprovalResult(
+            True,
+            "Kanban executed replay의 canonical readback이 없거나 모호하다.",
+            action=APPROVAL,
+        )
+    if not _task_matches_execution_contract(task, pending):
+        return ApprovalResult(
+            True,
+            "Kanban executed replay readback이 예상 계약과 다르다.",
+            task_id=task.id,
+            action=APPROVAL,
+        )
+    return ApprovalResult(
+        True,
+        f"Kanban executed replay readback 완료: {task.id}",
+        task_id=task.id,
+        verified=True,
+        action=APPROVAL,
+    )
+
+
+def apply_typed_proposal_decision(
+    *,
+    action: str,
+    proposal_ref: str,
     binding: SourceBinding,
     cfg: KanbanIntakeConfig,
     store: PendingKanbanStore,
+    now: Optional[float] = None,
+    expected_proposal_digest: Optional[str] = None,
+    expected_reply_message_id: Optional[str] = None,
 ) -> ApprovalResult:
-    action = classify_reply(text, cfg)
-    if action == NONE:
-        return ApprovalResult(False)
-    executing = store.get_executing_for_source(binding)
-    if executing.state != "none":
-        if executing.state == "ambiguous" or executing.pending is None:
-            return ApprovalResult(
-                True,
-                "Kanban executing 후보가 모호해 자동 재실행하지 않았다.",
-                action=action,
-            )
-        if action != APPROVAL:
-            return ApprovalResult(
-                True,
-                "이미 executing 상태라 취소/변경하지 않았다. 승인 재시도로 reconciliation만 가능하다.",
-                action=action,
-            )
-        return reconcile_or_resume_pending_execution(executing.pending, cfg, store)
-    lookup = store.get_active_for_source(binding)
+    """Apply one model-selected closed action to one host-stored proposal."""
+    if action not in {APPROVAL, DENY}:
+        return ApprovalResult(True, "Kanban typed action이 닫힌 스키마와 다르다.")
+    lookup = store.get_active_by_proposal_ref(proposal_ref, binding, now=now)
     if lookup.state == "none":
-        return ApprovalResult(False)
-    if lookup.state == "ambiguous":
-        return ApprovalResult(True, "Kanban 카드 후보가 여러 개라서 실행하지 않았다. 하나만 남기고 다시 승인해줘.", action=action)
+        return ApprovalResult(True, "Kanban proposal_ref가 현재 route/user/TTL과 일치하지 않는다.", action=action)
+    if lookup.state == "invalid":
+        if lookup.reason_code == "policy_version_mismatch":
+            return ApprovalResult(
+                True,
+                "Kanban 카드 후보 정책 버전이 오래되어 실행하지 않았다. revalidate 또는 새 후보 생성이 필요하다.",
+                action=action,
+            )
+        return ApprovalResult(True, "Kanban proposal digest 검증 실패로 실행하지 않았다.", action=action)
     assert lookup.pending is not None
+    if expected_reply_message_id is not None:
+        message_ids = lookup.pending.source_ids.get("proposal_message_ids", [])
+        if not isinstance(message_ids, list) or not any(
+            hmac.compare_digest(str(candidate), str(expected_reply_message_id))
+            for candidate in message_ids
+        ):
+            return ApprovalResult(True, "Kanban proposal reply target mismatch; no card was changed.", verified=False, action=action)
+    if expected_proposal_digest is not None and not hmac.compare_digest(
+        lookup.pending.proposal_digest, expected_proposal_digest
+    ):
+        return ApprovalResult(True, "Kanban current-event proposal capability가 canonical digest와 다르다.", action=action)
+    if lookup.pending.status == "executed":
+        if action != APPROVAL:
+            return ApprovalResult(True, "이미 executed 상태라 취소하지 않았다.", action=action)
+        return readback_executed_pending(lookup.pending, cfg)
+    if lookup.pending.status == "executing":
+        if action != APPROVAL:
+            return ApprovalResult(True, "이미 executing 상태라 취소하지 않았다.", action=action)
+        return reconcile_or_resume_pending_execution(lookup.pending, cfg, store)
+    if lookup.pending.status != "pending":
+        return ApprovalResult(True, "Kanban proposal은 더 이상 실행 가능한 상태가 아니다.", action=action)
     if action == DENY:
-        store.transition_status(
-            lookup.pending.pending_id,
-            expected_status="pending",
-            status="denied",
-            reason_code="user_denied",
-            invocation_key=f"reply:v1:{lookup.pending.pending_id}:deny",
-        )
+        try:
+            store.transition_status(
+                lookup.pending.pending_id,
+                expected_status="pending",
+                status="denied",
+                reason_code="user_denied",
+                invocation_key=f"typed:v1:{lookup.pending.pending_id}:deny",
+                now=now,
+            )
+        except ValueError:
+            latest = store.get_active_by_proposal_ref(lookup.pending.pending_id, binding, now=now)
+            if latest.pending is not None and latest.pending.status in {"executing", "executed"}:
+                return ApprovalResult(True, "승인 실행이 이미 시작되어 취소하지 않았다.", action=DENY)
+            return ApprovalResult(True, "Kanban 카드 후보는 이미 다른 결정으로 닫혔다.", action=action)
         return ApprovalResult(True, "Kanban 카드 후보 취소 완료.", action=DENY)
     if lookup.pending.policy_version != CURRENT_POLICY_VERSION:
         store.transition_status(
@@ -1617,40 +2145,38 @@ def handle_reply(
             expected_status="pending",
             status="needs_revalidation",
             reason_code="policy_version_mismatch",
-            invocation_key=f"reply:v1:{lookup.pending.pending_id}:policy",
+            invocation_key=f"typed:v1:{lookup.pending.pending_id}:policy",
+            now=now,
         )
-        return ApprovalResult(
-            True,
-            "Kanban 카드 후보 정책 버전이 오래되어 실행하지 않았다. revalidate 또는 새 후보 생성이 필요하다.",
-            action=APPROVAL,
+        return ApprovalResult(True, "Kanban 카드 후보 정책 버전이 오래되어 실행하지 않았다. revalidate 또는 새 후보 생성이 필요하다.", action=APPROVAL)
+    if expected_proposal_digest is None or expected_reply_message_id is None:
+        return ApprovalResult(True, "Kanban final delivery authority가 없어 실행하지 않았다.", verified=False, action=APPROVAL)
+    try:
+        claim = store.claim_delivery_authorized_execution(
+            lookup.pending.pending_id,
+            binding,
+            expected_proposal_digest=expected_proposal_digest,
+            expected_reply_message_id=expected_reply_message_id,
+            now=now,
         )
-    claim = store.transition_status(
-        lookup.pending.pending_id,
-        expected_status="pending",
-        status="executing",
-        reason_code="approval_execution_claimed",
-        invocation_key=f"reply:v1:{lookup.pending.pending_id}:claim",
-    )
+    except ValueError:
+        latest = store.get_active_by_proposal_ref(lookup.pending.pending_id, binding, now=now)
+        if latest.pending is not None and latest.pending.status == "executing":
+            return reconcile_or_resume_pending_execution(latest.pending, cfg, store)
+        if latest.pending is not None and latest.pending.status == "executed":
+            return readback_executed_pending(latest.pending, cfg)
+        return ApprovalResult(True, "Kanban proposal은 이미 다른 결정으로 닫혔다.", verified=False, action=APPROVAL)
     if claim["replayed"]:
-        return ApprovalResult(
-            True,
-            "Kanban 실행이 이미 다른 승인 호출에서 진행 중이다.",
-            verified=False,
-            action=APPROVAL,
-        )
+        return ApprovalResult(True, "Kanban 실행이 이미 다른 승인 호출에서 진행 중이다.", verified=False, action=APPROVAL)
     result = execute_pending_approval(lookup.pending, cfg)
     final_status = "executed" if result.verified else "invalid"
-    final_reason = (
-        "approval_execution_succeeded"
-        if result.verified
-        else "approval_execution_invalid"
-    )
     store.transition_status(
         lookup.pending.pending_id,
         expected_status="executing",
         status=final_status,
-        reason_code=final_reason,
-        invocation_key=f"reply:v1:{lookup.pending.pending_id}:final:{final_status}",
+        reason_code="approval_execution_succeeded" if result.verified else "approval_execution_invalid",
+        invocation_key=f"typed:v1:{lookup.pending.pending_id}:final:{final_status}",
+        now=now,
     )
     return result
 

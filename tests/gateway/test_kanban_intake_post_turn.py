@@ -1,9 +1,18 @@
+from __future__ import annotations
+
+import asyncio
+import sqlite3
 from types import SimpleNamespace
 
 import pytest
 
-from gateway.kanban_intake import DetectorDecision, KanbanIntakeConfig
-from gateway.platforms.base import MessageEvent, MessageType
+from gateway.kanban_intake import (
+    DetectorDecision,
+    KanbanIntakeConfig,
+    PendingKanbanStore,
+    SourceBinding,
+)
+from gateway.platforms.base import MessageEvent, MessageType, SendResult
 from gateway.run import GatewayRunner
 from gateway.session import Platform, SessionSource
 
@@ -102,6 +111,429 @@ async def test_post_turn_stores_pending_and_renders_message(tmp_path):
     assert runner._kanban_intake_detector.requests
     payload = runner._kanban_intake_detector.requests[0].user_summary
     assert "1521423652547989615" not in payload
+
+
+@pytest.mark.asyncio
+async def test_post_turn_binds_actual_outbound_message_ids(tmp_path):
+    cfg = KanbanIntakeConfig(
+        enabled=True,
+        default_board="lifelog-control",
+        store_path=tmp_path / "pending.db",
+    )
+    store = PendingKanbanStore(cfg.store_path)
+
+    class Adapter:
+        _active_sessions = {}
+
+        def register_post_delivery_callback(
+            self,
+            session_key,
+            callback,
+            *,
+            generation=None,
+        ):
+            self.session_key = session_key
+            self.callback = callback
+            self.generation = generation
+
+        async def send(self, chat_id, content, reply_to=None, metadata=None):
+            self.sent = (chat_id, content, reply_to, metadata)
+            return SendResult(
+                success=True,
+                message_id="1521423652547989690",
+                raw_response={
+                    "message_ids": [
+                        "1521423652547989690",
+                        "1521423652547989691",
+                    ]
+                },
+            )
+
+    adapter = Adapter()
+    runner = object.__new__(GatewayRunner)
+    runner._kanban_intake_config = lambda: cfg
+    runner._kanban_intake_store = lambda cfg=None: store
+    runner._adapter_for_source = lambda source: adapter
+    object.__setattr__(
+        runner,
+        "_kanban_intake_detector",
+        Detector(
+            DetectorDecision(
+                True,
+                title="Safe ops follow-up",
+                body={"source_ref": "kp_safe"},
+            )
+        ),
+    )
+    event = MessageEvent(
+        text="gateway 구현 후속",
+        message_type=MessageType.TEXT,
+        source=source(),
+        message_id="1521423652547989615",
+    )
+
+    msg = await runner._maybe_build_kanban_intake_proposal_message(
+        event,
+        "s1",
+        event.text,
+        "done",
+    )
+    assert msg is None
+    await adapter.callback()
+    assert "proposal_ref:" in adapter.sent[1]
+    binding = SourceBinding.from_source(
+        event.source,
+        "s1",
+        message_id=event.message_id,
+    )
+    lookup = store.get_active_for_source(binding)
+    assert lookup.pending is not None
+    assert lookup.pending.source_ids["proposal_message_ids"] == [
+        "1521423652547989690",
+        "1521423652547989691",
+    ]
+
+
+@pytest.mark.asyncio
+async def test_invalidated_run_cannot_register_or_deliver_proposal(tmp_path):
+    cfg = KanbanIntakeConfig(
+        enabled=True,
+        default_board="lifelog-control",
+        store_path=tmp_path / "pending.db",
+    )
+    store = PendingKanbanStore(cfg.store_path)
+
+    class Adapter:
+        _active_sessions = {}
+
+        def __init__(self):
+            self.registered = False
+            self.sent = False
+
+        def register_post_delivery_callback(self, *args, **kwargs):
+            self.registered = True
+
+        async def send(self, *args, **kwargs):
+            self.sent = True
+            raise AssertionError("stale run must not send proposal")
+
+    adapter = Adapter()
+    runner = object.__new__(GatewayRunner)
+    runner._session_run_generation = {"s1": 1}
+    runner._kanban_intake_config = lambda: cfg
+    runner._kanban_intake_store = lambda cfg=None: store
+    runner._adapter_for_source = lambda source: adapter
+
+    class InvalidatingDetector:
+        def detect(self, request):
+            runner._session_run_generation["s1"] = 2
+            return DetectorDecision(
+                True,
+                title="Safe ops follow-up",
+                body={"source_ref": "kp_safe"},
+            )
+
+    object.__setattr__(runner, "_kanban_intake_detector", InvalidatingDetector())
+    event = MessageEvent(
+        text="gateway 구현 후속",
+        message_type=MessageType.TEXT,
+        source=source(),
+        message_id="1521423652547989615",
+    )
+
+    msg = await runner._maybe_build_kanban_intake_proposal_message(
+        event,
+        "s1",
+        event.text,
+        "done",
+        run_generation=1,
+    )
+    binding = SourceBinding.from_source(
+        event.source,
+        "s1",
+        message_id=event.message_id,
+    )
+
+    assert msg is None
+    assert adapter.registered is False
+    assert adapter.sent is False
+    assert store.get_active_for_source(binding).state == "none"
+
+
+@pytest.mark.asyncio
+async def test_invalidated_registered_callback_closes_undelivered_pending(tmp_path):
+    cfg = KanbanIntakeConfig(
+        enabled=True,
+        default_board="lifelog-control",
+        store_path=tmp_path / "pending.db",
+    )
+    store = PendingKanbanStore(cfg.store_path)
+
+    class Adapter:
+        _active_sessions = {}
+
+        def register_post_delivery_callback(
+            self,
+            session_key,
+            callback,
+            *,
+            generation=None,
+        ):
+            self.callback = callback
+            self.generation = generation
+
+        async def send(self, *args, **kwargs):
+            raise AssertionError("invalidated callback must not send")
+
+    adapter = Adapter()
+    runner = object.__new__(GatewayRunner)
+    runner._session_run_generation = {"s1": 1}
+    runner._kanban_intake_config = lambda: cfg
+    runner._kanban_intake_store = lambda cfg=None: store
+    runner._adapter_for_source = lambda source: adapter
+    object.__setattr__(
+        runner,
+        "_kanban_intake_detector",
+        Detector(
+            DetectorDecision(
+                True,
+                title="Safe ops follow-up",
+                body={"source_ref": "kp_safe"},
+            )
+        ),
+    )
+    event = MessageEvent(
+        text="gateway 구현 후속",
+        message_type=MessageType.TEXT,
+        source=source(),
+        message_id="1521423652547989615",
+    )
+
+    msg = await runner._maybe_build_kanban_intake_proposal_message(
+        event,
+        "s1",
+        event.text,
+        "done",
+        run_generation=1,
+    )
+    assert msg is None
+    assert adapter.generation == 1
+    runner._session_run_generation["s1"] = 2
+    await adapter.callback()
+    binding = SourceBinding.from_source(
+        event.source,
+        "s1",
+        message_id=event.message_id,
+    )
+
+    assert store.get_active_for_source(binding).state == "none"
+
+
+@pytest.mark.asyncio
+async def test_invalidation_during_send_never_binds_authoritative_delivery(tmp_path):
+    cfg = KanbanIntakeConfig(
+        enabled=True,
+        default_board="lifelog-control",
+        store_path=tmp_path / "pending.db",
+    )
+    store = PendingKanbanStore(cfg.store_path)
+    runner = object.__new__(GatewayRunner)
+    runner._session_run_generation = {"s1": 1}
+
+    class Adapter:
+        _active_sessions = {}
+
+        def register_post_delivery_callback(
+            self,
+            session_key,
+            callback,
+            *,
+            generation=None,
+        ):
+            self.callback = callback
+
+        async def send(self, *args, **kwargs):
+            runner._session_run_generation["s1"] = 2
+            return SendResult(
+                success=True,
+                message_id="1521423652547989690",
+                raw_response={"message_ids": ["1521423652547989690"]},
+            )
+
+    adapter = Adapter()
+    runner._kanban_intake_config = lambda: cfg
+    runner._kanban_intake_store = lambda cfg=None: store
+    runner._adapter_for_source = lambda source: adapter
+    object.__setattr__(
+        runner,
+        "_kanban_intake_detector",
+        Detector(
+            DetectorDecision(
+                True,
+                title="Safe ops follow-up",
+                body={"source_ref": "kp_safe"},
+            )
+        ),
+    )
+    event = MessageEvent(
+        text="gateway 구현 후속",
+        message_type=MessageType.TEXT,
+        source=source(),
+        message_id="1521423652547989615",
+    )
+
+    msg = await runner._maybe_build_kanban_intake_proposal_message(
+        event,
+        "s1",
+        event.text,
+        "done",
+        run_generation=1,
+    )
+    assert msg is None
+    await adapter.callback()
+    binding = SourceBinding.from_source(
+        event.source,
+        "s1",
+        message_id=event.message_id,
+    )
+
+    assert store.get_pending_capability_for_reply(
+        binding,
+        "1521423652547989690",
+    ).state == "none"
+    assert store.get_active_for_source(binding).state == "none"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    (
+        "cancel_owner",
+        "raise_before_commit",
+        "commit_then_raise",
+        "cleanup_raises",
+    ),
+    [
+        (True, False, False, False),
+        (True, False, True, False),
+        (False, False, True, False),
+        (True, False, True, True),
+        (False, True, False, True),
+    ],
+)
+async def test_cancellation_during_bind_waits_then_revokes_authority(
+    tmp_path,
+    cancel_owner,
+    raise_before_commit,
+    commit_then_raise,
+    cleanup_raises,
+):
+    import threading
+
+    cfg = KanbanIntakeConfig(
+        enabled=True,
+        default_board="lifelog-control",
+        store_path=tmp_path / "pending.db",
+    )
+    store = PendingKanbanStore(cfg.store_path)
+    runner = object.__new__(GatewayRunner)
+    runner._session_run_generation = {"s1": 1}
+    started = threading.Event()
+    release = threading.Event()
+    finished = threading.Event()
+    original_bind = store.bind_outbound_proposal_messages
+
+    def blocking_bind(*args, **kwargs):
+        started.set()
+        release.wait(timeout=5)
+        try:
+            if raise_before_commit:
+                raise RuntimeError("simulated pre-commit bind failure")
+            result = original_bind(*args, **kwargs)
+            if commit_then_raise:
+                raise RuntimeError("simulated unknown commit outcome")
+            return result
+        finally:
+            finished.set()
+
+    store.bind_outbound_proposal_messages = blocking_bind
+
+    class Adapter:
+        _active_sessions = {}
+
+        def register_post_delivery_callback(
+            self,
+            session_key,
+            callback,
+            *,
+            generation=None,
+        ):
+            self.callback = callback
+
+        async def send(self, *args, **kwargs):
+            return SendResult(
+                success=True,
+                message_id="1521423652547989691",
+                raw_response={"message_ids": ["1521423652547989691"]},
+            )
+
+    adapter = Adapter()
+    runner._kanban_intake_config = lambda: cfg
+    runner._kanban_intake_store = lambda cfg=None: store
+    runner._adapter_for_source = lambda source: adapter
+    object.__setattr__(
+        runner,
+        "_kanban_intake_detector",
+        Detector(
+            DetectorDecision(
+                True,
+                title="Safe ops follow-up",
+                body={"source_ref": "kp_safe"},
+            )
+        ),
+    )
+    event = MessageEvent(
+        text="gateway 구현 후속",
+        message_type=MessageType.TEXT,
+        source=source(),
+        message_id="1521423652547989616",
+    )
+
+    msg = await runner._maybe_build_kanban_intake_proposal_message(
+        event,
+        "s1",
+        event.text,
+        "done",
+        run_generation=1,
+    )
+    assert msg is None
+    if cleanup_raises:
+        def fail_cleanup(*args, **kwargs):
+            raise sqlite3.OperationalError("simulated cleanup failure")
+
+        store.transition_status = fail_cleanup
+    callback_task = asyncio.create_task(adapter.callback())
+    assert await asyncio.to_thread(started.wait, 5)
+    if cancel_owner:
+        runner._session_run_generation["s1"] = 2
+        callback_task.cancel()
+    release.set()
+    if cancel_owner:
+        with pytest.raises(asyncio.CancelledError):
+            await callback_task
+    else:
+        await callback_task
+    assert await asyncio.to_thread(finished.wait, 5)
+
+    binding = SourceBinding.from_source(
+        event.source,
+        "s1",
+        message_id=event.message_id,
+    )
+    assert store.get_pending_capability_for_reply(
+        binding,
+        "1521423652547989691",
+    ).state == "none"
+    assert store.get_active_for_source(binding).state == "none"
 
 
 @pytest.mark.asyncio

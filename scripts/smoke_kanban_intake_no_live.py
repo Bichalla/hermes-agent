@@ -45,9 +45,10 @@ def main() -> int:
             PendingKanbanStore,
             SourceBinding,
             TitleGenerationRule,
+            APPROVAL,
+            apply_typed_proposal_decision,
             constrained_llm_title_generator,
             explicit_title_from_request,
-            handle_reply,
             validate_proposal,
         )
         from hermes_cli import kanban_db as kb
@@ -189,8 +190,27 @@ def main() -> int:
             source_ref="kp_safe",
             user_id="u1",
         )
-        store.put_pending(proposal, binding, cfg)
-        approved = handle_reply("ㅇㅇ", binding, cfg, store)
+        pending = store.put_pending(proposal, binding, cfg)
+        delivery_id = "1521423652547989700"
+        assert store.bind_outbound_proposal_messages(
+            pending.pending_id,
+            binding,
+            [delivery_id],
+        )
+        pending = store.get_active_by_proposal_ref(
+            pending.pending_id,
+            binding,
+        ).pending
+        assert pending is not None
+        approved = apply_typed_proposal_decision(
+            action=APPROVAL,
+            proposal_ref=pending.pending_id,
+            binding=binding,
+            cfg=cfg,
+            store=store,
+            expected_proposal_digest=pending.proposal_digest,
+            expected_reply_message_id=delivery_id,
+        )
         old_policy_binding = SourceBinding("discord", "old_policy_chat_123456789", "old_policy_thread_123456789", "u_old", "s1")
         old_policy_pending = store.put_pending(
             KanbanCardProposal(
@@ -209,7 +229,13 @@ def main() -> int:
                 ("kanban-intake-policy/v2", old_policy_pending.pending_id),
             )
             old_policy_conn.commit()
-        old_policy_result = handle_reply("승인", old_policy_binding, cfg, store)
+        old_policy_result = apply_typed_proposal_decision(
+            action=APPROVAL,
+            proposal_ref=old_policy_pending.pending_id,
+            binding=old_policy_binding,
+            cfg=cfg,
+            store=store,
+        )
         old_policy_review = store.review_pending(include_all=True)
         old_policy_items = {item["pending_id"]: item for item in old_policy_review["items"]}
         old_policy_pending_approval_rejected = (
@@ -235,7 +261,19 @@ def main() -> int:
             store.put_pending(proposal, SourceBinding("discord", "c", "t", "", "s"), cfg)
         except Exception:
             missing_user_ok = True
-        cross = handle_reply("승인", SourceBinding("discord", "raw_chat_123456789", "raw_thread_123456789", "u2", "s1"), cfg, store)
+        cross = apply_typed_proposal_decision(
+            action=APPROVAL,
+            proposal_ref=pending.pending_id,
+            binding=SourceBinding(
+                "discord",
+                "raw_chat_123456789",
+                "raw_thread_123456789",
+                "u2",
+                "s1",
+            ),
+            cfg=cfg,
+            store=store,
+        )
         expired_pending = store.put_pending(
             KanbanCardProposal(
                 board=board,
@@ -279,8 +317,12 @@ def main() -> int:
             "card_blocked_by_default": task_status == "blocked",
             "card_unclaimed_before_dispatch": worker_pid is None and claim_lock is None,
             "blocked_card_not_dispatched": bool(after_dispatch and after_dispatch.status == "blocked" and not spawned and not dispatch.spawned),
-            "approved_short_phrase": bool(approved.verified),
-            "cross_user_fail_closed": cross.handled is False,
+            "typed_proposal_approved": bool(approved.verified),
+            "cross_user_fail_closed": (
+                cross.handled
+                and not cross.verified
+                and "route/user/TTL" in cross.message
+            ),
             "missing_user_id_fail_closed": missing_user_ok,
             "one_off_card_proposal_suppressed": one_off_card_proposal_suppressed,
             "meta_kanban_card_proposal_suppressed": meta_kanban_card_proposal_suppressed,
@@ -329,7 +371,7 @@ def main() -> int:
             result["card_blocked_by_default"],
             result["card_unclaimed_before_dispatch"],
             result["blocked_card_not_dispatched"],
-            result["approved_short_phrase"],
+            result["typed_proposal_approved"],
             result["cross_user_fail_closed"],
             result["missing_user_id_fail_closed"],
             result["one_off_card_proposal_suppressed"],

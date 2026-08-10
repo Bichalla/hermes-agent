@@ -7029,10 +7029,28 @@ class DiscordAdapter(BasePlatformAdapter):
 
         reply_to_id = None
         reply_to_text = None
+        reply_to_author_id = None
+        reply_to_author_name = None
+        reply_to_is_own_message = False
         if message.reference:
             reply_to_id = str(message.reference.message_id)
             if message.reference.resolved:
-                reply_to_text = getattr(message.reference.resolved, "content", None) or None
+                resolved = message.reference.resolved
+                reply_to_text = getattr(resolved, "content", None) or None
+                reply_author = getattr(resolved, "author", None)
+                reply_to_author_id = (
+                    str(getattr(reply_author, "id", "")) or None
+                )
+                reply_to_author_name = (
+                    getattr(reply_author, "display_name", None)
+                    or getattr(reply_author, "name", None)
+                )
+                bot_user = getattr(self._client, "user", None)
+                reply_to_is_own_message = bool(
+                    reply_author is not None
+                    and bot_user is not None
+                    and getattr(reply_author, "id", None) == getattr(bot_user, "id", None)
+                )
 
         event = MessageEvent(
             text=event_text,
@@ -7044,10 +7062,24 @@ class DiscordAdapter(BasePlatformAdapter):
             media_types=media_types,
             reply_to_message_id=reply_to_id,
             reply_to_text=reply_to_text,
+            reply_to_author_id=reply_to_author_id,
+            reply_to_author_name=reply_to_author_name,
+            reply_to_is_own_message=reply_to_is_own_message,
             timestamp=message.created_at,
             auto_skill=_skills,
             channel_prompt=_channel_prompt,
             channel_context=_channel_context,
+        )
+
+        setattr(
+            event,
+            "trusted_batch_reply_to_message_id",
+            reply_to_id if reply_to_is_own_message else None,
+        )
+        setattr(
+            event,
+            "trusted_batch_reply_to_is_own_message",
+            reply_to_is_own_message,
         )
 
         # Track thread participation so the bot won't require @mention for
@@ -7094,11 +7126,40 @@ class DiscordAdapter(BasePlatformAdapter):
         existing = self._pending_text_batches.get(key)
         chunk_len = len(event.text or "")
         if existing is None:
+            if (
+                not getattr(event, "trusted_batch_reply_to_message_id", None)
+                and event.reply_to_is_own_message
+                and event.reply_to_message_id
+            ):
+                setattr(event, "trusted_batch_reply_to_message_id", event.reply_to_message_id)
+                setattr(event, "trusted_batch_reply_to_is_own_message", True)
             event._last_chunk_len = chunk_len  # type: ignore[attr-defined]
             self._pending_text_batches[key] = event
         else:
             if event.text:
                 existing.text = f"{existing.text}\n{event.text}" if existing.text else event.text
+            existing.raw_message = event.raw_message
+            existing.source = event.source
+            existing.message_id = event.message_id
+            existing.reply_to_message_id = event.reply_to_message_id
+            existing.reply_to_text = event.reply_to_text
+            existing.reply_to_author_id = event.reply_to_author_id
+            existing.reply_to_author_name = event.reply_to_author_name
+            existing.reply_to_is_own_message = event.reply_to_is_own_message
+            if event.reply_to_message_id is not None:
+                setattr(
+                    existing,
+                    "trusted_batch_reply_to_message_id",
+                    event.reply_to_message_id
+                    if event.reply_to_is_own_message
+                    else None,
+                )
+                setattr(
+                    existing,
+                    "trusted_batch_reply_to_is_own_message",
+                    bool(event.reply_to_is_own_message),
+                )
+            existing.timestamp = event.timestamp
             existing._last_chunk_len = chunk_len  # type: ignore[attr-defined]
             if event.media_urls:
                 existing.media_urls.extend(event.media_urls)

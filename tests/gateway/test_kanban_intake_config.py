@@ -21,6 +21,21 @@ def test_missing_block_returns_disabled_config():
     assert cfg.default_board == ""
 
 
+def test_legacy_phrase_keys_are_ignored_not_authority():
+    cfg = parse_config(
+        {
+            "kanban": {
+                "conversational_intake": {
+                    "short_approval_phrases": ["anything"],
+                    "deny_phrases": ["anything else"],
+                }
+            }
+        }
+    )
+    assert not hasattr(cfg, "short_approval_phrases")
+    assert not hasattr(cfg, "deny_phrases")
+
+
 def test_invalid_status_fails_closed_to_blocked():
     cfg = parse_config({"kanban": {"conversational_intake": {"default_status": "ready"}}})
     assert cfg.default_status == "blocked"

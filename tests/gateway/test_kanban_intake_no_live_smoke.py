@@ -26,7 +26,7 @@ def test_no_live_smoke_script_outputs_safe_booleans(tmp_path, monkeypatch):
     assert data["card_blocked_by_default"] is True
     assert data["card_unclaimed_before_dispatch"] is True
     assert data["blocked_card_not_dispatched"] is True
-    assert data["approved_short_phrase"] is True
+    assert data["typed_proposal_approved"] is True
     assert data["cross_user_fail_closed"] is True
     assert data["missing_user_id_fail_closed"] is True
     assert data["one_off_card_proposal_suppressed"] is True

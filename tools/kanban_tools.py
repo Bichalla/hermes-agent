@@ -104,6 +104,17 @@ def _check_registered_blocked_create_mode() -> bool:
         return False
 
 
+def _check_kanban_intake_decision_mode() -> bool:
+    """Expose typed intake only when the existing intake service is enabled."""
+    if not _check_registered_blocked_create_mode():
+        return False
+    try:
+        from gateway.kanban_intake import parse_config
+        return bool(parse_config(load_config()).enabled)
+    except Exception:
+        return False
+
+
 # ---------------------------------------------------------------------------
 # Shared helpers
 # ---------------------------------------------------------------------------
@@ -1338,7 +1349,88 @@ _DESC_BOARD = (
 )
 
 
-def _board_schema_prop() -> dict[str, str]:
+def _handle_kanban_intake_decision(args: dict, **kw) -> str:
+    """Apply one host-sealed, model-selected action to one opaque proposal."""
+    del kw
+    allowed = frozenset({"action", "proposal_ref"})
+    unknown = set(args) - allowed
+    if unknown:
+        return tool_error(
+            "kanban_intake_decision: unsupported field(s): "
+            + ", ".join(sorted(str(name) for name in unknown))
+        )
+    action = args.get("action")
+    proposal_ref = args.get("proposal_ref")
+    if action not in {"approve", "deny"}:
+        return tool_error("kanban_intake_decision: invalid action")
+    import re
+    if not isinstance(proposal_ref, str) or re.fullmatch(r"kp_[a-f0-9]{16}", proposal_ref) is None:
+        return tool_error("kanban_intake_decision: invalid proposal_ref")
+
+    from gateway.kanban_intake import PendingKanbanStore, SourceBinding, apply_typed_proposal_decision, parse_config
+    from gateway.session_context import get_session_controller_role, get_session_env, get_trusted_kanban_proposal_capability
+    from tools.workflow_authority import get_current_turn_user_authority, is_host_issued_current_turn_authority, matches_active_workflow_turn
+
+    authority = get_current_turn_user_authority()
+    if (
+        authority is None
+        or get_session_controller_role() != "main_controller"
+        or not is_host_issued_current_turn_authority(authority)
+        or not matches_active_workflow_turn(authority)
+    ):
+        return tool_error("kanban_intake_decision: current foreground host authority required")
+    cfg = parse_config(load_config())
+    if not cfg.enabled:
+        return tool_error("kanban_intake_decision: intake disabled")
+    capability = get_trusted_kanban_proposal_capability()
+    if capability is None:
+        return tool_error("kanban_intake_decision: authenticated reply proposal capability required")
+    binding = SourceBinding(
+        platform=capability.platform,
+        chat_id=capability.chat_id,
+        thread_id=capability.thread_id or None,
+        user_id=capability.authenticated_sender_id,
+        session_key=get_session_env("HERMES_SESSION_ID", "") or get_session_env("HERMES_SESSION_KEY", ""),
+        message_id=capability.current_message_id,
+    )
+    if not binding.session_key:
+        return tool_error("kanban_intake_decision: trusted route binding unavailable")
+    if proposal_ref != capability.proposal_ref:
+        return tool_error("kanban_intake_decision: proposal_ref does not match current reply capability")
+    if (
+        capability.platform != binding.platform
+        or capability.chat_id != binding.chat_id
+        or capability.thread_id != (binding.thread_id or binding.chat_id)
+        or capability.authenticated_sender_id != binding.user_id
+        or capability.current_message_id != (binding.message_id or "")
+    ):
+        return tool_error("kanban_intake_decision: current event does not match reply capability")
+    try:
+        result = apply_typed_proposal_decision(
+            action=action,
+            proposal_ref=proposal_ref,
+            binding=binding,
+            cfg=cfg,
+            store=PendingKanbanStore(cfg.store_path),
+            expected_proposal_digest=capability.proposal_digest,
+            expected_reply_message_id=capability.replied_to_message_id,
+        )
+    except Exception:
+        logger.exception("kanban intake canonical decision failed closed")
+        return tool_error("kanban_intake_decision: canonical proposal lookup/effect unavailable")
+    if action == "approve" and not result.verified:
+        return tool_error(f"kanban_intake_decision: {result.message}")
+    return _ok(
+        action=action,
+        proposal_ref=proposal_ref,
+        task_id=result.task_id,
+        verified=result.verified,
+        message=result.message,
+    )
+
+
+def _board_schema_prop() -> dict:
+
     """Schema fragment for the optional ``board`` parameter.
 
     Centralised so a future tweak to the description / validation hint
@@ -1813,6 +1905,34 @@ KANBAN_CREATE_BLOCKED_SCHEMA = {
     },
 }
 
+KANBAN_INTAKE_DECISION_SCHEMA = {
+    "name": "kanban_intake_decision",
+    "description": (
+        "Apply one semantic decision to one opaque conversational Kanban "
+        "proposal. Use only for the proposal_ref shown in the replied-to "
+        "candidate. The host resolves all card fields and enforces route, TTL, "
+        "digest, blocked-only effect, idempotency, and readback."
+    ),
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "action": {
+                "type": "string",
+                "enum": ["approve", "deny"],
+                "description": "The user's semantic decision for this exact proposal.",
+            },
+            "proposal_ref": {
+                "type": "string",
+                "pattern": r"^kp_[a-f0-9]{16}$",
+                "description": "Opaque host-issued proposal reference.",
+            },
+        },
+        "required": ["action", "proposal_ref"],
+        "additionalProperties": False,
+    },
+}
+
+
 KANBAN_UNBLOCK_SCHEMA = {
     "name": "kanban_unblock",
     "description": (
@@ -1926,6 +2046,15 @@ registry.register(
     handler=_handle_registered_blocked_create,
     check_fn=_check_registered_blocked_create_mode,
     emoji="⊘",
+)
+
+registry.register(
+    name="kanban_intake_decision",
+    toolset="registered-workflow",
+    schema=KANBAN_INTAKE_DECISION_SCHEMA,
+    handler=_handle_kanban_intake_decision,
+    check_fn=_check_kanban_intake_decision_mode,
+    emoji="✓",
 )
 
 registry.register(

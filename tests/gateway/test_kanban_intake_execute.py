@@ -33,6 +33,7 @@ def test_execute_creates_verified_blocked_card_in_temp_home(tmp_path, monkeypatc
         source_ref="kp_safe",
         user_id="u1",
         tenant="lifelog",
+        idempotency_key="kanban-intake:v1:" + "a" * 64,
     ).normalized(cfg)
     pending = PendingKanbanApproval(
         pending_id="kp_pending",
@@ -76,6 +77,7 @@ def test_blocked_intake_card_is_not_spawned_by_dispatch_tick(tmp_path, monkeypat
         source_ref="kp_safe",
         user_id="u1",
         tenant="lifelog",
+        idempotency_key="kanban-intake:v1:" + "a" * 64,
     ).normalized(cfg)
     pending = PendingKanbanApproval(
         pending_id="kp_pending",

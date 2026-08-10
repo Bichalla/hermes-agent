@@ -9130,26 +9130,56 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         return PendingKanbanStore(cfg.store_path)
 
     async def _maybe_handle_kanban_intake_reply(self, event: MessageEvent, session_key: str) -> Optional[str]:
-        from gateway.kanban_intake import (
-            SourceBinding,
-            classify_reply,
-            handle_reply,
+        """Legacy rail no-op; semantic decisions are made by the typed tool."""
+        del event, session_key
+        return None
+
+    async def _trusted_kanban_proposal_for_reply(
+        self, event: MessageEvent, session_key: str
+    ):
+        """Resolve one exact proposal from an authenticated own-message reply."""
+        target = getattr(event, "reply_to_message_id", None) or getattr(
+            event, "trusted_batch_reply_to_message_id", None
         )
+        own = bool(
+            getattr(event, "reply_to_is_own_message", False)
+            or getattr(event, "trusted_batch_reply_to_is_own_message", False)
+        )
+        if not own or not target or not getattr(event, "message_id", None):
+            return None
+        from gateway.kanban_intake import SourceBinding
+        from gateway.session_context import TrustedKanbanProposalCapability
         cfg = self._kanban_intake_config()
-        if not cfg.enabled or event.message_type != MessageType.TEXT or event.get_command():
-            return None
-        platform = getattr(getattr(event.source, "platform", None), "value", getattr(event.source, "platform", ""))
-        if str(platform).lower() not in cfg.normalized_platforms:
-            return None
-        if classify_reply(event.text or "", cfg) == "none":
+        if not cfg.enabled:
             return None
         try:
             binding = SourceBinding.from_source(event.source, session_key, message_id=event.message_id)
         except ValueError:
             return None
         store = self._kanban_intake_store(cfg)
-        result = await asyncio.to_thread(handle_reply, event.text or "", binding, cfg, store)
-        return result.message if result.handled else None
+        try:
+            lookup = await asyncio.to_thread(
+                store.get_pending_capability_for_reply, binding, str(target)
+            )
+        except Exception:
+            logger.warning("kanban intake reply capability lookup failed closed", exc_info=True)
+            return None
+        if lookup.state != "one" or lookup.pending is None:
+            return None
+        pending = lookup.pending
+        try:
+            return TrustedKanbanProposalCapability(
+                proposal_ref=pending.pending_id,
+                proposal_digest=pending.proposal_digest,
+                platform=binding.platform,
+                chat_id=binding.chat_id,
+                thread_id=binding.thread_id or binding.chat_id,
+                authenticated_sender_id=binding.user_id,
+                current_message_id=str(event.message_id),
+                replied_to_message_id=str(target),
+            )
+        except (TypeError, ValueError):
+            return None
 
     async def _maybe_build_kanban_intake_proposal_message(
         self,
@@ -9157,6 +9187,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         session_key: str,
         user_message: str,
         assistant_response: str,
+        run_generation: Optional[int] = None,
     ) -> Optional[str]:
         from gateway.kanban_intake import (
             KeywordHeuristicDetector,
@@ -9168,6 +9199,14 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             render_proposal_message,
             validate_proposal,
         )
+
+        def _originating_run_is_current() -> bool:
+            return run_generation is None or self._is_session_run_current(
+                session_key, run_generation
+            )
+
+        if not _originating_run_is_current():
+            return None
         cfg = self._kanban_intake_config()
         if (
             not cfg.enabled
@@ -9219,9 +9258,11 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         if not ok:
             logger.info("kanban intake proposal rejected: %s", reason)
             return None
+        if not _originating_run_is_current():
+            return None
         store = self._kanban_intake_store(cfg)
         try:
-            await asyncio.to_thread(
+            pending = await asyncio.to_thread(
                 store.put_pending,
                 proposal,
                 binding,
@@ -9237,7 +9278,134 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         except Exception as exc:
             logger.info("kanban intake pending store rejected proposal: %s", exc)
             return None
-        return render_proposal_message(proposal)
+        proposal_message = render_proposal_message(
+            pending.proposal,
+            proposal_ref=pending.pending_id,
+        )
+        try:
+            adapter = self._adapter_for_source(event.source)
+        except Exception:
+            adapter = None
+        register_delivery = getattr(adapter, "register_post_delivery_callback", None)
+        if (
+            callable(register_delivery)
+            and str(getattr(platform, "value", platform)).lower() == "discord"
+        ):
+            pending_id = pending.pending_id
+            target_chat_id = str(
+                getattr(event.source, "thread_id", None)
+                or getattr(event.source, "chat_id", "")
+            )
+
+            async def _invalidate_stale_pending(*, require_undelivered: bool, phase: str):
+                store.deny_delivery_authority(pending_id)
+                try:
+                    await asyncio.to_thread(
+                        store.transition_status,
+                        pending_id,
+                        expected_status="pending",
+                        status="invalid",
+                        reason_code="proposal_run_invalidated",
+                        invocation_key=f"delivery:v1:{pending_id}:stale-run:{phase}",
+                        require_undelivered=require_undelivered,
+                    )
+                except Exception:
+                    logger.warning(
+                        "kanban intake stale callback cleanup failed closed: %s (%s)",
+                        pending_id,
+                        phase,
+                        exc_info=True,
+                    )
+
+            async def _deliver_and_bind_proposal() -> None:
+                if not _originating_run_is_current():
+                    await _invalidate_stale_pending(require_undelivered=True, phase="before-send")
+                    return
+                try:
+                    send_result = await adapter.send(
+                        target_chat_id,
+                        proposal_message,
+                        reply_to=getattr(event, "message_id", None),
+                    )
+                except Exception:
+                    logger.warning("kanban intake proposal delivery failed closed: %s", pending_id, exc_info=True)
+                    return
+                if not getattr(send_result, "success", False):
+                    return
+                if not _originating_run_is_current():
+                    await _invalidate_stale_pending(require_undelivered=True, phase="after-send")
+                    return
+                raw_response = getattr(send_result, "raw_response", None)
+                raw_ids = raw_response.get("message_ids", []) if isinstance(raw_response, dict) else []
+                message_ids = [str(value) for value in raw_ids if value]
+                if not message_ids and getattr(send_result, "message_id", None):
+                    message_ids = [str(send_result.message_id)]
+                if not message_ids:
+                    await _invalidate_stale_pending(require_undelivered=False, phase="missing-message-id")
+                    return
+                def _bind_if_still_current() -> bool:
+                    if not _originating_run_is_current():
+                        return False
+                    return store.bind_outbound_proposal_messages(
+                        pending_id,
+                        binding,
+                        message_ids,
+                    )
+
+                bind_task = asyncio.create_task(
+                    asyncio.to_thread(_bind_if_still_current)
+                )
+
+                async def _finish_task_despite_owner_cancellation(task):
+                    while not task.done():
+                        try:
+                            await asyncio.shield(task)
+                        except asyncio.CancelledError:
+                            continue
+                    return task.result()
+
+                try:
+                    bound = await asyncio.shield(bind_task)
+                except asyncio.CancelledError:
+                    try:
+                        bound = await _finish_task_despite_owner_cancellation(bind_task)
+                    except Exception:
+                        bound = False
+                    cleanup_task = asyncio.create_task(
+                        _invalidate_stale_pending(
+                            require_undelivered=False,
+                            phase="cancelled-during-bind",
+                        )
+                    )
+                    await _finish_task_despite_owner_cancellation(cleanup_task)
+                    raise
+                except Exception:
+                    cleanup_task = asyncio.create_task(
+                        _invalidate_stale_pending(
+                            require_undelivered=False,
+                            phase="bind-worker-exception",
+                        )
+                    )
+                    await _finish_task_despite_owner_cancellation(cleanup_task)
+                    return
+                if not _originating_run_is_current():
+                    cleanup_task = asyncio.create_task(
+                        _invalidate_stale_pending(
+                            require_undelivered=not bound,
+                            phase="after-bind",
+                        )
+                    )
+                    await asyncio.shield(cleanup_task)
+                    return
+                if not bound:
+                    await _invalidate_stale_pending(
+                        require_undelivered=False,
+                        phase="bind-returned-false",
+                    )
+
+            register_delivery(session_key, _deliver_and_bind_proposal, generation=run_generation)
+            return None
+        return proposal_message
 
     async def _handle_message(self, event: MessageEvent) -> Optional[str]:
         """
@@ -10762,6 +10930,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         source: SessionSource,
         history: List[Dict[str, Any]],
         session_key: Optional[str] = None,
+        kanban_proposal_capability=None,
     ) -> Optional[str]:
         """Prepare inbound event text for the agent.
 
@@ -11021,6 +11190,15 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             else:
                 message_text = f'[Replying to: "{reply_snippet}"]\n\n{message_text}'
 
+        if kanban_proposal_capability is not None:
+            message_text = (
+                "[Host-bound Kanban proposal for this authenticated reply: "
+                f"proposal_ref=`{kanban_proposal_capability.proposal_ref}`. "
+                "Only this exact opaque reference is eligible for "
+                "kanban_intake_decision.]\n\n"
+                f"{message_text}"
+            )
+
         if "@" in message_text:
             try:
                 from agent.context_references import preprocess_context_references_async
@@ -11119,6 +11297,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         source: SessionSource,
         history: List[Dict[str, Any]],
         session_key: Optional[str] = None,
+        kanban_proposal_capability=None,
     ) -> Optional[str]:
         """Run inbound preprocessing under the routed profile when multiplexed."""
         if getattr(getattr(self, "config", None), "multiplex_profiles", False):
@@ -11128,12 +11307,14 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     source=source,
                     history=history,
                     session_key=session_key,
+                    kanban_proposal_capability=kanban_proposal_capability,
                 )
         return await self._prepare_inbound_message_text(
             event=event,
             source=source,
             history=history,
             session_key=session_key,
+            kanban_proposal_capability=kanban_proposal_capability,
         )
 
     def _consume_pending_native_image_paths(self, session_key: str) -> List[str]:
@@ -11366,9 +11547,13 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         context = build_session_context(source, self.config, session_entry)
 
         # Set session context variables for tools (task-local, concurrency-safe)
+        _trusted_kanban_proposal = await self._trusted_kanban_proposal_for_reply(
+            event, session_key
+        )
         _session_env_tokens = self._set_session_env(
             context,
             user_text=event.text if isinstance(event.text, str) else "",
+            trusted_kanban_proposal=_trusted_kanban_proposal,
         )
 
         # Read privacy.redact_pii from config (re-read per message)
@@ -11991,6 +12176,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             source=source,
             history=history,
             session_key=session_key,
+            kanban_proposal_capability=_trusted_kanban_proposal,
         )
         if message_text is None:
             return
@@ -15534,7 +15720,11 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         return delivered
 
     def _set_session_env(
-        self, context: SessionContext, *, user_text: str | None = None
+        self,
+        context: SessionContext,
+        *,
+        user_text: str | None = None,
+        trusted_kanban_proposal=None,
     ) -> list:
         """Set session context variables for the current async task.
 
@@ -15571,6 +15761,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             controller_role=(
                 "main_controller" if isinstance(user_text, str) else ""
             ),
+            trusted_kanban_proposal=trusted_kanban_proposal,
         )
 
     def _clear_session_env(self, tokens: list) -> None:
@@ -20742,6 +20933,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 next_message_id = None
                 next_channel_prompt = None
                 next_session_key = session_key
+                next_kanban_capability = None
                 if pending_event is not None:
                     next_source = getattr(pending_event, "source", None) or source
                     if self._is_goal_continuation_event(pending_event) and not self._goal_still_active_for_session(session_id):
@@ -20763,11 +20955,16 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                             session_key or "?",
                             exc_info=True,
                         )
+                    next_kanban_capability = await self._trusted_kanban_proposal_for_reply(
+                        pending_event,
+                        next_session_key,
+                    )
                     next_message = await self._prepare_profile_scoped_inbound_message_text(
                         event=pending_event,
                         source=next_source,
                         history=updated_history,
                         session_key=next_session_key,
+                        kanban_proposal_capability=next_kanban_capability,
                     )
                     if next_message is None:
                         return result
@@ -20803,18 +21000,34 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 # what the follow-up's guard will consult.  Fail-safe in helper.
                 await self._refresh_agent_cache_message_count(session_key, session_id)
 
-                followup_result = await self._run_agent(
-                    message=next_message,
-                    context_prompt=context_prompt,
-                    history=updated_history,
-                    source=next_source,
-                    session_id=session_id,
-                    session_key=next_session_key,
-                    run_generation=run_generation,
-                    _interrupt_depth=_interrupt_depth + 1,
-                    event_message_id=next_message_id,
-                    channel_prompt=next_channel_prompt,
+                from gateway.session_context import (
+                    bind_queued_event_kanban_context,
+                    reset_queued_event_kanban_context,
                 )
+
+                _queued_context_tokens = bind_queued_event_kanban_context(
+                    message_id=(
+                        getattr(pending_event, "message_id", None)
+                        if pending_event is not None
+                        else None
+                    ),
+                    capability=next_kanban_capability,
+                )
+                try:
+                    followup_result = await self._run_agent(
+                        message=next_message,
+                        context_prompt=context_prompt,
+                        history=updated_history,
+                        source=next_source,
+                        session_id=session_id,
+                        session_key=next_session_key,
+                        run_generation=run_generation,
+                        _interrupt_depth=_interrupt_depth + 1,
+                        event_message_id=next_message_id,
+                        channel_prompt=next_channel_prompt,
+                    )
+                finally:
+                    reset_queued_event_kanban_context(_queued_context_tokens)
                 return _preserve_queued_followup_history_offset(result, followup_result)
         finally:
             # Stop progress sender, interrupt monitor, and notification task

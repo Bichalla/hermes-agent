@@ -1,8 +1,11 @@
 """Conversational Kanban intake guardrail for gateway messages.
 
 Default-off runtime support for turning assistant-detected card-worthy
-conversation scope into a stored pending Kanban card proposal. Short approval
-phrases can execute only an exact, source-bound pending proposal.
+conversation scope into a stored pending Kanban card proposal. Follow-up
+effects are executed only through the closed typed decision route, which
+requires exact host-bound current-turn, source/message, proposal-capability,
+and canonical pending-state authority. Raw phrase classification never directly
+performs the effect.
 """
 
 from __future__ import annotations

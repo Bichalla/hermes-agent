@@ -69,6 +69,28 @@ def test_normalization_failure_is_constant_and_context_free(monkeypatch: pytest.
     assert "secret-name" not in repr(captured.value)
 
 
+@pytest.mark.parametrize("signal_type", (KeyboardInterrupt, SystemExit, MemoryError))
+def test_control_flow_normalization_errors_propagate(
+    monkeypatch: pytest.MonkeyPatch,
+    signal_type: type[BaseException],
+) -> None:
+    signal = signal_type("private-stop")
+
+    def fail_normalization(_form: str, _value: str) -> str:
+        raise signal
+
+    monkeypatch.setattr(
+        contract_module,
+        "unicodedata",
+        SimpleNamespace(normalize=fail_normalization),
+    )
+
+    with pytest.raises(BaseException) as captured:
+        normalize_medication_name("sensitive-name")
+
+    assert captured.value is signal
+
+
 def test_intent_and_config_remove_private_alias_normalizers() -> None:
     assert not hasattr(intent_module, "_normalize_alias")
     assert not hasattr(config_module, "_normalize_alias")

@@ -27,12 +27,16 @@ def normalize_medication_name(value: object) -> str:
     normalized: str | None = None
     try:
         normalized = " ".join(unicodedata.normalize("NFKC", value).casefold().split())
-    except BaseException:
+    except MemoryError:
+        raise
+    except Exception:
         failed = True
 
+    if failed:
+        _deny()
+
     if (
-        failed
-        or type(normalized) is not str
+        type(normalized) is not str
         or not normalized
         or len(normalized) > MAX_MEDICATION_NAME_CHARS
     ):

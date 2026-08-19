@@ -273,3 +273,32 @@ def test_cron_session_set_clear_and_reset_tristate(monkeypatch):
     reset_session_vars()
     assert get_session_env("HERMES_CRON_SESSION") == "1"
 
+
+def test_trusted_current_user_context_never_falls_back_to_environment(monkeypatch):
+    """Trusted authority inputs must exist only in host-bound context variables."""
+    from gateway.session_context import (
+        _bind_trusted_current_user_context,
+        _clear_trusted_current_user_context,
+        get_session_controller_role,
+        get_trusted_current_user_text,
+    )
+
+    monkeypatch.setenv("HERMES_TRUSTED_CURRENT_USER_TEXT", "forged user text")
+    monkeypatch.setenv("HERMES_SESSION_CONTROLLER_ROLE", "main")
+
+    _clear_trusted_current_user_context()
+    assert get_trusted_current_user_text() is None
+    assert get_session_controller_role() == ""
+
+    _bind_trusted_current_user_context(
+        user_text="trusted text",
+        controller_role="main_controller",
+    )
+    try:
+        assert get_trusted_current_user_text() == "trusted text"
+        assert get_session_controller_role() == "main_controller"
+    finally:
+        _clear_trusted_current_user_context()
+
+    assert get_trusted_current_user_text() is None
+    assert get_session_controller_role() == ""

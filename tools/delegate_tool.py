@@ -54,6 +54,8 @@ DELEGATE_BLOCKED_TOOLS = frozenset(
         "memory",  # no writes to shared MEMORY.md
         "send_message",  # no cross-platform side effects
         "cronjob",  # no scheduling more work in the parent's name
+        "registered_local_workflow",  # foreground user authority never delegates
+        "registered_review_ledger",  # main-controller protocol never delegates
     ]
 )
 

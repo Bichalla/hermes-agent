@@ -1688,7 +1688,64 @@ def _notify_context_engine_turn_complete(
         )
 
 
-def run_conversation(
+def _bind_workflow_authority_for_turn(
+    agent,
+    *,
+    original_user_message: Any,
+    turn_id: str,
+    current_turn_user_idx: int,
+    persist_user_display_kind: Optional[str],
+):
+    """Bind only a real foreground user turn; every other host fails closed."""
+
+    from gateway.session_context import get_session_env
+    from tools.workflow_authority import (
+        _bind_host_current_turn_user_authority,
+        clear_current_turn_user_authority,
+    )
+
+    surface = (
+        get_session_env("HERMES_SESSION_PLATFORM", "").strip().casefold()
+        or get_session_env("HERMES_SESSION_SOURCE", "").strip().casefold()
+        or str(getattr(agent, "platform", "") or "").strip().casefold()
+    )
+    try:
+        from agent.delegation_context import is_delegated_child_context
+
+        delegated_child = bool(is_delegated_child_context())
+    except Exception:
+        delegated_child = True
+    session_scope = str(getattr(agent, "session_id", "") or "")
+    internal_agent = bool(
+        getattr(agent, "_skip_mcp_refresh", False)
+        or getattr(agent, "_memory_write_origin", "") == "background_review"
+        or session_scope.startswith(("bg_", "preview_"))
+    )
+    if (
+        persist_user_display_kind is not None
+        or type(original_user_message) is not str
+        or not original_user_message
+        or not surface
+        or delegated_child
+        or internal_agent
+        or get_session_env("HERMES_CRON_SESSION", "") == "1"
+    ):
+        clear_current_turn_user_authority()
+        return None
+    try:
+        return _bind_host_current_turn_user_authority(
+            original_user_message,
+            turn_id=turn_id,
+            session_scope=session_scope,
+            platform_scope=surface,
+            user_message_index=current_turn_user_idx,
+        )
+    except (TypeError, ValueError):
+        clear_current_turn_user_authority()
+        return None
+
+
+def _run_conversation_inner(
     agent,
     user_message: Any,
     system_message: str = None,
@@ -1823,6 +1880,17 @@ def run_conversation(
     _should_review_memory = _ctx.should_review_memory
     _plugin_user_context = _ctx.plugin_user_context
     _ext_prefetch_cache = _ctx.ext_prefetch_cache
+
+    # Bind workflow authority only after the canonical current user turn has
+    # been built. Synthetic timeline turns, cron, API, delegated children and
+    # other non-foreground surfaces remain unbound/default-off.
+    _bind_workflow_authority_for_turn(
+        agent,
+        original_user_message=original_user_message,
+        turn_id=turn_id,
+        current_turn_user_idx=current_turn_user_idx,
+        persist_user_display_kind=persist_user_display_kind,
+    )
 
     # Commentary deduplication spans all provider continuations and tool calls
     # within one user turn, but must not suppress the same phrase next turn.
@@ -8260,6 +8328,42 @@ def run_conversation(
         _pending_verification_response_previewed=_pending_verification_response_previewed,
     )
 
+
+
+def run_conversation(
+    agent,
+    user_message: Any,
+    system_message: str = None,
+    conversation_history: List[Dict[str, Any]] = None,
+    task_id: str = None,
+    stream_callback: Optional[callable] = None,
+    persist_user_message: Optional[Any] = None,
+    persist_user_timestamp: Optional[float] = None,
+    persist_user_display_kind: Optional[str] = None,
+    persist_user_display_metadata: Optional[Dict[str, Any]] = None,
+    moa_config: Optional[dict[str, Any]] = None,
+) -> Dict[str, Any]:
+    """Run one turn and always revoke its private workflow authority."""
+
+    from tools.workflow_authority import clear_current_turn_user_authority
+
+    clear_current_turn_user_authority()
+    try:
+        return _run_conversation_inner(
+            agent,
+            user_message,
+            system_message=system_message,
+            conversation_history=conversation_history,
+            task_id=task_id,
+            stream_callback=stream_callback,
+            persist_user_message=persist_user_message,
+            persist_user_timestamp=persist_user_timestamp,
+            persist_user_display_kind=persist_user_display_kind,
+            persist_user_display_metadata=persist_user_display_metadata,
+            moa_config=moa_config,
+        )
+    finally:
+        clear_current_turn_user_authority()
 
 
 __all__ = ["run_conversation"]

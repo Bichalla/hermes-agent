@@ -103,6 +103,19 @@ _SESSION_MESSAGE_ID: ContextVar = ContextVar("HERMES_SESSION_MESSAGE_ID", defaul
 
 _SESSION_PROFILE: ContextVar = ContextVar("HERMES_SESSION_PROFILE", default=_UNSET)
 
+# Private turn-local host values. Unlike HERMES_SESSION_* routing metadata,
+# trusted user text must never fall back to or be mirrored through os.environ.
+# It is bound only by the conversation prologue after a foreground user turn
+# has been accepted and is cleared in the same finally boundary as authority.
+_TRUSTED_CURRENT_USER_TEXT: ContextVar[str | None] = ContextVar(
+    "HERMES_TRUSTED_CURRENT_USER_TEXT",
+    default=None,
+)
+_SESSION_CONTROLLER_ROLE: ContextVar[str] = ContextVar(
+    "HERMES_SESSION_CONTROLLER_ROLE",
+    default="",
+)
+
 # Per-session cron marker. Unlike the process-global legacy env var, this is
 # scoped to one cron job / inbound session. _UNSET preserves the legacy env
 # fallback for CLI/tests; "1" marks cron; "" explicitly marks non-cron and
@@ -273,6 +286,8 @@ def set_session_vars(
         _SESSION_UI_SESSION_ID.set(ui_session_id),
         _SESSION_MESSAGE_ID.set(message_id),
         _SESSION_PROFILE.set(profile),
+        _TRUSTED_CURRENT_USER_TEXT.set(None),
+        _SESSION_CONTROLLER_ROLE.set(""),
         _CRON_SESSION.set(cron_session),
         _SESSION_ASYNC_DELIVERY.set(bool(async_delivery)),
     ]
@@ -312,6 +327,8 @@ def clear_session_vars(tokens: list) -> None:
         _SESSION_UI_SESSION_ID,
         _SESSION_MESSAGE_ID,
         _SESSION_PROFILE,
+        _TRUSTED_CURRENT_USER_TEXT,
+        _SESSION_CONTROLLER_ROLE,
         _CRON_SESSION,
     ):
         var.set("")
@@ -364,6 +381,8 @@ def reset_session_vars() -> None:
     """
     for var in _VAR_MAP.values():
         var.set(_UNSET)
+    _TRUSTED_CURRENT_USER_TEXT.set(None)
+    _SESSION_CONTROLLER_ROLE.set("")
     # Reset the async-delivery capability to "never bound here" (_UNSET) for the
     # same inheritance-leak reason as the mapped vars above — see clear_session_vars,
     # which resets this var on the handler-exit path for the symmetric concern.
@@ -400,6 +419,40 @@ def get_session_env(name: str, default: str = "") -> str:
             return value
     # Fall back to os.environ for CLI, cron, and test compatibility
     return os.getenv(name, default)
+
+
+def _bind_trusted_current_user_context(
+    user_text: str,
+    *,
+    controller_role: str,
+) -> None:
+    """Bind private host values after the conversation prologue accepts a turn."""
+
+    if type(user_text) is not str or not user_text:
+        raise ValueError("trusted_user_text_invalid")
+    if controller_role != "main_controller":
+        raise ValueError("controller_role_invalid")
+    _TRUSTED_CURRENT_USER_TEXT.set(user_text)
+    _SESSION_CONTROLLER_ROLE.set(controller_role)
+
+
+def _clear_trusted_current_user_context() -> None:
+    _TRUSTED_CURRENT_USER_TEXT.set(None)
+    _SESSION_CONTROLLER_ROLE.set("")
+
+
+def get_trusted_current_user_text() -> str | None:
+    """Return exact current foreground user text only inside its host turn."""
+
+    value = _TRUSTED_CURRENT_USER_TEXT.get()
+    return value if type(value) is str and value else None
+
+
+def get_session_controller_role() -> str:
+    """Return the host-bound controller role; empty means no authority."""
+
+    value = _SESSION_CONTROLLER_ROLE.get()
+    return value if type(value) is str else ""
 
 
 # Surfaces that are not a human chat channel. The gateway binds a platform

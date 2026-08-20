@@ -47,6 +47,7 @@ from hermes_cli.change_gate_runtime import (
     ChangeGateRuntimePolicy,
     REVIEW_METADATA_KEY,
     build_review_result_metadata,
+    count_change_gate_corrections,
     load_task_gate_artifacts,
     project_upstream_reviews,
 )
@@ -1168,6 +1169,107 @@ def test_high_risk_review_projection_requires_normal_then_deep_passes(
         final_task = kb.get_task(conn, task_id)
         assert final_task is not None
         assert final_task.status == "done"
+        g4_state = kb.change_gate_release_state(conn, g4_release.release_id)
+        assert g4_state is not None
+        assert g4_state["state"] == "CONSUMED"
+
+
+def test_bounded_correction_reaches_latest_pass_and_atomic_g4(
+    tmp_path: Path,
+    isolated_home: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    db_path = tmp_path / "kanban.db"
+    monkeypatch.setenv("HERMES_KANBAN_DB", str(db_path))
+    with _connect(db_path) as conn:
+        task_id = _create_ready_task(conn)
+        fixture = _attach_runtime_artifacts(
+            conn,
+            tmp_path,
+            task_id,
+            dirty_tracked=True,
+        )
+        _enable_runtime(monkeypatch, tmp_path / "inventory")
+
+        def issue(purpose: ReleasePurpose, turn: str):
+            statement = expected_release_statement(
+                purpose=purpose,
+                handoff_sha256=fixture.handoff_sha256,
+            )
+            with _scoped_test_current_turn_user_authority(
+                statement,
+                session_id="synthetic-change-gate-correction",
+                turn_id=turn,
+                platform_scope="manual",
+            ):
+                return issue_change_gate_release(
+                    task_id=task_id,
+                    purpose=purpose.value,
+                )
+
+        first_claim_release = issue(ReleasePurpose.CLAIM, "correction-claim-1")
+        assert first_claim_release.ok, first_claim_release.reason
+        first_executor = kb.claim_task(conn, task_id)
+        assert first_executor is not None and first_executor.current_run_id is not None
+        assert kb.request_review(
+            conn,
+            task_id,
+            expected_run_id=int(first_executor.current_run_id),
+        )
+
+        first_reviewer = kb.claim_review_task(conn, task_id)
+        assert first_reviewer is not None and first_reviewer.current_run_id is not None
+        changed, implementer = kb.request_changes(
+            conn,
+            task_id,
+            reason="bounded correction required",
+            expected_run_id=int(first_reviewer.current_run_id),
+            change_gate_review={
+                "reviewer_class": ReviewerClass.REVIEWER.value,
+                "verdict": ReviewVerdict.REQUEST_CHANGES.value,
+                "finding_codes": ["bounded-correction"],
+            },
+        )
+        assert changed and implementer == "executor"
+        assert count_change_gate_corrections(conn, task_id) == 1
+
+        second_claim_release = issue(ReleasePurpose.CLAIM, "correction-claim-2")
+        assert second_claim_release.ok, second_claim_release.reason
+        second_executor = kb.claim_task(conn, task_id)
+        assert second_executor is not None and second_executor.current_run_id is not None
+        assert kb.request_review(
+            conn,
+            task_id,
+            expected_run_id=int(second_executor.current_run_id),
+        )
+
+        second_reviewer = kb.claim_review_task(conn, task_id)
+        assert second_reviewer is not None and second_reviewer.current_run_id is not None
+        assert kb.request_review(
+            conn,
+            task_id,
+            expected_run_id=int(second_reviewer.current_run_id),
+            change_gate_review={
+                "reviewer_class": ReviewerClass.REVIEWER.value,
+                "verdict": ReviewVerdict.PASS.value,
+                "finding_codes": [],
+            },
+        )
+
+        handoff = _handoff(fixture)
+        projection = project_upstream_reviews(conn, task_id, handoff=handoff)
+        assert projection.ok
+        assert len(projection.reviews) == 1
+        assert projection.reviews[0].attempt_id == str(second_reviewer.current_run_id)
+        assert projection.reviews[0].verdict is ReviewVerdict.PASS
+        assert count_change_gate_corrections(conn, task_id) == 1
+
+        g4_release = issue(ReleasePurpose.G4, "correction-g4")
+        assert g4_release.ok, g4_release.reason
+        assert g4_release.release_id is not None
+        assert kb.complete_task(conn, task_id, result="bounded correction complete")
+        final_task = kb.get_task(conn, task_id)
+        assert final_task is not None and final_task.status == "done"
         g4_state = kb.change_gate_release_state(conn, g4_release.release_id)
         assert g4_state is not None
         assert g4_state["state"] == "CONSUMED"

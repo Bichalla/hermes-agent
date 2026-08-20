@@ -442,10 +442,21 @@ def evaluate_review_claim_runtime(
             ChangeGateReason.REVIEW_CONVERGED_AWAITING_G4,
             artifacts,
         )
-    if aggregate.reason is not ChangeGateReason.REVIEW_MISSING_REQUIRED_CLASS:
+    if aggregate.reason not in {
+        ChangeGateReason.REVIEW_MISSING_REQUIRED_CLASS,
+        ChangeGateReason.REVIEW_REQUEST_CHANGES,
+    }:
         return ReviewClaimEvaluation(True, False, aggregate.reason, artifacts)
 
-    completed = {review.reviewer_class for review in projection.reviews}
+    # A bounded correction keeps the frozen bundle and its older result
+    # history.  Only a current PASS satisfies a reviewer slot; the latest
+    # REQUEST_CHANGES result leaves that exact class eligible for a fresh
+    # upstream review attempt.  REPLAN_REQUIRED remains denied above.
+    completed = {
+        review.reviewer_class
+        for review in projection.reviews
+        if review.verdict is ReviewVerdict.PASS
+    }
     next_routes = tuple(
         route
         for route in artifacts.handoff.route.reviews

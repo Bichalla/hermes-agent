@@ -89,6 +89,16 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Iterable, Mapping, Optional
 
+from hermes_cli.change_gate import (
+    ChangeGateAdapter,
+    ChangeGateReason,
+    ChangeGateRequest,
+    ChangeGateResult,
+    GateDecision,
+    GatePhase,
+    ReleasePurpose,
+    UpstreamRouteSelector,
+)
 from hermes_cli.sqlite_util import add_column_if_missing as _add_column_if_missing
 from toolsets import get_toolset_names
 
@@ -4614,12 +4624,66 @@ def _parents_satisfied(conn: sqlite3.Connection, task_id: str) -> bool:
     ).fetchone() is None
 
 
+def _evaluate_change_gate_claim(
+    conn: sqlite3.Connection,
+    task_id: str,
+    adapter: ChangeGateAdapter,
+    request: ChangeGateRequest | None,
+) -> ChangeGateResult:
+    """Return a bounded Change Gate decision before any claim mutation."""
+
+    try:
+        if type(adapter) is not ChangeGateAdapter:
+            raise TypeError("change_gate_adapter_invalid")
+        if adapter.enabled is not True:
+            return adapter.evaluate(request)
+        if request is None or request.purpose is not ReleasePurpose.CLAIM:
+            return ChangeGateResult(
+                GateDecision.DENY,
+                ChangeGateReason.RELEASE_PURPOSE_UNSUPPORTED,
+                GatePhase.G2_CLAIM,
+            )
+        row = conn.execute(
+            "SELECT assignee, model_override, provider_override, reasoning_effort "
+            "FROM tasks WHERE id = ?",
+            (task_id,),
+        ).fetchone()
+        if row is None:
+            return ChangeGateResult(
+                GateDecision.DENY,
+                ChangeGateReason.TASK_ID_MISMATCH,
+                GatePhase.G2_CLAIM,
+            )
+
+        route = UpstreamRouteSelector(
+            assignee=row["assignee"],
+            model_override=row["model_override"],
+            provider_override=row["provider_override"],
+            reasoning_effort=row["reasoning_effort"],
+        )
+        return adapter.evaluate(
+            request,
+            actual_task_id=task_id,
+            actual_route=route,
+        )
+    except Exception:
+        # The optional authority boundary is fail-closed. It emits no event or
+        # task diagnostic, but still returns a bounded non-secret reason.
+        return ChangeGateResult(
+            GateDecision.DENY,
+            ChangeGateReason.EVIDENCE_MALFORMED,
+            GatePhase.G0_EVIDENCE,
+        )
+
+
 def claim_task(
     conn: sqlite3.Connection,
     task_id: str,
     *,
     ttl_seconds: Optional[int] = None,
     claimer: Optional[str] = None,
+    change_gate_adapter: ChangeGateAdapter | None = None,
+    change_gate_request: ChangeGateRequest | None = None,
 ) -> Optional[Task]:
     """Atomically transition ``ready -> running``.
 
@@ -4630,6 +4694,16 @@ def claim_task(
     lock = claimer or _claimer_id()
     expires = now + _resolve_claim_ttl_seconds(ttl_seconds)
     with write_txn(conn):
+        if change_gate_adapter is not None:
+            gate_result = _evaluate_change_gate_claim(
+                conn,
+                task_id,
+                change_gate_adapter,
+                change_gate_request,
+            )
+            if not gate_result.allowed:
+                return None
+
         # Structural invariant: never transition ready -> running while any
         # parent is not yet 'done'. This is the single enforcement point
         # regardless of which writer (create_task, link_tasks, unblock_task,

@@ -4555,7 +4555,7 @@ def _change_gate_request_from_release(
         release,
         evidence=evidence,
         handoff=handoff,
-        reviews=reviews,
+        reviews=tuple(reviews),
     )
 
 
@@ -5243,7 +5243,7 @@ def evaluate_change_gate_g4_runtime(
                 GateDecision.DENY,
                 projection.reason,
                 GatePhase.G3_REVIEW,
-                route=load.artifacts.actual_route,
+                route=load.artifacts.handoff.route,
                 required_reviewers=(
                     load.artifacts.handoff.route.required_reviewers
                 ),

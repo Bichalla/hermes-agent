@@ -7,7 +7,7 @@ import json
 from dataclasses import dataclass
 from enum import StrEnum
 from pathlib import Path, PurePosixPath
-from typing import Any, Final, Literal, TypeAlias
+from typing import Any, Final, Literal, TypeAlias, cast
 
 from hermes_cli.change_gate import (
     ARCHITECTURE_INVENTORY_SCHEMA,
@@ -584,7 +584,7 @@ _HANDOFF_KEYS: Final[set[str]] = {
 def _object(value: object, expected_keys: set[str]) -> dict[str, Any]:
     if type(value) is not dict:
         raise _CodecError(ArtifactCodecReason.TYPE_INVALID)
-    return _closed(value, expected_keys)
+    return _closed(cast(dict[str, Any], value), expected_keys)
 
 
 def _closed(value: dict[str, Any], expected_keys: set[str]) -> dict[str, Any]:

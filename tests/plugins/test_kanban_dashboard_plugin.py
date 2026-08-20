@@ -225,6 +225,48 @@ def test_task_detail_includes_links_and_events(client):
 # ---------------------------------------------------------------------------
 
 
+def test_patch_done_and_review_forward_resolved_board(client, monkeypatch):
+    kb.create_board("gated-board")
+    kb.create_board("other-board")
+    kb.set_current_board("other-board")
+    calls: list[tuple[str, str | None]] = []
+    original_complete_task = kb.complete_task
+    original_request_review = kb.request_review
+
+    def complete_spy(conn, task_id, *args, **kwargs):
+        calls.append(("done", kwargs.get("board")))
+        return original_complete_task(conn, task_id, *args, **kwargs)
+
+    def review_spy(conn, task_id, *args, **kwargs):
+        calls.append(("review", kwargs.get("board")))
+        return original_request_review(conn, task_id, *args, **kwargs)
+
+    monkeypatch.setattr(kb, "complete_task", complete_spy)
+    monkeypatch.setattr(kb, "request_review", review_spy)
+
+    done_task = client.post(
+        "/api/plugins/kanban/tasks?board=gated-board",
+        json={"title": "done on gated board"},
+    ).json()["task"]
+    review_task = client.post(
+        "/api/plugins/kanban/tasks?board=gated-board",
+        json={"title": "review on gated board", "assignee": "builder"},
+    ).json()["task"]
+
+    done_response = client.patch(
+        f"/api/plugins/kanban/tasks/{done_task['id']}?board=gated-board",
+        json={"status": "done", "summary": "finished"},
+    )
+    review_response = client.patch(
+        f"/api/plugins/kanban/tasks/{review_task['id']}?board=gated-board",
+        json={"status": "review", "assignee": "reviewer", "summary": "ready"},
+    )
+
+    assert done_response.status_code == 200, done_response.text
+    assert review_response.status_code == 200, review_response.text
+    assert calls == [("done", "gated-board"), ("review", "gated-board")]
+
+
 def test_patch_review_lifecycle_preserves_handoff_and_reopens(client):
     secret = "ghp_" + "D" * 40
     task = client.post(
@@ -653,6 +695,70 @@ def test_bulk_review_assignment_preserves_implementer_provenance(client):
             assert event.payload is not None
             assert event.payload["implementer"] == "builder"
             assert event.payload["reviewer"] == "reviewer"
+
+
+def test_bulk_done_and_review_forward_resolved_board(client, monkeypatch):
+    kb.create_board("gated-board")
+    kb.create_board("other-board")
+    kb.set_current_board("other-board")
+    calls: list[tuple[str, str | None]] = []
+    original_complete_task = kb.complete_task
+    original_request_review = kb.request_review
+
+    def complete_spy(conn, task_id, *args, **kwargs):
+        calls.append(("done", kwargs.get("board")))
+        return original_complete_task(conn, task_id, *args, **kwargs)
+
+    def review_spy(conn, task_id, *args, **kwargs):
+        calls.append(("review", kwargs.get("board")))
+        return original_request_review(conn, task_id, *args, **kwargs)
+
+    monkeypatch.setattr(kb, "complete_task", complete_spy)
+    monkeypatch.setattr(kb, "request_review", review_spy)
+
+    done_tasks = [
+        client.post(
+            "/api/plugins/kanban/tasks?board=gated-board",
+            json={"title": f"done {idx}"},
+        ).json()["task"]
+        for idx in range(2)
+    ]
+    review_tasks = [
+        client.post(
+            "/api/plugins/kanban/tasks?board=gated-board",
+            json={"title": f"review {idx}", "assignee": "builder"},
+        ).json()["task"]
+        for idx in range(2)
+    ]
+
+    done_response = client.post(
+        "/api/plugins/kanban/tasks/bulk?board=gated-board",
+        json={
+            "ids": [task["id"] for task in done_tasks],
+            "status": "done",
+            "summary": "finished",
+        },
+    )
+    review_response = client.post(
+        "/api/plugins/kanban/tasks/bulk?board=gated-board",
+        json={
+            "ids": [task["id"] for task in review_tasks],
+            "status": "review",
+            "assignee": "reviewer",
+            "summary": "ready",
+        },
+    )
+
+    assert done_response.status_code == 200, done_response.text
+    assert review_response.status_code == 200, review_response.text
+    assert all(item["ok"] for item in done_response.json()["results"])
+    assert all(item["ok"] for item in review_response.json()["results"])
+    assert calls == [
+        ("done", "gated-board"),
+        ("done", "gated-board"),
+        ("review", "gated-board"),
+        ("review", "gated-board"),
+    ]
 
 
 def test_bulk_status_done_forwards_completion_summary(client):
@@ -1228,5 +1334,4 @@ def test_specify_happy_path(client, monkeypatch):
 # ---------------------------------------------------------------------------
 # Final result visibility for Done cards
 # ---------------------------------------------------------------------------
-
 

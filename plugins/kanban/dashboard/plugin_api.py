@@ -902,6 +902,7 @@ def update_task(task_id: str, payload: UpdateTaskBody, board: Optional[str] = Qu
                     result=payload.result,
                     summary=payload.summary,
                     metadata=payload.metadata,
+                    board=board,
                 )
             elif s == "blocked":
                 ok = kanban_db.block_task(conn, task_id, reason=payload.block_reason)
@@ -919,6 +920,7 @@ def update_task(task_id: str, payload: UpdateTaskBody, board: Optional[str] = Qu
                     # Dashboard PATCH is an explicit human action — allowed
                     # to override a live worker claim (M1 guard).
                     force=True,
+                    board=board,
                 )
                 if ok and review_assignee_deferred and not payload.assignee:
                     ok = kanban_db.assign_task(conn, task_id, None)
@@ -1346,6 +1348,7 @@ def bulk_update(payload: BulkTaskBody, board: Optional[str] = Query(None)):
                             result=payload.result,
                             summary=payload.summary,
                             metadata=payload.metadata,
+                            board=board,
                         )
                     elif s == "blocked":
                         ok = kanban_db.block_task(conn, tid)
@@ -1357,6 +1360,7 @@ def bulk_update(payload: BulkTaskBody, board: Optional[str] = Query(None)):
                             reviewer=(payload.assignee or None),
                             # Bulk dashboard action: explicit human override.
                             force=True,
+                            board=board,
                         )
                     elif s == "ready":
                         cur = kanban_db.get_task(conn, tid)

@@ -16,7 +16,7 @@ import sqlite3
 import subprocess
 from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
-from typing import Sequence
+from typing import Any, Sequence, cast
 
 from hermes_cli.change_gate import (
     ARCHITECTURE_INVENTORY_SCHEMA,
@@ -167,17 +167,21 @@ def runtime_policy_from_mapping(config: object) -> ChangeGateRuntimePolicy:
 
     if type(config) is not dict:
         return ChangeGateRuntimePolicy()
-    block = config.get("change_gate")
-    if type(block) is not dict or block.get("enabled") is not True:
+    config_data = cast(dict[str, object], config)
+    block = config_data.get("change_gate")
+    if type(block) is not dict:
         return ChangeGateRuntimePolicy()
-    if set(block) - _CONFIG_KEYS:
+    block_data = cast(dict[str, object], block)
+    if block_data.get("enabled") is not True:
+        return ChangeGateRuntimePolicy()
+    if set(block_data) - _CONFIG_KEYS:
         return ChangeGateRuntimePolicy(enabled=True, valid=False)
 
-    root_raw = block.get("inventory_root")
-    ttl = block.get("release_ttl_seconds", DEFAULT_RELEASE_TTL_SECONDS)
-    ungated = block.get("ungated_policy", "passthrough")
-    planner = block.get("planner_assignee", "planner")
-    max_corrections = block.get("max_corrections", DEFAULT_MAX_CORRECTIONS)
+    root_raw = block_data.get("inventory_root")
+    ttl = block_data.get("release_ttl_seconds", DEFAULT_RELEASE_TTL_SECONDS)
+    ungated = block_data.get("ungated_policy", "passthrough")
+    planner = block_data.get("planner_assignee", "planner")
+    max_corrections = block_data.get("max_corrections", DEFAULT_MAX_CORRECTIONS)
     if (
         type(root_raw) is not str
         or not root_raw.strip()
@@ -194,14 +198,19 @@ def runtime_policy_from_mapping(config: object) -> ChangeGateRuntimePolicy:
         or not 0 <= max_corrections <= 10
     ):
         return ChangeGateRuntimePolicy(enabled=True, valid=False)
+    root = root_raw
+    release_ttl_seconds = ttl
+    ungated_policy = cast(str, ungated)
+    planner_assignee = planner
+    correction_limit = max_corrections
     return ChangeGateRuntimePolicy(
         enabled=True,
         valid=True,
-        inventory_root=Path(root_raw),
-        release_ttl_seconds=ttl,
-        ungated_policy=ungated,
-        planner_assignee=planner,
-        max_corrections=max_corrections,
+        inventory_root=Path(root),
+        release_ttl_seconds=release_ttl_seconds,
+        ungated_policy=ungated_policy,
+        planner_assignee=planner_assignee,
+        max_corrections=correction_limit,
     )
 
 
@@ -460,17 +469,18 @@ def parse_review_submission(
         "finding_codes",
     }:
         return None
+    data = cast(dict[str, object], value)
     try:
-        reviewer_class = ReviewerClass(value["reviewer_class"])
-        verdict = ReviewVerdict(value["verdict"])
+        reviewer_class = ReviewerClass(data["reviewer_class"])
+        verdict = ReviewVerdict(data["verdict"])
     except (TypeError, ValueError):
         return None
-    raw_codes = value["finding_codes"]
+    raw_codes = data["finding_codes"]
     if type(raw_codes) is not list or len(raw_codes) > 32:
         return None
     if any(type(code) is not str or _FINDING_CODE_RE.fullmatch(code) is None for code in raw_codes):
         return None
-    finding_codes = tuple(raw_codes)
+    finding_codes = tuple(cast(list[str], raw_codes))
     allowed_verdicts = (
         expected_verdict
         if type(expected_verdict) is tuple
@@ -717,7 +727,9 @@ def read_current_source_identity(
     branch = _git_read(root, "symbolic-ref", "--quiet", "--short", "HEAD")
     remote = _git_read(root, "config", "--get", "remote.origin.url")
     repository = _normalize_repository(remote)
-    if None in {commit, tree, branch, repository} or repository != expected_repository:
+    if commit is None or tree is None or branch is None or repository is None:
+        return ChangeGateReason.SOURCE_READ_FAILED
+    if repository != expected_repository:
         return ChangeGateReason.SOURCE_READ_FAILED
     return SourceIdentity(repository=repository, branch=branch, commit=commit, tree=tree)
 
@@ -865,14 +877,21 @@ __all__ = [
     "FileArchitectureInventoryReader",
     "HANDOFF_ATTACHMENT_FILENAME",
     "REVIEW_METADATA_KEY",
+    "ReviewClaimEvaluation",
     "ReviewProjection",
+    "ReviewSubmission",
     "RuntimeEvaluation",
     "TaskGateArtifacts",
     "TaskGateLoad",
+    "build_current_review_result",
+    "build_review_claim_payload",
     "build_review_result_metadata",
+    "count_change_gate_corrections",
+    "evaluate_review_claim_runtime",
     "evaluate_loaded_runtime",
     "load_runtime_policy",
     "load_task_gate_artifacts",
+    "parse_review_submission",
     "project_upstream_reviews",
     "read_current_source_identity",
     "runtime_policy_from_mapping",

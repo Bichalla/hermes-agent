@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+from typing import Any, cast
 
 from hermes_cli.change_gate_release import ChangeGateReleaseIssueResult
 from hermes_cli.change_gate_runtime import ChangeGateRuntimePolicy
@@ -12,12 +13,16 @@ from toolsets import resolve_toolset
 
 
 def test_schema_exposes_only_task_and_purpose() -> None:
-    parameters = tool.CHANGE_GATE_RELEASE_SCHEMA["parameters"]
+    parameters = cast(
+        dict[str, Any],
+        tool.CHANGE_GATE_RELEASE_SCHEMA["parameters"],
+    )
+    properties = cast(dict[str, Any], parameters["properties"])
 
-    assert set(parameters["properties"]) == {"task_id", "purpose"}
+    assert set(properties) == {"task_id", "purpose"}
     assert parameters["required"] == ["task_id", "purpose"]
     assert parameters["additionalProperties"] is False
-    assert parameters["properties"]["purpose"]["enum"] == ["CLAIM", "G4"]
+    assert properties["purpose"]["enum"] == ["CLAIM", "G4"]
 
 
 def test_requirement_check_is_exact_true_default_off(monkeypatch) -> None:

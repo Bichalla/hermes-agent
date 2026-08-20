@@ -22,9 +22,11 @@ from hermes_cli.change_gate import (
     ChangeGateReason,
     DurableReleaseArtifact,
     EvidencePacket,
+    FrozenHandoff,
     GateDecision,
     HumanReleaseReceipt,
     ReleasePurpose,
+    ReviewResult,
     ReviewRoute,
     ReviewerClass,
     ReviewVerdict,
@@ -34,6 +36,7 @@ from hermes_cli.change_gate import (
     UpstreamRouteSelector,
     WorkIdentity,
     canonical_sha256,
+    evaluate_reviews,
     expected_release_statement,
     freeze_handoff,
 )
@@ -42,6 +45,7 @@ from hermes_cli.change_gate_release import issue_change_gate_release
 from hermes_cli.change_gate_runtime import (
     ChangeGateRuntimePolicy,
     REVIEW_METADATA_KEY,
+    build_review_result_metadata,
     project_upstream_reviews,
 )
 from tools.workflow_authority import (
@@ -141,6 +145,16 @@ def _artifact_set_sha256(handoff) -> str:
     )
 
 
+def _handoff(fixture: RuntimeFixture) -> FrozenHandoff:
+    return freeze_handoff(
+        fixture.evidence,
+        inventory=fixture.inventory,
+        inventory_consumer="change-gate-runtime-integration",
+        scope=("SOURCE_CHANGE",),
+        forbidden_effects=("LIVE_SERVICE_MUTATION",),
+    )
+
+
 def _release(
     fixture: RuntimeFixture,
     purpose: ReleasePurpose,
@@ -149,13 +163,7 @@ def _release(
     issued_at: int | None = None,
 ) -> DurableReleaseArtifact:
     now = int(time.time()) if issued_at is None else issued_at
-    handoff = freeze_handoff(
-        fixture.evidence,
-        inventory=fixture.inventory,
-        inventory_consumer="change-gate-runtime-integration",
-        scope=("SOURCE_CHANGE",),
-        forbidden_effects=("LIVE_SERVICE_MUTATION",),
-    )
+    handoff = _handoff(fixture)
     handoff_sha256 = handoff.digest()
     statement = expected_release_statement(purpose=purpose, handoff_sha256=handoff_sha256)
     receipt = HumanReleaseReceipt(
@@ -335,6 +343,38 @@ def _store_release(
     return kb._store_change_gate_release(conn, release)
 
 
+def _claim_and_converge_normal_review(
+    conn: sqlite3.Connection,
+    fixture: RuntimeFixture,
+    *,
+    claim_suffix: str,
+) -> int:
+    _store_release(conn, fixture, ReleasePurpose.CLAIM, claim_suffix)
+    claimed = kb.claim_task(conn, fixture.task_id)
+    assert claimed is not None
+    assert claimed.current_run_id is not None
+    assert kb.request_review(
+        conn,
+        fixture.task_id,
+        expected_run_id=int(claimed.current_run_id),
+    )
+    review = kb.claim_review_task(conn, fixture.task_id)
+    assert review is not None
+    assert review.current_run_id is not None
+    review_run_id = int(review.current_run_id)
+    assert kb.request_review(
+        conn,
+        fixture.task_id,
+        expected_run_id=review_run_id,
+        change_gate_review={
+            "reviewer_class": ReviewerClass.REVIEWER.value,
+            "verdict": ReviewVerdict.PASS.value,
+            "finding_codes": [],
+        },
+    )
+    return review_run_id
+
+
 def test_default_off_passthrough_does_not_create_runtime_table(
     tmp_path: Path,
     isolated_home: Path,
@@ -418,6 +458,67 @@ def test_enabled_dispatcher_denial_has_no_claim_event_or_spawn(
             (task_id, ChangeGateReason.RELEASE_MISSING.value)
         ]
         assert _snapshot(conn, task_id) == before
+
+
+def test_detached_dispatcher_consumes_valid_release_and_spawns_once(
+    tmp_path: Path,
+    isolated_home: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import hermes_cli.profiles as profiles
+
+    db_path = tmp_path / "kanban.db"
+    monkeypatch.setenv("HERMES_KANBAN_DB", str(db_path))
+    monkeypatch.setattr(profiles, "profile_exists", lambda _name: True)
+    with _connect(db_path) as conn:
+        task_id = _create_ready_task(conn)
+        fixture = _attach_runtime_artifacts(conn, tmp_path, task_id)
+        _enable_runtime(monkeypatch, tmp_path / "inventory")
+        statement = expected_release_statement(
+            purpose=ReleasePurpose.CLAIM,
+            handoff_sha256=fixture.handoff_sha256,
+        )
+        with _scoped_test_current_turn_user_authority(
+            statement,
+            session_id="detached-dispatch",
+            turn_id="foreground-release",
+            platform_scope="manual",
+        ):
+            issued = issue_change_gate_release(
+                task_id=task_id,
+                purpose=ReleasePurpose.CLAIM.value,
+        )
+        assert issued.ok, issued.reason
+        assert issued.release_id is not None
+
+        spawns: list[str] = []
+        result = kb.dispatch_once(
+            conn,
+            spawn_fn=lambda task, *_args, **_kwargs: (
+                spawns.append(task.id) or 4242
+            ),
+            reconcile_orphans=False,
+        )
+
+        assert spawns == [task_id]
+        assert [item[0] for item in result.spawned] == [task_id]
+        assert result.change_gate_denied == []
+        task = kb.get_task(conn, task_id)
+        assert task is not None
+        assert task.status == "running"
+        assert conn.execute(
+            "SELECT COUNT(*) FROM task_runs WHERE task_id = ?",
+            (task_id,),
+        ).fetchone()[0] == 1
+        assert conn.execute(
+            "SELECT COUNT(*) FROM task_events "
+            "WHERE task_id = ? AND kind = 'claimed'",
+            (task_id,),
+        ).fetchone()[0] == 1
+        state = kb.change_gate_release_state(conn, issued.release_id)
+        assert state is not None
+        assert state["state"] == "CONSUMED"
+        assert state["consumed_run_id"] == task.current_run_id
 
 
 def test_enabled_ungated_historical_task_uses_explicit_passthrough_policy(
@@ -576,6 +677,44 @@ def test_expired_claim_release_has_zero_domain_mutation(
         assert state["state"] == "ISSUED"
 
 
+def test_wrong_task_release_has_zero_domain_mutation(
+    tmp_path: Path,
+    isolated_home: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    with _connect(tmp_path / "kanban.db") as conn:
+        release_root = tmp_path / "release-task"
+        target_root = tmp_path / "target-task"
+        release_root.mkdir()
+        target_root.mkdir()
+        release_task_id = _create_ready_task(conn)
+        release_fixture = _attach_runtime_artifacts(
+            conn,
+            release_root,
+            release_task_id,
+        )
+        target_task_id = _create_ready_task(conn)
+        _attach_runtime_artifacts(
+            conn,
+            target_root,
+            target_task_id,
+        )
+        _enable_runtime(monkeypatch, target_root / "inventory")
+        release_id = _store_release(
+            conn,
+            release_fixture,
+            ReleasePurpose.CLAIM,
+            "4",
+        )
+        before = _snapshot(conn, target_task_id)
+
+        assert kb.claim_task(conn, target_task_id) is None
+        assert _snapshot(conn, target_task_id) == before
+        state = kb.change_gate_release_state(conn, release_id)
+        assert state is not None
+        assert state["state"] == "ISSUED"
+
+
 def test_g4_cannot_complete_without_release_and_consumes_release_once(
     tmp_path: Path,
     isolated_home: Path,
@@ -588,10 +727,12 @@ def test_g4_cannot_complete_without_release_and_consumes_release_once(
         _store_release(conn, fixture, ReleasePurpose.CLAIM, "b")
         claimed = kb.claim_task(conn, task_id)
         assert claimed is not None
+        assert claimed.current_run_id is not None
         run_id = int(claimed.current_run_id)
         assert kb.request_review(conn, task_id, expected_run_id=run_id)
         review = kb.claim_review_task(conn, task_id)
         assert review is not None
+        assert review.current_run_id is not None
         review_run_id = int(review.current_run_id)
         assert kb.request_review(
             conn,
@@ -625,6 +766,33 @@ def test_g4_cannot_complete_without_release_and_consumes_release_once(
         assert state is not None
         assert state["state"] == "CONSUMED"
         assert state["consumed_to_status"] == "done"
+
+
+def test_failed_g4_consumption_rolls_back_terminal_transition(
+    tmp_path: Path,
+    isolated_home: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    with _connect(tmp_path / "kanban.db") as conn:
+        task_id = _create_ready_task(conn)
+        fixture = _attach_runtime_artifacts(conn, tmp_path, task_id)
+        _enable_runtime(monkeypatch, tmp_path / "inventory")
+        _claim_and_converge_normal_review(conn, fixture, claim_suffix="5")
+        release_id = _store_release(conn, fixture, ReleasePurpose.G4, "d")
+        before = _snapshot(conn, task_id)
+        monkeypatch.setattr(
+            kb,
+            "_mark_change_gate_release_consumed",
+            lambda *_args, **_kwargs: False,
+        )
+
+        assert kb.complete_task(conn, task_id, result="must roll back") is False
+        assert _snapshot(conn, task_id) == before
+        state = kb.change_gate_release_state(conn, release_id)
+        assert state is not None
+        assert state["state"] == "ISSUED"
+        assert state["consumed_run_id"] is None
+        assert state["consumed_event_id"] is None
 
 
 def test_high_risk_review_projection_requires_normal_then_deep_passes(
@@ -675,10 +843,12 @@ def test_high_risk_review_projection_requires_normal_then_deep_passes(
         # has been cleared: only the persisted short-lived release remains.
         claimed = kb.claim_task(conn, task_id)
         assert claimed is not None
+        assert claimed.current_run_id is not None
         assert kb.request_review(conn, task_id, expected_run_id=int(claimed.current_run_id))
 
         normal = kb.claim_review_task(conn, task_id)
         assert normal is not None
+        assert normal.current_run_id is not None
         assert normal.assignee == "reviewer-normal"
         assert kb.request_review(
             conn,
@@ -693,6 +863,7 @@ def test_high_risk_review_projection_requires_normal_then_deep_passes(
 
         deep = kb.claim_review_task(conn, task_id)
         assert deep is not None
+        assert deep.current_run_id is not None
         assert deep.assignee == "reviewer-deep"
         assert kb.request_review(
             conn,
@@ -711,13 +882,7 @@ def test_high_risk_review_projection_requires_normal_then_deep_passes(
         projection = project_upstream_reviews(
             conn,
             task_id,
-            handoff=freeze_handoff(
-                fixture.evidence,
-                inventory=fixture.inventory,
-                inventory_consumer="change-gate-runtime-integration",
-                scope=("SOURCE_CHANGE",),
-                forbidden_effects=("LIVE_SERVICE_MUTATION",),
-            ),
+            handoff=_handoff(fixture),
         )
         metadata_rows = conn.execute(
             "SELECT metadata FROM task_runs WHERE task_id = ? AND metadata IS NOT NULL",
@@ -742,6 +907,21 @@ def test_high_risk_review_projection_requires_normal_then_deep_passes(
             handoff_sha256=fixture.handoff_sha256,
         )
         with _scoped_test_current_turn_user_authority(
+            g4_statement + " trailing-text",
+            session_id="synthetic-change-gate",
+            turn_id="wrong-g4-release-turn",
+            platform_scope="manual",
+        ):
+            wrong_g4_statement = issue_change_gate_release(
+                task_id=task_id,
+                purpose=ReleasePurpose.G4.value,
+            )
+        assert not wrong_g4_statement.ok
+        assert (
+            wrong_g4_statement.reason
+            == ChangeGateReason.RELEASE_RECEIPT_MISSING.value
+        )
+        with _scoped_test_current_turn_user_authority(
             g4_statement,
             session_id="synthetic-change-gate",
             turn_id="g4-release-turn",
@@ -752,11 +932,177 @@ def test_high_risk_review_projection_requires_normal_then_deep_passes(
                 purpose=ReleasePurpose.G4.value,
             )
         assert g4_release.ok, g4_release.reason
+        assert g4_release.release_id is not None
         assert kb.complete_task(conn, task_id, result="synthetic E2E complete")
-        assert kb.get_task(conn, task_id).status == "done"
+        final_task = kb.get_task(conn, task_id)
+        assert final_task is not None
+        assert final_task.status == "done"
         g4_state = kb.change_gate_release_state(conn, g4_release.release_id)
         assert g4_state is not None
         assert g4_state["state"] == "CONSUMED"
+
+
+def test_runtime_projection_ignores_wrong_bundle_review(
+    tmp_path: Path,
+    isolated_home: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    with _connect(tmp_path / "kanban.db") as conn:
+        task_id = _create_ready_task(conn)
+        fixture = _attach_runtime_artifacts(conn, tmp_path, task_id)
+        _enable_runtime(monkeypatch, tmp_path / "inventory")
+        review_run_id = _claim_and_converge_normal_review(
+            conn,
+            fixture,
+            claim_suffix="1",
+        )
+        row = conn.execute(
+            "SELECT profile, ended_at FROM task_runs WHERE id = ?",
+            (review_run_id,),
+        ).fetchone()
+        assert row is not None
+        wrong_bundle = ReviewResult(
+            bundle_sha256="0" * 64,
+            reviewer_class=ReviewerClass.REVIEWER,
+            reviewer_identity=str(row["profile"]),
+            attempt_id=str(review_run_id),
+            verdict=ReviewVerdict.PASS,
+            finding_codes=(),
+            completed_at_epoch=int(row["ended_at"]),
+        )
+        conn.execute(
+            "UPDATE task_runs SET metadata = ? WHERE id = ?",
+            (
+                json.dumps(build_review_result_metadata(wrong_bundle)),
+                review_run_id,
+            ),
+        )
+        conn.commit()
+
+        handoff = _handoff(fixture)
+        projection = project_upstream_reviews(conn, task_id, handoff=handoff)
+        aggregate = evaluate_reviews(
+            projection.reviews,
+            bundle_sha256=handoff.review_bundle_sha256(),
+            required_reviewers=handoff.route.required_reviewers,
+        )
+
+        assert projection.ok
+        assert projection.reviews == ()
+        assert not aggregate.allowed
+        assert aggregate.reason is ChangeGateReason.REVIEW_MISSING_REQUIRED_CLASS
+
+
+def test_runtime_projection_rejects_malformed_current_review_metadata(
+    tmp_path: Path,
+    isolated_home: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    with _connect(tmp_path / "kanban.db") as conn:
+        task_id = _create_ready_task(conn)
+        fixture = _attach_runtime_artifacts(conn, tmp_path, task_id)
+        _enable_runtime(monkeypatch, tmp_path / "inventory")
+        review_run_id = _claim_and_converge_normal_review(
+            conn,
+            fixture,
+            claim_suffix="2",
+        )
+        conn.execute(
+            "UPDATE task_runs SET metadata = ? WHERE id = ?",
+            (json.dumps({REVIEW_METADATA_KEY: "{"}), review_run_id),
+        )
+        conn.commit()
+
+        projection = project_upstream_reviews(
+            conn,
+            task_id,
+            handoff=_handoff(fixture),
+        )
+
+        assert not projection.ok
+        assert projection.reviews == ()
+        assert projection.reason is ChangeGateReason.REVIEW_RESULT_MALFORMED
+
+
+def test_runtime_projection_duplicate_role_does_not_converge(
+    tmp_path: Path,
+    isolated_home: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    with _connect(tmp_path / "kanban.db") as conn:
+        task_id = _create_ready_task(conn)
+        fixture = _attach_runtime_artifacts(conn, tmp_path, task_id)
+        _enable_runtime(monkeypatch, tmp_path / "inventory")
+        review_run_id = _claim_and_converge_normal_review(
+            conn,
+            fixture,
+            claim_suffix="3",
+        )
+        original = conn.execute(
+            "SELECT profile, ended_at FROM task_runs WHERE id = ?",
+            (review_run_id,),
+        ).fetchone()
+        claimed = conn.execute(
+            "SELECT payload FROM task_events "
+            "WHERE task_id = ? AND run_id = ? AND kind = 'claimed'",
+            (task_id, review_run_id),
+        ).fetchone()
+        assert original is not None
+        assert claimed is not None
+        duplicate_end = int(original["ended_at"]) + 1
+        cursor = conn.execute(
+            "INSERT INTO task_runs "
+            "(task_id, profile, status, started_at, ended_at, outcome) "
+            "VALUES (?, ?, 'review_requested', ?, ?, 'review_requested')",
+            (
+                task_id,
+                original["profile"],
+                duplicate_end - 1,
+                duplicate_end,
+            ),
+        )
+        assert cursor.lastrowid is not None
+        duplicate_run_id = int(cursor.lastrowid)
+        duplicate = ReviewResult(
+            bundle_sha256=_handoff(fixture).review_bundle_sha256(),
+            reviewer_class=ReviewerClass.REVIEWER,
+            reviewer_identity=str(original["profile"]),
+            attempt_id=str(duplicate_run_id),
+            verdict=ReviewVerdict.PASS,
+            finding_codes=(),
+            completed_at_epoch=duplicate_end,
+        )
+        conn.execute(
+            "UPDATE task_runs SET metadata = ? WHERE id = ?",
+            (
+                json.dumps(build_review_result_metadata(duplicate)),
+                duplicate_run_id,
+            ),
+        )
+        conn.execute(
+            "INSERT INTO task_events (task_id, run_id, kind, payload, created_at) "
+            "VALUES (?, ?, 'claimed', ?, ?)",
+            (task_id, duplicate_run_id, claimed["payload"], duplicate_end - 1),
+        )
+        conn.execute(
+            "INSERT INTO task_events (task_id, run_id, kind, payload, created_at) "
+            "VALUES (?, ?, 'review_requested', '{}', ?)",
+            (task_id, duplicate_run_id, duplicate_end),
+        )
+        conn.commit()
+
+        handoff = _handoff(fixture)
+        projection = project_upstream_reviews(conn, task_id, handoff=handoff)
+        aggregate = evaluate_reviews(
+            projection.reviews,
+            bundle_sha256=handoff.review_bundle_sha256(),
+            required_reviewers=handoff.route.required_reviewers,
+        )
+
+        assert projection.ok
+        assert len(projection.reviews) == 2
+        assert not aggregate.allowed
+        assert aggregate.reason is ChangeGateReason.REVIEW_DUPLICATE_CLASS
 
 
 @pytest.mark.parametrize(
@@ -793,6 +1139,7 @@ def test_review_consequence_routes_one_bounded_planner_parent(
         _store_release(conn, fixture, ReleasePurpose.CLAIM, "e")
         claimed = kb.claim_task(conn, task_id)
         assert claimed is not None
+        assert claimed.current_run_id is not None
         assert kb.request_review(
             conn,
             task_id,
@@ -800,6 +1147,7 @@ def test_review_consequence_routes_one_bounded_planner_parent(
         )
         reviewer = kb.claim_review_task(conn, task_id)
         assert reviewer is not None
+        assert reviewer.current_run_id is not None
         issued_g4 = _store_release(conn, fixture, ReleasePurpose.G4, "f")
 
         ok, implementer = kb.request_changes(

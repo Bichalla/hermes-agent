@@ -294,6 +294,87 @@ def test_g4_release_is_denied_after_review_reopen(
         assert state["state"] == "ISSUED"
 
 
+def test_g4_release_is_stale_after_route_drift(
+    tmp_path: Path,
+    isolated_home: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    db_path = tmp_path / "g4-route-drift.db"
+    monkeypatch.setenv("HERMES_KANBAN_DB", str(db_path))
+    with _connect(db_path) as conn:
+        fixture = _setup_enabled_task(conn, tmp_path, monkeypatch)
+        _claim_and_converge_normal_review(conn, fixture, claim_suffix="2")
+        release_id = _issue_foreground_release(
+            fixture.task_id,
+            fixture,
+            ReleasePurpose.G4,
+            turn_id="g4-before-route-drift",
+        )
+
+        assert kb.set_model_override(
+            conn,
+            fixture.task_id,
+            "other-model",
+            "other-provider",
+        )
+        evaluation = kb.evaluate_change_gate_g4_runtime(conn, fixture.task_id)
+        completed = kb.complete_task(conn, fixture.task_id, result="must not complete")
+        state = kb.change_gate_release_state(conn, release_id)
+
+        assert evaluation.result.reason is ChangeGateReason.RELEASE_TRANSITION_STALE
+        assert completed is False
+        assert state is not None and state["state"] == "ISSUED"
+
+
+def test_g4_release_is_stale_during_reopened_run_and_after_review_status_restore(
+    tmp_path: Path,
+    isolated_home: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import hermes_cli.profiles as profiles
+
+    db_path = tmp_path / "g4-current-run-and-restored-status.db"
+    monkeypatch.setenv("HERMES_KANBAN_DB", str(db_path))
+    monkeypatch.setattr(profiles, "profile_exists", lambda _name: True)
+    with _connect(db_path) as conn:
+        fixture = _setup_enabled_task(conn, tmp_path, monkeypatch)
+        _claim_and_converge_normal_review(conn, fixture, claim_suffix="3")
+        g4_release_id = _issue_foreground_release(
+            fixture.task_id,
+            fixture,
+            ReleasePurpose.G4,
+            turn_id="g4-before-current-run-drift",
+        )
+
+        assert kb.reopen_review_task(conn, fixture.task_id)
+        _issue_foreground_release(
+            fixture.task_id,
+            fixture,
+            ReleasePurpose.CLAIM,
+            turn_id="claim-after-g4-reopen",
+        )
+        executor = kb.claim_task(conn, fixture.task_id)
+        assert executor is not None and executor.current_run_id is not None
+
+        while_running = kb.evaluate_change_gate_g4_runtime(conn, fixture.task_id)
+        assert while_running.result.reason is ChangeGateReason.RELEASE_TRANSITION_STALE
+        assert kb.request_review(
+            conn,
+            fixture.task_id,
+            expected_run_id=int(executor.current_run_id),
+        )
+        restored = kb.get_task(conn, fixture.task_id)
+        assert restored is not None and restored.status == "review"
+
+        after_restore = kb.evaluate_change_gate_g4_runtime(conn, fixture.task_id)
+        completed = kb.complete_task(conn, fixture.task_id, result="must not complete")
+        g4_state = kb.change_gate_release_state(conn, g4_release_id)
+
+        assert after_restore.result.reason is ChangeGateReason.RELEASE_TRANSITION_STALE
+        assert completed is False
+        assert g4_state is not None and g4_state["state"] == "ISSUED"
+
+
 def test_fake_caller_supplied_anchor_cannot_persist_foreground_release(
     tmp_path: Path,
     isolated_home: Path,

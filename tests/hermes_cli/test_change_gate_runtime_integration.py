@@ -370,6 +370,30 @@ def test_enabled_claim_without_release_has_zero_domain_mutation(
         assert _snapshot(conn, task_id) == before
 
 
+def test_manual_force_review_cannot_impersonate_claim_release(
+    tmp_path: Path,
+    isolated_home: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    with _connect(tmp_path / "kanban.db") as conn:
+        task_id = _create_ready_task(conn)
+        _attach_runtime_artifacts(conn, tmp_path, task_id)
+        _enable_runtime(monkeypatch, tmp_path / "inventory")
+        before = _snapshot(conn, task_id)
+
+        ok, reason = kb.request_review(
+            conn,
+            task_id,
+            summary="manual force must not become authority",
+            force=True,
+            with_reason=True,
+        )
+
+        assert ok is False
+        assert reason == "change_gate_review_run_binding_required"
+        assert _snapshot(conn, task_id) == before
+
+
 def test_enabled_dispatcher_denial_has_no_claim_event_or_spawn(
     tmp_path: Path,
     isolated_home: Path,

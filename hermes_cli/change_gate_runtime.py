@@ -14,6 +14,7 @@ import json
 import re
 import sqlite3
 import subprocess
+import threading
 from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
 from typing import Any, Sequence, cast
@@ -63,6 +64,7 @@ DEFAULT_MAX_CORRECTIONS = 1
 _MAX_GIT_OUTPUT_BYTES = 4096
 _INVENTORY_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$")
 _FINDING_CODE_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,79}$")
+_GIT_OID_RE = re.compile(r"^[0-9a-f]{40,64}$")
 _CONFIG_KEYS = frozenset(
     {
         "enabled",
@@ -93,6 +95,7 @@ class TaskGateArtifacts:
     inventory: ArchitectureInventoryRecord
     actual_source: SourceIdentity
     actual_route: UpstreamRouteSelector
+    workspace_observation: WorkspaceObservation
     evidence_attachment_sha256: str
     handoff_attachment_sha256: str
 
@@ -124,6 +127,21 @@ class RuntimeEvaluation:
     result: ChangeGateResult
     artifacts: TaskGateArtifacts | None = None
     release: DurableReleaseArtifact | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class WorkspaceChangedPath:
+    path: str
+    staged: bool
+    unstaged: bool
+    untracked: bool
+
+
+@dataclass(frozen=True, slots=True)
+class WorkspaceObservation:
+    reason: ChangeGateReason = ChangeGateReason.ALLOWED
+    changed_paths: tuple[str, ...] = ()
+    changes: tuple[WorkspaceChangedPath, ...] = ()
 
 
 @dataclass(frozen=True, slots=True)
@@ -297,27 +315,43 @@ def load_task_gate_artifacts(
     except Exception:
         return TaskGateLoad(True, ChangeGateReason.ROUTE_PROJECTION_MISMATCH)
 
-    source_result = read_current_source_identity(task_row["workspace_path"], evidence.source.repository)
+    workspace_path = task_row["workspace_path"]
+    source_result = read_current_source_identity(workspace_path, evidence.source.repository)
     if isinstance(source_result, ChangeGateReason):
         return TaskGateLoad(True, source_result)
+    try:
+        source_root = Path(str(workspace_path)).resolve(strict=True)
+    except OSError:
+        return TaskGateLoad(True, ChangeGateReason.SOURCE_READ_FAILED)
+    observation = observe_workspace_changes(source_root)
+    artifacts = TaskGateArtifacts(
+        evidence=evidence,
+        handoff=handoff,
+        inventory=inventory,
+        actual_source=source_result,
+        actual_route=actual_route,
+        workspace_observation=observation,
+        evidence_attachment_sha256=evidence_read.sha256 or "",
+        handoff_attachment_sha256=handoff_read.sha256 or "",
+    )
+    if observation.reason is not ChangeGateReason.ALLOWED:
+        return TaskGateLoad(True, observation.reason, artifacts)
+    binding_reason = validate_observed_artifact_bindings(
+        evidence,
+        observation.changed_paths,
+    )
+    if binding_reason is not ChangeGateReason.ALLOWED:
+        return TaskGateLoad(True, binding_reason, artifacts)
     artifact_reason = validate_bound_artifacts(
-        Path(task_row["workspace_path"]),
+        source_root,
         evidence.required_inputs + evidence.produced_artifacts,
     )
     if artifact_reason is not ChangeGateReason.ALLOWED:
-        return TaskGateLoad(True, artifact_reason)
+        return TaskGateLoad(True, artifact_reason, artifacts)
     return TaskGateLoad(
         True,
         ChangeGateReason.ALLOWED,
-        TaskGateArtifacts(
-            evidence=evidence,
-            handoff=handoff,
-            inventory=inventory,
-            actual_source=source_result,
-            actual_route=actual_route,
-            evidence_attachment_sha256=evidence_read.sha256 or "",
-            handoff_attachment_sha256=handoff_read.sha256 or "",
-        ),
+        artifacts,
     )
 
 
@@ -333,7 +367,7 @@ def evaluate_loaded_runtime(
     if not load.applicable:
         return RuntimeEvaluation(False, _allow(ChangeGateReason.DISABLED, GatePhase.G0_EVIDENCE))
     if not load.ok or load.artifacts is None:
-        return RuntimeEvaluation(True, _failure(load.reason, purpose))
+        return RuntimeEvaluation(True, _failure(load.reason, purpose), load.artifacts)
     if release is None:
         return RuntimeEvaluation(True, _failure(release_reason, purpose), load.artifacts)
 
@@ -344,7 +378,7 @@ def evaluate_loaded_runtime(
         release_receipt=None,
         source=artifacts.actual_source,
         work=artifacts.evidence.work,
-        requested_paths=artifacts.evidence.allowed_paths,
+        requested_paths=artifacts.workspace_observation.changed_paths,
         observed_inputs=artifacts.evidence.required_inputs,
         observed_outputs=artifacts.evidence.produced_artifacts,
         reviews=tuple(reviews),
@@ -574,23 +608,33 @@ def project_upstream_reviews(
     *,
     handoff: FrozenHandoff,
 ) -> ReviewProjection:
-    """Project only exact metadata linked to completed upstream review runs."""
+    """Project the latest current result per required reviewer class."""
 
     if type(handoff) is not FrozenHandoff:
         return ReviewProjection((), ChangeGateReason.FROZEN_HANDOFF_MALFORMED)
     bundle_sha256 = handoff.review_bundle_sha256()
+    required = handoff.route.required_reviewers
+    if required not in {
+        (ReviewerClass.REVIEWER,),
+        (ReviewerClass.NORMAL, ReviewerClass.DEEP),
+    }:
+        return ReviewProjection((), ChangeGateReason.ROUTE_POLICY_CONFLICT)
 
     rows = conn.execute(
         "SELECT id, profile, ended_at, outcome, metadata FROM task_runs "
         "WHERE task_id = ? AND ended_at IS NOT NULL AND metadata IS NOT NULL "
-        "ORDER BY id ASC",
+        "ORDER BY id DESC",
         (task_id,),
     ).fetchall()
-    projected: list[ReviewResult] = []
+    projected_by_class: dict[ReviewerClass, ReviewResult] = {}
+    selected_attempts: set[str] = set()
     for row in rows:
+        have_required = set(projected_by_class) == set(required)
         try:
             metadata = json.loads(row["metadata"])
         except (TypeError, json.JSONDecodeError):
+            if have_required:
+                continue
             if REVIEW_METADATA_KEY in str(row["metadata"]):
                 return ReviewProjection((), ChangeGateReason.REVIEW_RESULT_MALFORMED)
             continue
@@ -598,11 +642,25 @@ def project_upstream_reviews(
             continue
         raw = metadata[REVIEW_METADATA_KEY]
         if type(raw) is not str:
+            if have_required:
+                continue
             return ReviewProjection((), ChangeGateReason.REVIEW_RESULT_MALFORMED)
         decoded = decode_artifact(raw.encode("utf-8"), expected_schema=REVIEW_RESULT_SCHEMA)
         if not decoded.ok or type(decoded.value) is not ReviewResult:
+            if have_required:
+                continue
             return ReviewProjection((), ChangeGateReason.REVIEW_RESULT_MALFORMED)
         review = decoded.value
+        if have_required:
+            if review.attempt_id in selected_attempts:
+                return ReviewProjection((), ChangeGateReason.REVIEW_RESULT_MALFORMED)
+            continue
+        if review.reviewer_class not in required:
+            return ReviewProjection((), ChangeGateReason.REVIEW_CLASS_UNEXPECTED)
+        if review.reviewer_class in projected_by_class:
+            continue
+        if review.bundle_sha256 != bundle_sha256:
+            return ReviewProjection((), ChangeGateReason.REVIEW_BUNDLE_MISMATCH)
         expected_event = {
             ReviewVerdict.PASS: "review_requested",
             ReviewVerdict.REQUEST_CHANGES: "changes_requested",
@@ -652,9 +710,14 @@ def project_upstream_reviews(
             or row["profile"] != routes[0].selector.assignee
         ):
             return ReviewProjection((), ChangeGateReason.REVIEW_RESULT_MALFORMED)
-        if review.bundle_sha256 == bundle_sha256:
-            projected.append(review)
-    return ReviewProjection(tuple(projected))
+        projected_by_class[review.reviewer_class] = review
+        selected_attempts.add(review.attempt_id)
+    projected = tuple(
+        projected_by_class[reviewer]
+        for reviewer in required
+        if reviewer in projected_by_class
+    )
+    return ReviewProjection(projected)
 
 
 def build_review_result_metadata(review: ReviewResult) -> dict[str, str]:
@@ -775,6 +838,178 @@ def validate_bound_artifacts(
     return ChangeGateReason.ALLOWED
 
 
+@dataclass(frozen=True, slots=True)
+class _BindingIndex:
+    path_to_binding: dict[str, ArtifactBinding]
+    ambiguous: bool = False
+
+
+def validate_observed_artifact_bindings(
+    evidence: EvidencePacket,
+    observed_paths: Sequence[str],
+) -> ChangeGateReason:
+    if type(evidence) is not EvidencePacket or type(observed_paths) not in {tuple, list}:
+        return ChangeGateReason.ARTIFACT_BINDING_MISMATCH
+    if not set(observed_paths).issubset(evidence.allowed_paths):
+        return ChangeGateReason.SCOPE_DEVIATION
+    index = _binding_by_path(evidence)
+    if index.ambiguous:
+        return ChangeGateReason.ARTIFACT_AMBIGUOUS
+    for path in observed_paths:
+        if path not in index.path_to_binding:
+            return ChangeGateReason.ARTIFACT_BINDING_MISMATCH
+    return ChangeGateReason.ALLOWED
+
+
+def observe_workspace_changes(source_root: Path) -> WorkspaceObservation:
+    """Return actual Git-visible changed paths without exposing file content."""
+
+    if not source_root.is_absolute():
+        return WorkspaceObservation(ChangeGateReason.SOURCE_READ_FAILED)
+    staged = _git_name_status(
+        source_root,
+        ("diff", "--name-status", "-z", "--find-renames", "-C", "-C", "--cached"),
+        staged=True,
+    )
+    unstaged = _git_name_status(
+        source_root,
+        ("diff", "--name-status", "-z", "--find-renames", "-C", "-C"),
+        unstaged=True,
+    )
+    untracked = _git_untracked(source_root)
+    for result in (staged, unstaged, untracked):
+        if result.reason is not ChangeGateReason.ALLOWED:
+            return result
+    by_path: dict[str, WorkspaceChangedPath] = {}
+    for result in (staged, unstaged, untracked):
+        for change in result.changes:
+            current = by_path.get(change.path)
+            by_path[change.path] = (
+                change
+                if current is None
+                else WorkspaceChangedPath(
+                    path=change.path,
+                    staged=current.staged or change.staged,
+                    unstaged=current.unstaged or change.unstaged,
+                    untracked=current.untracked or change.untracked,
+                )
+            )
+    paths = tuple(sorted(by_path))
+    if paths:
+        submodule_check = _has_submodule_path(source_root, paths)
+        if submodule_check is not False:
+            return WorkspaceObservation(ChangeGateReason.ARTIFACT_AMBIGUOUS)
+    changes = tuple(by_path[path] for path in paths)
+    return WorkspaceObservation(ChangeGateReason.ALLOWED, paths, changes)
+
+
+def _binding_by_path(evidence: EvidencePacket) -> _BindingIndex:
+    path_to_binding: dict[str, ArtifactBinding] = {}
+    ambiguous = False
+    for binding in evidence.required_inputs + evidence.produced_artifacts:
+        if binding.path in path_to_binding:
+            ambiguous = True
+            continue
+        path_to_binding[binding.path] = binding
+    return _BindingIndex(path_to_binding, ambiguous)
+
+
+def _git_name_status(
+    root: Path,
+    args: tuple[str, ...],
+    *,
+    staged: bool = False,
+    unstaged: bool = False,
+) -> WorkspaceObservation:
+    data = _git_read_bytes(root, *args)
+    if data is None:
+        return WorkspaceObservation(ChangeGateReason.ARTIFACT_AMBIGUOUS)
+    if not data:
+        return WorkspaceObservation(ChangeGateReason.ALLOWED)
+    if not data.endswith(b"\0"):
+        return WorkspaceObservation(ChangeGateReason.ARTIFACT_AMBIGUOUS)
+    try:
+        tokens = data[:-1].decode("utf-8", "strict").split("\0")
+    except UnicodeDecodeError:
+        return WorkspaceObservation(ChangeGateReason.ARTIFACT_AMBIGUOUS)
+    changes: list[WorkspaceChangedPath] = []
+    index = 0
+    while index < len(tokens):
+        status = tokens[index]
+        index += 1
+        if not status:
+            return WorkspaceObservation(ChangeGateReason.ARTIFACT_AMBIGUOUS)
+        if status[0] in {"R", "C"}:
+            return WorkspaceObservation(ChangeGateReason.ARTIFACT_AMBIGUOUS)
+        if status not in {"M", "A"}:
+            return WorkspaceObservation(ChangeGateReason.ARTIFACT_AMBIGUOUS)
+        if index >= len(tokens) or not _valid_observed_path(tokens[index]):
+            return WorkspaceObservation(ChangeGateReason.ARTIFACT_AMBIGUOUS)
+        changes.append(
+            WorkspaceChangedPath(
+                path=tokens[index],
+                staged=staged,
+                unstaged=unstaged,
+                untracked=False,
+            )
+        )
+        index += 1
+    paths = tuple(change.path for change in changes)
+    return WorkspaceObservation(ChangeGateReason.ALLOWED, paths, tuple(changes))
+
+
+def _git_untracked(root: Path) -> WorkspaceObservation:
+    data = _git_read_bytes(root, "ls-files", "--others", "--exclude-standard", "-z")
+    if data is None:
+        return WorkspaceObservation(ChangeGateReason.ARTIFACT_AMBIGUOUS)
+    if not data:
+        return WorkspaceObservation(ChangeGateReason.ALLOWED)
+    if not data.endswith(b"\0"):
+        return WorkspaceObservation(ChangeGateReason.ARTIFACT_AMBIGUOUS)
+    try:
+        paths = tuple(data[:-1].decode("utf-8", "strict").split("\0"))
+    except UnicodeDecodeError:
+        return WorkspaceObservation(ChangeGateReason.ARTIFACT_AMBIGUOUS)
+    if any(not _valid_observed_path(path) for path in paths):
+        return WorkspaceObservation(ChangeGateReason.ARTIFACT_AMBIGUOUS)
+    changes = tuple(
+        WorkspaceChangedPath(path=path, staged=False, unstaged=False, untracked=True)
+        for path in paths
+    )
+    return WorkspaceObservation(ChangeGateReason.ALLOWED, paths, changes)
+
+
+def _has_submodule_path(root: Path, paths: Sequence[str]) -> bool | None:
+    data = _git_read_bytes(root, "ls-files", "--stage", "-z", "--", *paths)
+    if data is None:
+        return None
+    if not data:
+        return False
+    if not data.endswith(b"\0"):
+        return True
+    try:
+        records = data[:-1].decode("utf-8", "strict").split("\0")
+    except UnicodeDecodeError:
+        return True
+    for record in records:
+        if "\t" not in record:
+            return True
+        metadata, _path = record.split("\t", 1)
+        parts = metadata.split(" ")
+        if len(parts) != 3 or not parts[0].isdigit() or not _GIT_OID_RE.fullmatch(parts[1]):
+            return True
+        if parts[0] == "160000":
+            return True
+    return False
+
+
+def _valid_observed_path(value: str) -> bool:
+    if not value or "\0" in value or "\\" in value:
+        return False
+    path = PurePosixPath(value)
+    return not path.is_absolute() and ".." not in path.parts and "." not in path.parts
+
+
 def _read_attachment(
     row: sqlite3.Row,
     *,
@@ -805,22 +1040,80 @@ def _read_attachment(
 
 
 def _git_read(root: Path, *args: str) -> str | None:
-    try:
-        completed = subprocess.run(
-            ["git", "-C", str(root), *args],
-            check=False,
-            capture_output=True,
-            timeout=5,
-        )
-    except (OSError, subprocess.SubprocessError):
-        return None
-    if completed.returncode != 0 or len(completed.stdout) > _MAX_GIT_OUTPUT_BYTES:
+    data = _git_read_bytes(root, *args)
+    if data is None:
         return None
     try:
-        value = completed.stdout.decode("utf-8", "strict").strip()
+        value = data.decode("utf-8", "strict").strip()
     except UnicodeDecodeError:
         return None
     return value if value and "\0" not in value else None
+
+
+def _git_read_bytes(root: Path, *args: str) -> bytes | None:
+    try:
+        process = subprocess.Popen(
+            ["git", "-C", str(root), *args],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+        )
+    except OSError:
+        return None
+    stdout_parts: list[bytes] = []
+    stderr_parts: list[bytes] = []
+    overflow = False
+
+    def _reader(stream, parts: list[bytes]) -> None:
+        nonlocal overflow
+        try:
+            while True:
+                chunk = stream.read(1024)
+                if not chunk:
+                    break
+                parts.append(chunk)
+                if sum(len(part) for part in parts) > _MAX_GIT_OUTPUT_BYTES:
+                    overflow = True
+                    try:
+                        process.kill()
+                    except OSError:
+                        pass
+                    break
+        finally:
+            try:
+                stream.close()
+            except OSError:
+                pass
+
+    assert process.stdout is not None
+    assert process.stderr is not None
+    stdout_thread = threading.Thread(target=_reader, args=(process.stdout, stdout_parts))
+    stderr_thread = threading.Thread(target=_reader, args=(process.stderr, stderr_parts))
+    stdout_thread.start()
+    stderr_thread.start()
+    try:
+        returncode = process.wait(timeout=5)
+    except subprocess.TimeoutExpired:
+        process.kill()
+        returncode = process.wait()
+        overflow = True
+    stdout_thread.join(timeout=1)
+    stderr_thread.join(timeout=1)
+    if stdout_thread.is_alive() or stderr_thread.is_alive():
+        try:
+            process.kill()
+        except OSError:
+            pass
+        return None
+    stdout = b"".join(stdout_parts)
+    stderr = b"".join(stderr_parts)
+    if (
+        returncode != 0
+        or overflow
+        or len(stdout) > _MAX_GIT_OUTPUT_BYTES
+        or len(stderr) > _MAX_GIT_OUTPUT_BYTES
+    ):
+        return None
+    return stdout
 
 
 def _normalize_repository(remote: str | None) -> str | None:
@@ -853,6 +1146,8 @@ def _codec_reason(reason: ArtifactCodecReason) -> ChangeGateReason:
 
 def _failure(reason: ChangeGateReason, purpose: ReleasePurpose) -> ChangeGateResult:
     phase = GatePhase.G4_RELEASE if purpose is ReleasePurpose.G4 else GatePhase.G2_CLAIM
+    if reason is ChangeGateReason.SCOPE_DEVIATION:
+        return ChangeGateResult(GateDecision.SCOPE_DEVIATION, reason, phase)
     decision = (
         GateDecision.REPLAN_REQUIRED
         if reason in {
@@ -861,6 +1156,7 @@ def _failure(reason: ChangeGateReason, purpose: ReleasePurpose) -> ChangeGateRes
             ChangeGateReason.INVENTORY_BINDING_MISMATCH,
             ChangeGateReason.INVENTORY_READ_FAILED,
             ChangeGateReason.ROUTE_POLICY_CONFLICT,
+            ChangeGateReason.ARTIFACT_AMBIGUOUS,
         }
         else GateDecision.DENY
     )
@@ -883,6 +1179,8 @@ __all__ = [
     "RuntimeEvaluation",
     "TaskGateArtifacts",
     "TaskGateLoad",
+    "WorkspaceChangedPath",
+    "WorkspaceObservation",
     "build_current_review_result",
     "build_review_claim_payload",
     "build_review_result_metadata",
@@ -891,6 +1189,7 @@ __all__ = [
     "evaluate_loaded_runtime",
     "load_runtime_policy",
     "load_task_gate_artifacts",
+    "observe_workspace_changes",
     "parse_review_submission",
     "project_upstream_reviews",
     "read_current_source_identity",

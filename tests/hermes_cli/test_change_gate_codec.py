@@ -10,9 +10,11 @@ from hermes_cli.change_gate import (
     DURABLE_RELEASE_SCHEMA,
     EVIDENCE_PACKET_SCHEMA,
     FROZEN_HANDOFF_SCHEMA,
+    LEGACY_DURABLE_RELEASE_SCHEMA,
     REVIEW_RESULT_SCHEMA,
     ArchitectureInventoryRecord,
     ArtifactBinding,
+    TransitionAnchor,
     DurableReleaseArtifact,
     EvidencePacket,
     FrozenHandoff,
@@ -27,6 +29,7 @@ from hermes_cli.change_gate import (
     SourceIdentity,
     UpstreamRouteSelector,
     WorkIdentity,
+    canonical_sha256,
     freeze_handoff,
 )
 from hermes_cli.change_gate_codec import (
@@ -160,6 +163,20 @@ def _durable_release(evidence: EvidencePacket, handoff: FrozenHandoff) -> Durabl
         work_id=evidence.work.work_id,
         source=evidence.source,
         authority_receipt=receipt,
+        transition_anchor=TransitionAnchor(
+            task_id=evidence.work.task_id,
+            purpose=ReleasePurpose.CLAIM,
+            status="ready",
+            route_sha256=canonical_sha256(handoff.route.executor),
+            workspace_source_sha256="9" * 64,
+            current_run_id=None,
+            latest_event_id=1,
+            latest_event_kind="task_ready",
+            latest_event_payload_sha256="a" * 64,
+            frozen_handoff_sha256=handoff.digest(),
+            review_bundle_sha256=None,
+            selected_review_set_sha256=None,
+        ),
         issued_at_epoch=NOW,
         expires_at_epoch=NOW + 60,
     )
@@ -233,6 +250,55 @@ def test_rejects_unsupported_schema_version() -> None:
     result = decode_artifact(encoded, expected_schema=EVIDENCE_PACKET_SCHEMA)
 
     assert result.reason is ArtifactCodecReason.UNSUPPORTED_SCHEMA
+
+
+def test_legacy_durable_release_v1_is_not_accepted_as_v2() -> None:
+    evidence = _evidence()
+    handoff = _handoff(evidence, _inventory(evidence))
+    data = json.loads(encode_artifact(_durable_release(evidence, handoff)))
+    data.pop("transition_anchor")
+    data["schema"] = LEGACY_DURABLE_RELEASE_SCHEMA
+    encoded = json.dumps(data, sort_keys=True, separators=(",", ":"), ensure_ascii=False).encode()
+
+    result = decode_artifact(encoded, expected_schema=DURABLE_RELEASE_SCHEMA)
+
+    assert result.reason is ArtifactCodecReason.UNSUPPORTED_SCHEMA
+
+
+def test_durable_release_v2_requires_strict_transition_anchor_shape() -> None:
+    evidence = _evidence()
+    handoff = _handoff(evidence, _inventory(evidence))
+    data = json.loads(encode_artifact(_durable_release(evidence, handoff)))
+    data["transition_anchor"]["status"] = "running"
+    encoded = json.dumps(data, sort_keys=True, separators=(",", ":"), ensure_ascii=False).encode()
+
+    result = decode_artifact(encoded, expected_schema=DURABLE_RELEASE_SCHEMA)
+
+    assert result.reason is ArtifactCodecReason.VALUE_INVALID
+
+
+def test_transition_anchor_event_triple_is_atomic() -> None:
+    evidence = _evidence()
+    handoff = _handoff(evidence, _inventory(evidence))
+    data = json.loads(encode_artifact(_durable_release(evidence, handoff)))
+    data["transition_anchor"]["latest_event_payload_sha256"] = None
+    encoded = json.dumps(data, sort_keys=True, separators=(",", ":"), ensure_ascii=False).encode()
+
+    result = decode_artifact(encoded, expected_schema=DURABLE_RELEASE_SCHEMA)
+
+    assert result.reason is ArtifactCodecReason.VALUE_INVALID
+
+
+def test_durable_release_v2_binds_nested_anchor_to_outer_release() -> None:
+    evidence = _evidence()
+    handoff = _handoff(evidence, _inventory(evidence))
+    data = json.loads(encode_artifact(_durable_release(evidence, handoff)))
+    data["transition_anchor"]["task_id"] = "other-task"
+    encoded = json.dumps(data, sort_keys=True, separators=(",", ":"), ensure_ascii=False).encode()
+
+    result = decode_artifact(encoded, expected_schema=DURABLE_RELEASE_SCHEMA)
+
+    assert result.reason is ArtifactCodecReason.VALUE_INVALID
 
 
 def test_rejects_noncanonical_json() -> None:

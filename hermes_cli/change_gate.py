@@ -26,7 +26,9 @@ ARCHITECTURE_INVENTORY_SCHEMA = "hermes.change-gate.architecture-inventory/v1"
 REVIEW_RESULT_SCHEMA = "hermes.change-gate.review-result/v1"
 REVIEW_BUNDLE_SCHEMA = "hermes.change-gate.review-bundle/v1"
 RELEASE_RECEIPT_SCHEMA = "hermes.change-gate.current-turn-release/v1"
-DURABLE_RELEASE_SCHEMA = "hermes.change-gate.durable-release/v1"
+LEGACY_DURABLE_RELEASE_SCHEMA = "hermes.change-gate.durable-release/v1"
+DURABLE_RELEASE_SCHEMA = "hermes.change-gate.durable-release/v2"
+TRANSITION_ANCHOR_SCHEMA = "hermes.change-gate.transition-anchor/v1"
 CONVERGENCE_RULE = "exact-required-classes-pass-same-frozen-bundle/v1"
 MAX_EVIDENCE_LIFETIME_SECONDS = 600
 MAX_RELEASE_LIFETIME_SECONDS = 600
@@ -121,6 +123,7 @@ class ChangeGateReason(StrEnum):
     RELEASE_REVOKED = "release_revoked"
     RELEASE_REPLAY = "release_replay"
     RELEASE_TASK_MISMATCH = "release_task_mismatch"
+    RELEASE_TRANSITION_STALE = "release_transition_stale"
     RELEASE_PURPOSE_UNSUPPORTED = "release_purpose_unsupported"
     RUNTIME_CONFIG_INVALID = "runtime_config_invalid"
     SOURCE_READ_FAILED = "source_read_failed"
@@ -318,6 +321,28 @@ class HumanReleaseReceipt:
 
 
 @dataclass(frozen=True, slots=True)
+class TransitionAnchor:
+    """Owner-derived transition generation bound into persisted releases."""
+
+    task_id: str
+    purpose: ReleasePurpose
+    status: str
+    route_sha256: str
+    workspace_source_sha256: str
+    current_run_id: int | None
+    latest_event_id: int | None
+    latest_event_kind: str | None
+    latest_event_payload_sha256: str | None
+    frozen_handoff_sha256: str
+    review_bundle_sha256: str | None
+    selected_review_set_sha256: str | None
+    schema: str = TRANSITION_ANCHOR_SCHEMA
+
+    def digest(self) -> str:
+        return canonical_sha256(self)
+
+
+@dataclass(frozen=True, slots=True)
 class DurableReleaseArtifact:
     """Raw-free immutable release evidence stored only by the trusted owner.
 
@@ -337,6 +362,7 @@ class DurableReleaseArtifact:
     work_id: str
     source: SourceIdentity
     authority_receipt: HumanReleaseReceipt
+    transition_anchor: TransitionAnchor
     issued_at_epoch: int
     expires_at_epoch: int
     max_consumptions: int = 1
@@ -448,7 +474,7 @@ class ChangeGateAdapter:
         if type(actual_task_id) is not str or actual_task_id != evidence.work.task_id:
             return _deny(ChangeGateReason.TASK_ID_MISMATCH, GatePhase.G2_CLAIM)
 
-        if not _valid_paths(request.requested_paths, allow_empty=False):
+        if not _valid_paths(request.requested_paths, allow_empty=True):
             return _scope_deviation(ChangeGateReason.ALLOWED_PATH_VIOLATION)
         if not set(request.requested_paths).issubset(evidence.allowed_paths):
             return _scope_deviation(ChangeGateReason.ALLOWED_PATH_VIOLATION)
@@ -759,6 +785,7 @@ def issue_durable_release_artifact(
     purpose: ReleasePurpose,
     handoff: FrozenHandoff,
     evidence: EvidencePacket,
+    transition_anchor: TransitionAnchor,
     ttl_seconds: int,
     clock: Callable[[], int] = _system_epoch_seconds,
 ) -> DurableReleaseArtifact | None:
@@ -775,9 +802,21 @@ def issue_durable_release_artifact(
         handoff_sha256 = handoff.digest()
         artifact_set_sha256 = _artifact_set_sha256(handoff)
         route_sha256 = canonical_sha256(handoff.route)
+        anchor_route_sha256 = canonical_sha256(handoff.route.executor)
     except (TypeError, ValueError):
         return None
     if handoff.evidence_sha256 != evidence_sha256 or handoff.source != evidence.source:
+        return None
+    if (
+        _validate_transition_anchor(
+            transition_anchor,
+            purpose=purpose,
+            task_id=evidence.work.task_id,
+            handoff_sha256=handoff_sha256,
+            route_sha256=anchor_route_sha256,
+        )
+        is not ChangeGateReason.ALLOWED
+    ):
         return None
     receipt = issue_current_turn_release_receipt(
         purpose=purpose,
@@ -803,6 +842,7 @@ def issue_durable_release_artifact(
         work_id=evidence.work.work_id,
         source=evidence.source,
         authority_receipt=receipt,
+        transition_anchor=transition_anchor,
         issued_at_epoch=now,
         expires_at_epoch=now + ttl_seconds,
     )
@@ -813,6 +853,10 @@ def request_from_durable_release(
     *,
     evidence: EvidencePacket,
     handoff: FrozenHandoff,
+    expected_transition_anchor: TransitionAnchor | None = None,
+    requested_paths: Sequence[str] | None = None,
+    observed_inputs: Sequence[ArtifactBinding] | None = None,
+    observed_outputs: Sequence[ArtifactBinding] | None = None,
     reviews: Sequence[ReviewResult] = (),
 ) -> ChangeGateRequest | None:
     reason = validate_durable_release_artifact(
@@ -822,8 +866,18 @@ def request_from_durable_release(
         handoff=handoff,
         now_epoch=release.issued_at_epoch if type(release) is DurableReleaseArtifact else 0,
         require_unexpired=False,
+        expected_transition_anchor=expected_transition_anchor,
     )
     if reason is not ChangeGateReason.ALLOWED:
+        return None
+    request_paths = tuple(requested_paths) if requested_paths is not None else evidence.allowed_paths
+    request_inputs = tuple(observed_inputs) if observed_inputs is not None else evidence.required_inputs
+    request_outputs = (
+        tuple(observed_outputs) if observed_outputs is not None else evidence.produced_artifacts
+    )
+    if not _valid_paths(request_paths, allow_empty=True):
+        return None
+    if not _valid_artifacts(request_inputs) or not _valid_artifacts(request_outputs):
         return None
     return ChangeGateRequest(
         evidence=evidence,
@@ -831,9 +885,9 @@ def request_from_durable_release(
         release_receipt=None,
         source=release.source,
         work=evidence.work,
-        requested_paths=evidence.allowed_paths,
-        observed_inputs=evidence.required_inputs,
-        observed_outputs=evidence.produced_artifacts,
+        requested_paths=request_paths,
+        observed_inputs=request_inputs,
+        observed_outputs=request_outputs,
         reviews=tuple(reviews),
         purpose=release.purpose,
         durable_release=release,
@@ -848,6 +902,7 @@ def validate_durable_release_artifact(
     handoff: FrozenHandoff,
     now_epoch: int,
     require_unexpired: bool = True,
+    expected_transition_anchor: TransitionAnchor | None = None,
 ) -> ChangeGateReason:
     if type(release) is not DurableReleaseArtifact:
         return ChangeGateReason.RELEASE_ARTIFACT_MALFORMED
@@ -858,6 +913,7 @@ def validate_durable_release_artifact(
         handoff_sha256 = handoff.digest()
         artifact_set_sha256 = _artifact_set_sha256(handoff)
         route_sha256 = canonical_sha256(handoff.route)
+        anchor_route_sha256 = canonical_sha256(handoff.route.executor)
     except (TypeError, ValueError):
         return ChangeGateReason.RELEASE_ARTIFACT_MALFORMED
     if (
@@ -918,6 +974,94 @@ def validate_durable_release_artifact(
         handoff_sha256=handoff_sha256,
     ):
         return ChangeGateReason.RELEASE_ARTIFACT_MALFORMED
+    anchor_reason = _validate_transition_anchor(
+        release.transition_anchor,
+        purpose=purpose,
+        task_id=evidence.work.task_id,
+        handoff_sha256=handoff_sha256,
+        route_sha256=anchor_route_sha256,
+        expected_transition_anchor=expected_transition_anchor,
+    )
+    if anchor_reason is not ChangeGateReason.ALLOWED:
+        return anchor_reason
+    return ChangeGateReason.ALLOWED
+
+
+def _validate_transition_anchor(
+    anchor: TransitionAnchor,
+    *,
+    purpose: ReleasePurpose,
+    task_id: str,
+    handoff_sha256: str,
+    route_sha256: str,
+    expected_transition_anchor: TransitionAnchor | None = None,
+) -> ChangeGateReason:
+    if (
+        type(anchor) is not TransitionAnchor
+        or anchor.schema != TRANSITION_ANCHOR_SCHEMA
+        or type(anchor.purpose) is not ReleasePurpose
+        or not _valid_text(anchor.task_id)
+        or not _valid_text(anchor.status)
+        or not _is_sha256(anchor.route_sha256)
+        or not _is_sha256(anchor.workspace_source_sha256)
+        or not _is_sha256(anchor.frozen_handoff_sha256)
+        or (anchor.current_run_id is not None and not _is_positive_int(anchor.current_run_id))
+        or (anchor.latest_event_id is not None and not _is_positive_int(anchor.latest_event_id))
+    ):
+        return ChangeGateReason.RELEASE_ARTIFACT_MALFORMED
+
+    event_all_null = (
+        anchor.latest_event_id is None
+        and anchor.latest_event_kind is None
+        and anchor.latest_event_payload_sha256 is None
+    )
+    event_all_present = (
+        anchor.latest_event_id is not None
+        and _valid_text(anchor.latest_event_kind)
+        and _is_sha256(anchor.latest_event_payload_sha256)
+    )
+    if not (event_all_null or event_all_present):
+        return ChangeGateReason.RELEASE_ARTIFACT_MALFORMED
+
+    if (
+        anchor.purpose is not purpose
+        or anchor.task_id != task_id
+        or not hmac.compare_digest(anchor.frozen_handoff_sha256, handoff_sha256)
+        or not hmac.compare_digest(anchor.route_sha256, route_sha256)
+    ):
+        return ChangeGateReason.RELEASE_TRANSITION_STALE
+
+    if purpose is ReleasePurpose.CLAIM:
+        if (
+            anchor.status != "ready"
+            or anchor.current_run_id is not None
+            or anchor.review_bundle_sha256 is not None
+            or anchor.selected_review_set_sha256 is not None
+        ):
+            return ChangeGateReason.RELEASE_TRANSITION_STALE
+    elif purpose is ReleasePurpose.G4:
+        if (
+            anchor.status != "review"
+            or anchor.current_run_id is not None
+            or not _is_sha256(anchor.review_bundle_sha256)
+            or not _is_sha256(anchor.selected_review_set_sha256)
+        ):
+            return ChangeGateReason.RELEASE_TRANSITION_STALE
+    else:
+        return ChangeGateReason.RELEASE_ARTIFACT_MALFORMED
+
+    if expected_transition_anchor is not None:
+        expected_reason = _validate_transition_anchor(
+            expected_transition_anchor,
+            purpose=purpose,
+            task_id=task_id,
+            handoff_sha256=handoff_sha256,
+            route_sha256=route_sha256,
+        )
+        if expected_reason is not ChangeGateReason.ALLOWED:
+            return expected_reason
+        if anchor != expected_transition_anchor:
+            return ChangeGateReason.RELEASE_TRANSITION_STALE
     return ChangeGateReason.ALLOWED
 
 
@@ -1295,6 +1439,10 @@ def _valid_paths(paths: object, *, allow_empty: bool) -> bool:
     )
 
 
+def _is_positive_int(value: object) -> bool:
+    return type(value) is int and value >= 1
+
+
 def _valid_path(path: object) -> bool:
     if not _valid_text(path):
         return False
@@ -1437,8 +1585,10 @@ __all__ = [
     "DURABLE_RELEASE_SCHEMA",
     "EVIDENCE_PACKET_SCHEMA",
     "FROZEN_HANDOFF_SCHEMA",
+    "LEGACY_DURABLE_RELEASE_SCHEMA",
     "MAX_RUNTIME_ARTIFACT_BYTES",
     "REVIEW_RESULT_SCHEMA",
+    "TRANSITION_ANCHOR_SCHEMA",
     "ArchitectureInventoryReader",
     "ArchitectureInventoryRecord",
     "ArtifactBinding",
@@ -1461,6 +1611,7 @@ __all__ = [
     "RouteProjection",
     "SourceIdentity",
     "StaticArchitectureInventoryReader",
+    "TransitionAnchor",
     "UpstreamRouteSelector",
     "WorkIdentity",
     "canonical_sha256",

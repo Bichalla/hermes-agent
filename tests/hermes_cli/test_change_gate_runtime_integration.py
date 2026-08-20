@@ -33,6 +33,7 @@ from hermes_cli.change_gate import (
     RiskLevel,
     RouteProjection,
     SourceIdentity,
+    TransitionAnchor,
     UpstreamRouteSelector,
     WorkIdentity,
     canonical_sha256,
@@ -46,6 +47,7 @@ from hermes_cli.change_gate_runtime import (
     ChangeGateRuntimePolicy,
     REVIEW_METADATA_KEY,
     build_review_result_metadata,
+    load_task_gate_artifacts,
     project_upstream_reviews,
 )
 from tools.workflow_authority import (
@@ -88,7 +90,12 @@ def _run_git(repo: Path, *args: str) -> str:
     return completed.stdout.strip()
 
 
-def _source_repo(tmp_path: Path) -> tuple[Path, SourceIdentity, ArtifactBinding]:
+def _source_repo(
+    tmp_path: Path,
+    *,
+    dirty_tracked: bool = False,
+    tracked_outside: bool = False,
+) -> tuple[Path, SourceIdentity, ArtifactBinding]:
     repo = tmp_path / "source"
     repo.mkdir()
     subprocess.run(["git", "-C", str(repo), "init", "-b", "track-g-test"], check=True)
@@ -97,7 +104,9 @@ def _source_repo(tmp_path: Path) -> tuple[Path, SourceIdentity, ArtifactBinding]
     _run_git(repo, "remote", "add", "origin", "git@github.com:Bichalla/hermes-agent.git")
     artifact = repo / "gate-artifact.txt"
     artifact.write_text("bounded synthetic artifact\n", encoding="utf-8")
-    _run_git(repo, "add", "gate-artifact.txt")
+    if tracked_outside:
+        (repo / "outside.txt").write_text("outside baseline\n", encoding="utf-8")
+    _run_git(repo, "add", ".")
     _run_git(repo, "commit", "-m", "fixture")
     source = SourceIdentity(
         repository="Bichalla/hermes-agent",
@@ -105,6 +114,8 @@ def _source_repo(tmp_path: Path) -> tuple[Path, SourceIdentity, ArtifactBinding]
         commit=_run_git(repo, "rev-parse", "HEAD"),
         tree=_run_git(repo, "rev-parse", "HEAD^{tree}"),
     )
+    if dirty_tracked:
+        artifact.write_text("bounded current artifact\n", encoding="utf-8")
     binding = ArtifactBinding(
         path="gate-artifact.txt",
         sha256=hashlib.sha256(artifact.read_bytes()).hexdigest(),
@@ -160,6 +171,7 @@ def _release(
     purpose: ReleasePurpose,
     *,
     release_id: str,
+    transition_anchor: TransitionAnchor,
     issued_at: int | None = None,
 ) -> DurableReleaseArtifact:
     now = int(time.time()) if issued_at is None else issued_at
@@ -188,6 +200,7 @@ def _release(
         work_id=fixture.evidence.work.work_id,
         source=fixture.source,
         authority_receipt=receipt,
+        transition_anchor=transition_anchor,
         issued_at_epoch=now,
         expires_at_epoch=now + 300,
     )
@@ -199,8 +212,15 @@ def _attach_runtime_artifacts(
     task_id: str,
     *,
     risk: RiskLevel = RiskLevel.NORMAL,
+    dirty_tracked: bool = False,
+    tracked_outside: bool = False,
+    extra_allowed_paths: tuple[str, ...] = (),
 ) -> RuntimeFixture:
-    repo, source, binding = _source_repo(tmp_path)
+    repo, source, binding = _source_repo(
+        tmp_path,
+        dirty_tracked=dirty_tracked,
+        tracked_outside=tracked_outside,
+    )
     now = int(time.time())
     route = _route(risk)
     evidence = EvidencePacket(
@@ -214,7 +234,7 @@ def _attach_runtime_artifacts(
         ),
         risk=risk,
         route=route,
-        allowed_paths=("gate-artifact.txt",),
+        allowed_paths=("gate-artifact.txt",) + extra_allowed_paths,
         required_inputs=(),
         produced_artifacts=(binding,),
         inventory_id=f"inventory-{task_id}",
@@ -331,13 +351,50 @@ def _store_release(
     purpose: ReleasePurpose,
     suffix: str,
     *,
+    inventory_root: Path | None = None,
     issued_at: int | None = None,
 ) -> str:
+    import hermes_cli.change_gate_runtime as runtime
+
     kb.initialize_change_gate_runtime_schema(conn)
+    policy = (
+        ChangeGateRuntimePolicy(
+            enabled=True,
+            valid=True,
+            inventory_root=inventory_root,
+        )
+        if inventory_root is not None
+        else runtime.load_runtime_policy()
+    )
+    load = load_task_gate_artifacts(
+        conn,
+        fixture.task_id,
+        policy=policy,
+        attachment_root=kb.task_attachments_dir(fixture.task_id),
+    )
+    assert load.ok and load.artifacts is not None
+    reviews = ()
+    if purpose is ReleasePurpose.G4:
+        projection = project_upstream_reviews(
+            conn,
+            fixture.task_id,
+            handoff=load.artifacts.handoff,
+        )
+        assert projection.ok
+        reviews = projection.reviews
+    transition_anchor = kb.derive_change_gate_transition_anchor(
+        conn,
+        fixture.task_id,
+        purpose=purpose,
+        artifacts=load.artifacts,
+        reviews=reviews,
+    )
+    assert transition_anchor is not None
     release = _release(
         fixture,
         purpose,
         release_id="cgr_" + suffix * 64,
+        transition_anchor=transition_anchor,
         issued_at=int(time.time()) - 1 if issued_at is None else issued_at,
     )
     return kb._store_change_gate_release(conn, release)
@@ -573,6 +630,147 @@ def test_claim_consumes_release_once_and_replay_does_not_mutate_domain(
         assert _snapshot(conn, task_id) == after_claim
 
 
+def test_claim_allows_observed_allowed_bound_tracked_change(
+    tmp_path: Path,
+    isolated_home: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    with _connect(tmp_path / "kanban.db") as conn:
+        task_id = _create_ready_task(conn)
+        fixture = _attach_runtime_artifacts(
+            conn,
+            tmp_path,
+            task_id,
+            dirty_tracked=True,
+        )
+        _enable_runtime(monkeypatch, tmp_path / "inventory")
+        _store_release(conn, fixture, ReleasePurpose.CLAIM, "0")
+
+        evaluation = kb.evaluate_change_gate_claim_runtime(conn, task_id)
+        claimed = kb.claim_task(conn, task_id)
+
+        assert evaluation.result.allowed, evaluation.result.reason.value
+        assert evaluation.artifacts is not None
+        assert evaluation.artifacts.workspace_observation.changed_paths == (
+            "gate-artifact.txt",
+        )
+        assert claimed is not None
+
+
+def test_claim_reobserves_tracked_outside_scope_as_scope_deviation(
+    tmp_path: Path,
+    isolated_home: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    with _connect(tmp_path / "kanban.db") as conn:
+        task_id = _create_ready_task(conn)
+        _attach_runtime_artifacts(
+            conn,
+            tmp_path,
+            task_id,
+            tracked_outside=True,
+        )
+        _enable_runtime(monkeypatch, tmp_path / "inventory")
+        task = kb.get_task(conn, task_id)
+        assert task is not None and task.workspace_path is not None
+        (Path(task.workspace_path) / "outside.txt").write_text(
+            "outside changed\n",
+            encoding="utf-8",
+        )
+
+        evaluation = kb.evaluate_change_gate_claim_runtime(conn, task_id)
+
+        assert evaluation.result.decision is GateDecision.SCOPE_DEVIATION
+        assert evaluation.result.reason is ChangeGateReason.SCOPE_DEVIATION
+
+
+def test_claim_reobserves_untracked_outside_scope_as_scope_deviation(
+    tmp_path: Path,
+    isolated_home: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    with _connect(tmp_path / "kanban.db") as conn:
+        task_id = _create_ready_task(conn)
+        _attach_runtime_artifacts(conn, tmp_path, task_id)
+        _enable_runtime(monkeypatch, tmp_path / "inventory")
+        task = kb.get_task(conn, task_id)
+        assert task is not None and task.workspace_path is not None
+        (Path(task.workspace_path) / "outside.txt").write_text(
+            "outside untracked\n",
+            encoding="utf-8",
+        )
+
+        evaluation = kb.evaluate_change_gate_claim_runtime(conn, task_id)
+
+        assert evaluation.result.decision is GateDecision.SCOPE_DEVIATION
+        assert evaluation.result.reason is ChangeGateReason.SCOPE_DEVIATION
+
+
+def test_dispatch_scope_deviation_from_actual_observation_routes_planner_consequence(
+    tmp_path: Path,
+    isolated_home: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import hermes_cli.profiles as profiles
+
+    monkeypatch.setattr(profiles, "profile_exists", lambda _name: True)
+    with _connect(tmp_path / "kanban.db") as conn:
+        task_id = _create_ready_task(conn)
+        fixture = _attach_runtime_artifacts(conn, tmp_path, task_id)
+        _enable_runtime(monkeypatch, tmp_path / "inventory")
+        _store_release(conn, fixture, ReleasePurpose.CLAIM, "2")
+        task = kb.get_task(conn, task_id)
+        assert task is not None and task.workspace_path is not None
+        (Path(task.workspace_path) / "outside.txt").write_text(
+            "outside untracked\n",
+            encoding="utf-8",
+        )
+
+        result = kb.dispatch_once(
+            conn,
+            spawn_fn=lambda *_args, **_kwargs: 4242,
+            reconcile_orphans=False,
+        )
+
+        assert result.spawned == []
+        assert result.change_gate_denied == [
+            (task_id, ChangeGateReason.SCOPE_DEVIATION.value)
+        ]
+        parents = kb.parent_ids(conn, task_id)
+        assert len(parents) == 1
+        planner = kb.get_task(conn, parents[0])
+        assert planner is not None
+        assert planner.assignee == "planner"
+        assert planner.status == "ready"
+
+
+def test_claim_reobserves_allowed_unbound_path_as_artifact_mismatch(
+    tmp_path: Path,
+    isolated_home: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    with _connect(tmp_path / "kanban.db") as conn:
+        task_id = _create_ready_task(conn)
+        _attach_runtime_artifacts(
+            conn,
+            tmp_path,
+            task_id,
+            extra_allowed_paths=("allowed-unbound.txt",),
+        )
+        _enable_runtime(monkeypatch, tmp_path / "inventory")
+        task = kb.get_task(conn, task_id)
+        assert task is not None and task.workspace_path is not None
+        (Path(task.workspace_path) / "allowed-unbound.txt").write_text(
+            "allowed but unbound\n",
+            encoding="utf-8",
+        )
+
+        evaluation = kb.evaluate_change_gate_claim_runtime(conn, task_id)
+
+        assert not evaluation.result.allowed
+        assert evaluation.result.reason is ChangeGateReason.ARTIFACT_BINDING_MISMATCH
+
+
 def test_concurrent_claim_release_has_exactly_one_winner(
     tmp_path: Path,
     isolated_home: Path,
@@ -705,6 +903,7 @@ def test_wrong_task_release_has_zero_domain_mutation(
             release_fixture,
             ReleasePurpose.CLAIM,
             "4",
+            inventory_root=release_root / "inventory",
         )
         before = _snapshot(conn, target_task_id)
 
@@ -793,6 +992,38 @@ def test_failed_g4_consumption_rolls_back_terminal_transition(
         assert state["state"] == "ISSUED"
         assert state["consumed_run_id"] is None
         assert state["consumed_event_id"] is None
+
+
+def test_g4_reobserves_artifact_drift_before_terminal_transition(
+    tmp_path: Path,
+    isolated_home: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    with _connect(tmp_path / "kanban.db") as conn:
+        task_id = _create_ready_task(conn)
+        fixture = _attach_runtime_artifacts(conn, tmp_path, task_id)
+        _enable_runtime(monkeypatch, tmp_path / "inventory")
+        _claim_and_converge_normal_review(conn, fixture, claim_suffix="6")
+        release_id = _store_release(conn, fixture, ReleasePurpose.G4, "1")
+        task = kb.get_task(conn, task_id)
+        assert task is not None and task.workspace_path is not None
+        (Path(task.workspace_path) / "gate-artifact.txt").write_text(
+            "drift before g4\n",
+            encoding="utf-8",
+        )
+        before = _snapshot(conn, task_id)
+
+        evaluation = kb.evaluate_change_gate_g4_runtime(conn, task_id)
+        completed = kb.complete_task(conn, task_id, result="must not complete")
+
+        assert not evaluation.result.allowed
+        assert evaluation.result.reason is ChangeGateReason.ARTIFACT_DIGEST_MISMATCH
+        assert completed is False
+        assert _snapshot(conn, task_id) == before
+        state = kb.change_gate_release_state(conn, release_id)
+        assert state is not None
+        assert state["state"] == "ISSUED"
+        assert state["consumed_run_id"] is None
 
 
 def test_high_risk_review_projection_requires_normal_then_deep_passes(
@@ -942,7 +1173,7 @@ def test_high_risk_review_projection_requires_normal_then_deep_passes(
         assert g4_state["state"] == "CONSUMED"
 
 
-def test_runtime_projection_ignores_wrong_bundle_review(
+def test_runtime_projection_rejects_latest_wrong_bundle_review(
     tmp_path: Path,
     isolated_home: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -987,8 +1218,9 @@ def test_runtime_projection_ignores_wrong_bundle_review(
             required_reviewers=handoff.route.required_reviewers,
         )
 
-        assert projection.ok
+        assert not projection.ok
         assert projection.reviews == ()
+        assert projection.reason is ChangeGateReason.REVIEW_BUNDLE_MISMATCH
         assert not aggregate.allowed
         assert aggregate.reason is ChangeGateReason.REVIEW_MISSING_REQUIRED_CLASS
 
@@ -1024,7 +1256,7 @@ def test_runtime_projection_rejects_malformed_current_review_metadata(
         assert projection.reason is ChangeGateReason.REVIEW_RESULT_MALFORMED
 
 
-def test_runtime_projection_duplicate_role_does_not_converge(
+def test_runtime_projection_uses_latest_current_role_without_older_fallback(
     tmp_path: Path,
     isolated_home: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -1100,9 +1332,150 @@ def test_runtime_projection_duplicate_role_does_not_converge(
         )
 
         assert projection.ok
-        assert len(projection.reviews) == 2
+        assert projection.reviews == (duplicate,)
+        assert aggregate.allowed
+
+
+def test_runtime_projection_keeps_latest_request_changes_over_older_pass(
+    tmp_path: Path,
+    isolated_home: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    with _connect(tmp_path / "kanban.db") as conn:
+        task_id = _create_ready_task(conn)
+        fixture = _attach_runtime_artifacts(conn, tmp_path, task_id)
+        _enable_runtime(monkeypatch, tmp_path / "inventory")
+        older_run_id = _claim_and_converge_normal_review(
+            conn,
+            fixture,
+            claim_suffix="4",
+        )
+        older = conn.execute(
+            "SELECT profile, ended_at FROM task_runs WHERE id = ?",
+            (older_run_id,),
+        ).fetchone()
+        claimed = conn.execute(
+            "SELECT payload FROM task_events "
+            "WHERE task_id = ? AND run_id = ? AND kind = 'claimed'",
+            (task_id, older_run_id),
+        ).fetchone()
+        assert older is not None
+        assert claimed is not None
+        newer_end = int(older["ended_at"]) + 1
+        cursor = conn.execute(
+            "INSERT INTO task_runs "
+            "(task_id, profile, status, started_at, ended_at, outcome) "
+            "VALUES (?, ?, 'changes_requested', ?, ?, 'changes_requested')",
+            (
+                task_id,
+                older["profile"],
+                newer_end - 1,
+                newer_end,
+            ),
+        )
+        assert cursor.lastrowid is not None
+        newer_run_id = int(cursor.lastrowid)
+        newer = ReviewResult(
+            bundle_sha256=_handoff(fixture).review_bundle_sha256(),
+            reviewer_class=ReviewerClass.REVIEWER,
+            reviewer_identity=str(older["profile"]),
+            attempt_id=str(newer_run_id),
+            verdict=ReviewVerdict.REQUEST_CHANGES,
+            finding_codes=("latest-finding",),
+            completed_at_epoch=newer_end,
+        )
+        conn.execute(
+            "UPDATE task_runs SET metadata = ? WHERE id = ?",
+            (
+                json.dumps(build_review_result_metadata(newer)),
+                newer_run_id,
+            ),
+        )
+        conn.execute(
+            "INSERT INTO task_events (task_id, run_id, kind, payload, created_at) "
+            "VALUES (?, ?, 'claimed', ?, ?)",
+            (task_id, newer_run_id, claimed["payload"], newer_end - 1),
+        )
+        conn.execute(
+            "INSERT INTO task_events (task_id, run_id, kind, payload, created_at) "
+            "VALUES (?, ?, 'changes_requested', '{}', ?)",
+            (task_id, newer_run_id, newer_end),
+        )
+        conn.commit()
+
+        handoff = _handoff(fixture)
+        projection = project_upstream_reviews(conn, task_id, handoff=handoff)
+        aggregate = evaluate_reviews(
+            projection.reviews,
+            bundle_sha256=handoff.review_bundle_sha256(),
+            required_reviewers=handoff.route.required_reviewers,
+        )
+
+        assert projection.ok
+        assert projection.reviews == (newer,)
         assert not aggregate.allowed
-        assert aggregate.reason is ChangeGateReason.REVIEW_DUPLICATE_CLASS
+        assert aggregate.decision is GateDecision.REQUEST_CHANGES
+        assert aggregate.reason is ChangeGateReason.REVIEW_REQUEST_CHANGES
+
+
+def test_runtime_projection_rejects_older_attempt_id_collision_with_latest(
+    tmp_path: Path,
+    isolated_home: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    with _connect(tmp_path / "kanban.db") as conn:
+        task_id = _create_ready_task(conn)
+        fixture = _attach_runtime_artifacts(conn, tmp_path, task_id)
+        _enable_runtime(monkeypatch, tmp_path / "inventory")
+        latest_run_id = _claim_and_converge_normal_review(
+            conn,
+            fixture,
+            claim_suffix="5",
+        )
+        latest = conn.execute(
+            "SELECT profile, ended_at FROM task_runs WHERE id = ?",
+            (latest_run_id,),
+        ).fetchone()
+        assert latest is not None
+        cursor = conn.execute(
+            "INSERT INTO task_runs "
+            "(task_id, profile, status, started_at, ended_at, outcome) "
+            "VALUES (?, ?, 'review_requested', ?, ?, 'review_requested')",
+            (
+                task_id,
+                latest["profile"],
+                int(latest["ended_at"]) - 20,
+                int(latest["ended_at"]) - 10,
+            ),
+        )
+        assert cursor.lastrowid is not None
+        older_row_id = int(cursor.lastrowid)
+        collision = ReviewResult(
+            bundle_sha256=_handoff(fixture).review_bundle_sha256(),
+            reviewer_class=ReviewerClass.REVIEWER,
+            reviewer_identity=str(latest["profile"]),
+            attempt_id=str(latest_run_id),
+            verdict=ReviewVerdict.PASS,
+            finding_codes=(),
+            completed_at_epoch=int(latest["ended_at"]),
+        )
+        conn.execute(
+            "UPDATE task_runs SET metadata = ? WHERE id = ?",
+            (
+                json.dumps(build_review_result_metadata(collision)),
+                older_row_id,
+            ),
+        )
+        conn.commit()
+
+        projection = project_upstream_reviews(
+            conn,
+            task_id,
+            handoff=_handoff(fixture),
+        )
+
+        assert not projection.ok
+        assert projection.reason is ChangeGateReason.REVIEW_RESULT_MALFORMED
 
 
 @pytest.mark.parametrize(
@@ -1148,8 +1521,6 @@ def test_review_consequence_routes_one_bounded_planner_parent(
         reviewer = kb.claim_review_task(conn, task_id)
         assert reviewer is not None
         assert reviewer.current_run_id is not None
-        issued_g4 = _store_release(conn, fixture, ReleasePurpose.G4, "f")
-
         ok, implementer = kb.request_changes(
             conn,
             task_id,
@@ -1174,10 +1545,11 @@ def test_review_consequence_routes_one_bounded_planner_parent(
         assert planner is not None
         assert planner.assignee == "planner"
         assert planner.status == "ready"
-        state = kb.change_gate_release_state(conn, issued_g4)
-        assert state is not None
-        assert state["state"] == "REVOKED"
-        assert state["revoked_reason"] == expected_reason.value
+        assert conn.execute(
+            "SELECT COUNT(*) FROM change_gate_releases "
+            "WHERE task_id = ? AND purpose = 'G4'",
+            (task_id,),
+        ).fetchone()[0] == 0
 
         handoff = freeze_handoff(
             fixture.evidence,

@@ -128,10 +128,25 @@ def issue_change_gate_release(
                 return _deny(task_id, parsed_purpose.value, projection.reason)
             reviews = projection.reviews
 
+        transition_anchor = kb.derive_change_gate_transition_anchor(
+            conn,
+            task_id,
+            purpose=parsed_purpose,
+            artifacts=artifacts,
+            reviews=reviews,
+        )
+        if transition_anchor is None:
+            return _deny(
+                task_id,
+                parsed_purpose.value,
+                ChangeGateReason.RELEASE_TRANSITION_STALE,
+            )
+
         release = issue_durable_release_artifact(
             purpose=parsed_purpose,
             handoff=artifacts.handoff,
             evidence=artifacts.evidence,
+            transition_anchor=transition_anchor,
             ttl_seconds=policy.release_ttl_seconds,
             clock=lambda: now_epoch,
         )

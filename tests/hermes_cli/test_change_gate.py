@@ -16,6 +16,7 @@ from hermes_cli.change_gate import (
     ChangeGateAdapter,
     ChangeGateReason,
     ChangeGateRequest,
+    DurableReleaseArtifact,
     EvidencePacket,
     FrozenHandoff,
     HumanReleaseReceipt,
@@ -29,14 +30,19 @@ from hermes_cli.change_gate import (
     RiskLevel,
     SourceIdentity,
     StaticArchitectureInventoryReader,
+    TransitionAnchor,
     UpstreamRouteSelector,
     WorkIdentity,
+    canonical_sha256,
     evaluate_reviews,
     expected_release_statement,
     freeze_handoff,
+    issue_durable_release_artifact,
     issue_current_turn_release_receipt,
     project_route,
+    request_from_durable_release,
     validate_current_turn_release_receipt,
+    validate_durable_release_artifact,
 )
 from tools.workflow_authority import _scoped_test_current_turn_user_authority
 
@@ -232,6 +238,51 @@ def _review(
         verdict=verdict,
         finding_codes=findings,
         completed_at_epoch=NOW,
+    )
+
+
+def _claim_transition_anchor(
+    case: SyntheticCase,
+    *,
+    latest_event_id: int = 1,
+    latest_event_kind: str = "task_ready",
+    latest_event_payload_sha256: str = "9" * 64,
+) -> TransitionAnchor:
+    return TransitionAnchor(
+        task_id=case.evidence.work.task_id,
+        purpose=ReleasePurpose.CLAIM,
+        status="ready",
+        route_sha256=canonical_sha256(case.handoff.route.executor),
+        workspace_source_sha256="8" * 64,
+        current_run_id=None,
+        latest_event_id=latest_event_id,
+        latest_event_kind=latest_event_kind,
+        latest_event_payload_sha256=latest_event_payload_sha256,
+        frozen_handoff_sha256=case.handoff.digest(),
+        review_bundle_sha256=None,
+        selected_review_set_sha256=None,
+    )
+
+
+def _g4_transition_anchor(
+    case: SyntheticCase,
+    reviews: tuple[ReviewResult, ...],
+    *,
+    latest_event_id: int = 2,
+) -> TransitionAnchor:
+    return TransitionAnchor(
+        task_id=case.evidence.work.task_id,
+        purpose=ReleasePurpose.G4,
+        status="review",
+        route_sha256=canonical_sha256(case.handoff.route.executor),
+        workspace_source_sha256="8" * 64,
+        current_run_id=None,
+        latest_event_id=latest_event_id,
+        latest_event_kind="review_requested",
+        latest_event_payload_sha256="a" * 64,
+        frozen_handoff_sha256=case.handoff.digest(),
+        review_bundle_sha256=case.handoff.review_bundle_sha256(),
+        selected_review_set_sha256=canonical_sha256(reviews),
     )
 
 
@@ -609,6 +660,108 @@ def test_malformed_or_wrong_handoff_receipt_fails_closed_without_exception():
         handoff_sha256=case.handoff.digest(),
         purpose=ReleasePurpose.CLAIM,
     )
+
+
+def test_durable_claim_release_binds_exact_transition_anchor():
+    case = _case()
+    anchor = _claim_transition_anchor(case)
+    statement = expected_release_statement(
+        purpose=ReleasePurpose.CLAIM,
+        handoff_sha256=case.handoff.digest(),
+    )
+    with _scoped_test_current_turn_user_authority(
+        statement,
+        session_id="session-change-gate",
+        turn_id="turn-durable-claim",
+        platform_scope="manual",
+    ):
+        release = issue_durable_release_artifact(
+            purpose=ReleasePurpose.CLAIM,
+            handoff=case.handoff,
+            evidence=case.evidence,
+            transition_anchor=anchor,
+            ttl_seconds=60,
+            clock=lambda: NOW,
+        )
+
+    assert release is not None
+    assert release.transition_anchor == anchor
+    assert release.route_sha256 == canonical_sha256(case.handoff.route)
+    assert validate_durable_release_artifact(
+        release,
+        purpose=ReleasePurpose.CLAIM,
+        evidence=case.evidence,
+        handoff=case.handoff,
+        now_epoch=NOW,
+        expected_transition_anchor=anchor,
+    ) is ChangeGateReason.ALLOWED
+
+    stale_anchor = _claim_transition_anchor(case, latest_event_id=2)
+    assert validate_durable_release_artifact(
+        release,
+        purpose=ReleasePurpose.CLAIM,
+        evidence=case.evidence,
+        handoff=case.handoff,
+        now_epoch=NOW,
+        expected_transition_anchor=stale_anchor,
+    ) is ChangeGateReason.RELEASE_TRANSITION_STALE
+
+    request = request_from_durable_release(
+        release,
+        evidence=case.evidence,
+        handoff=case.handoff,
+        expected_transition_anchor=anchor,
+        requested_paths=(),
+    )
+    assert request is not None
+    assert request.requested_paths == ()
+
+
+def test_durable_g4_release_requires_review_transition_anchor():
+    case = _case(RiskLevel.HIGH)
+    reviews = (
+        _review(case, ReviewerClass.NORMAL, "reviewer-normal"),
+        _review(case, ReviewerClass.DEEP, "reviewer-deep"),
+    )
+    anchor = _g4_transition_anchor(case, reviews)
+    statement = expected_release_statement(
+        purpose=ReleasePurpose.G4,
+        handoff_sha256=case.handoff.digest(),
+    )
+    with _scoped_test_current_turn_user_authority(
+        statement,
+        session_id="session-change-gate",
+        turn_id="turn-durable-g4",
+        platform_scope="manual",
+    ):
+        release = issue_durable_release_artifact(
+            purpose=ReleasePurpose.G4,
+            handoff=case.handoff,
+            evidence=case.evidence,
+            transition_anchor=anchor,
+            ttl_seconds=60,
+            clock=lambda: NOW,
+        )
+
+    assert release is not None
+    assert validate_durable_release_artifact(
+        release,
+        purpose=ReleasePurpose.G4,
+        evidence=case.evidence,
+        handoff=case.handoff,
+        now_epoch=NOW,
+        expected_transition_anchor=anchor,
+    ) is ChangeGateReason.ALLOWED
+
+    wrong_generation = replace(release, transition_anchor=replace(anchor, status="ready"))
+    assert validate_durable_release_artifact(
+        wrong_generation,
+        purpose=ReleasePurpose.G4,
+        evidence=case.evidence,
+        handoff=case.handoff,
+        now_epoch=NOW,
+        expected_transition_anchor=anchor,
+    ) is ChangeGateReason.RELEASE_TRANSITION_STALE
 
 
 @pytest.mark.parametrize("risk", [RiskLevel.LOW, RiskLevel.NORMAL])

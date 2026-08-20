@@ -17,6 +17,7 @@ from hermes_cli.change_gate import (
     MAX_RUNTIME_ARTIFACT_BYTES,
     RELEASE_RECEIPT_SCHEMA,
     REVIEW_RESULT_SCHEMA,
+    TRANSITION_ANCHOR_SCHEMA,
     ArchitectureInventoryRecord,
     ArtifactBinding,
     DurableReleaseArtifact,
@@ -31,6 +32,7 @@ from hermes_cli.change_gate import (
     RiskLevel,
     RouteProjection,
     SourceIdentity,
+    TransitionAnchor,
     UpstreamRouteSelector,
     WorkIdentity,
     canonical_json_bytes,
@@ -45,7 +47,7 @@ _Schema: TypeAlias = Literal[
     "hermes.change-gate.frozen-handoff/v1",
     "hermes.change-gate.architecture-inventory/v1",
     "hermes.change-gate.review-result/v1",
-    "hermes.change-gate.durable-release/v1",
+    "hermes.change-gate.durable-release/v2",
 ]
 
 _SUPPORTED_SCHEMAS: Final[set[str]] = {
@@ -497,6 +499,79 @@ def _human_release_receipt(value: object) -> HumanReleaseReceipt:
     )
 
 
+def _transition_anchor(value: object) -> TransitionAnchor:
+    data = _object(
+        value,
+        {
+            "task_id",
+            "purpose",
+            "status",
+            "route_sha256",
+            "workspace_source_sha256",
+            "current_run_id",
+            "latest_event_id",
+            "latest_event_kind",
+            "latest_event_payload_sha256",
+            "frozen_handoff_sha256",
+            "review_bundle_sha256",
+            "selected_review_set_sha256",
+            "schema",
+        },
+    )
+    if data["schema"] != TRANSITION_ANCHOR_SCHEMA:
+        raise _CodecError(ArtifactCodecReason.WRONG_SCHEMA)
+    current_run_id = _optional_positive_int(data["current_run_id"])
+    latest_event_id = _optional_positive_int(data["latest_event_id"])
+    latest_event_kind = _optional_text(data["latest_event_kind"])
+    latest_event_payload_sha256 = _optional_sha256(data["latest_event_payload_sha256"])
+    event_all_null = (
+        latest_event_id is None
+        and latest_event_kind is None
+        and latest_event_payload_sha256 is None
+    )
+    event_all_present = (
+        latest_event_id is not None
+        and latest_event_kind is not None
+        and latest_event_payload_sha256 is not None
+    )
+    if not (event_all_null or event_all_present):
+        raise _CodecError(ArtifactCodecReason.VALUE_INVALID)
+    anchor = TransitionAnchor(
+        task_id=_text(data["task_id"]),
+        purpose=_release_purpose(data["purpose"]),
+        status=_text(data["status"]),
+        route_sha256=_sha256(data["route_sha256"]),
+        workspace_source_sha256=_sha256(data["workspace_source_sha256"]),
+        current_run_id=current_run_id,
+        latest_event_id=latest_event_id,
+        latest_event_kind=latest_event_kind,
+        latest_event_payload_sha256=latest_event_payload_sha256,
+        frozen_handoff_sha256=_sha256(data["frozen_handoff_sha256"]),
+        review_bundle_sha256=_optional_sha256(data["review_bundle_sha256"]),
+        selected_review_set_sha256=_optional_sha256(data["selected_review_set_sha256"]),
+        schema=TRANSITION_ANCHOR_SCHEMA,
+    )
+    if anchor.current_run_id is not None:
+        raise _CodecError(ArtifactCodecReason.VALUE_INVALID)
+    if anchor.purpose is ReleasePurpose.CLAIM:
+        if (
+            anchor.status != "ready"
+            or anchor.review_bundle_sha256 is not None
+            or anchor.selected_review_set_sha256 is not None
+        ):
+            raise _CodecError(ArtifactCodecReason.VALUE_INVALID)
+    elif anchor.purpose is ReleasePurpose.G4:
+        if (
+            anchor.status != "review"
+            or anchor.review_bundle_sha256 is None
+            or anchor.selected_review_set_sha256 is None
+        ):
+            raise _CodecError(ArtifactCodecReason.VALUE_INVALID)
+    else:
+        raise _CodecError(ArtifactCodecReason.VALUE_INVALID)
+    return anchor
+
+
 def _durable_release(value: dict[str, Any]) -> DurableReleaseArtifact:
     data = _closed(
         value,
@@ -512,6 +587,7 @@ def _durable_release(value: dict[str, Any]) -> DurableReleaseArtifact:
             "work_id",
             "source",
             "authority_receipt",
+            "transition_anchor",
             "issued_at_epoch",
             "expires_at_epoch",
             "max_consumptions",
@@ -532,6 +608,7 @@ def _durable_release(value: dict[str, Any]) -> DurableReleaseArtifact:
         work_id=_text(data["work_id"]),
         source=_source(data["source"]),
         authority_receipt=_human_release_receipt(data["authority_receipt"]),
+        transition_anchor=_transition_anchor(data["transition_anchor"]),
         issued_at_epoch=_nonnegative_int(data["issued_at_epoch"]),
         expires_at_epoch=_positive_int(data["expires_at_epoch"]),
         max_consumptions=_positive_int(data["max_consumptions"]),
@@ -542,6 +619,12 @@ def _durable_release(value: dict[str, Any]) -> DurableReleaseArtifact:
     if artifact.authority_receipt.purpose is not artifact.purpose:
         raise _CodecError(ArtifactCodecReason.VALUE_INVALID)
     if artifact.authority_receipt.handoff_sha256 != artifact.handoff_sha256:
+        raise _CodecError(ArtifactCodecReason.VALUE_INVALID)
+    if artifact.transition_anchor.purpose is not artifact.purpose:
+        raise _CodecError(ArtifactCodecReason.VALUE_INVALID)
+    if artifact.transition_anchor.task_id != artifact.task_id:
+        raise _CodecError(ArtifactCodecReason.VALUE_INVALID)
+    if artifact.transition_anchor.frozen_handoff_sha256 != artifact.handoff_sha256:
         raise _CodecError(ArtifactCodecReason.VALUE_INVALID)
     return artifact
 
@@ -651,6 +734,12 @@ def _sha256(value: object) -> str:
     return value
 
 
+def _optional_sha256(value: object) -> str | None:
+    if value is None:
+        return None
+    return _sha256(value)
+
+
 def _git_oid(value: object) -> str:
     if not _is_git_oid(value):
         raise _CodecError(ArtifactCodecReason.TYPE_INVALID)
@@ -668,6 +757,12 @@ def _positive_int(value: object) -> int:
     if type(value) is not int or value < 1:
         raise _CodecError(ArtifactCodecReason.TYPE_INVALID)
     return value
+
+
+def _optional_positive_int(value: object) -> int | None:
+    if value is None:
+        return None
+    return _positive_int(value)
 
 
 def _risk(value: object) -> RiskLevel:

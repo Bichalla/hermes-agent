@@ -96,16 +96,14 @@ from hermes_cli.change_gate import (
     ChangeGateResult,
     DURABLE_RELEASE_SCHEMA,
     DurableReleaseArtifact,
-    EvidencePacket,
-    FrozenHandoff,
     GateDecision,
     GatePhase,
     ReleasePurpose,
     ReviewResult,
     ReviewVerdict,
+    TransitionAnchor,
     UpstreamRouteSelector,
     canonical_sha256,
-    request_from_durable_release,
     validate_durable_release_artifact,
 )
 from hermes_cli.sqlite_util import add_column_if_missing as _add_column_if_missing
@@ -1553,6 +1551,8 @@ _CHANGE_GATE_SCHEMA_SQL = """
 CREATE TABLE IF NOT EXISTS change_gate_releases (
     release_id               TEXT PRIMARY KEY,
     artifact_sha256          TEXT NOT NULL UNIQUE,
+    artifact_schema          TEXT NOT NULL,
+    transition_anchor_sha256 TEXT NOT NULL,
     task_id                  TEXT NOT NULL,
     work_id                  TEXT NOT NULL,
     purpose                  TEXT NOT NULL CHECK (purpose IN ('CLAIM', 'G4')),
@@ -4321,6 +4321,27 @@ def initialize_change_gate_runtime_schema(conn: sqlite3.Connection) -> None:
             sql = statement.strip()
             if sql:
                 conn.execute(sql)
+        # V2 installations may already have the default-off extension table.
+        # Add only nullable authority columns so historical /v1 rows remain
+        # representable but fail closed (NULL can never satisfy the V3 CAS).
+        columns = {
+            row["name"]
+            for row in conn.execute("PRAGMA table_info(change_gate_releases)")
+        }
+        if "artifact_schema" not in columns:
+            _add_column_if_missing(
+                conn,
+                "change_gate_releases",
+                "artifact_schema",
+                "artifact_schema TEXT",
+            )
+        if "transition_anchor_sha256" not in columns:
+            _add_column_if_missing(
+                conn,
+                "change_gate_releases",
+                "transition_anchor_sha256",
+                "transition_anchor_sha256 TEXT",
+            )
 
 
 def change_gate_runtime_schema_exists(conn: sqlite3.Connection) -> bool:
@@ -4330,9 +4351,156 @@ def change_gate_runtime_schema_exists(conn: sqlite3.Connection) -> bool:
     ).fetchone() is not None
 
 
+_MAX_CHANGE_GATE_EVENT_PAYLOAD_BYTES = 64 * 1024
+
+
+def derive_change_gate_transition_anchor(
+    conn: sqlite3.Connection,
+    task_id: str,
+    *,
+    purpose: ReleasePurpose,
+    artifacts: object,
+    reviews: Iterable[ReviewResult] = (),
+) -> TransitionAnchor | None:
+    """Derive one raw-free transition generation from Kanban-owned state.
+
+    The public release tool never accepts any of these fields.  It supplies
+    only ``task_id`` and ``purpose``; this owner reads the task row, the latest
+    monotonic task event, the already re-observed workspace/source binding,
+    and (for G4) the selected current review set.
+    """
+
+    from hermes_cli.change_gate_runtime import TaskGateArtifacts
+
+    if (
+        type(task_id) is not str
+        or not task_id
+        or "\0" in task_id
+        or type(purpose) is not ReleasePurpose
+        or type(artifacts) is not TaskGateArtifacts
+        or artifacts.evidence.work.task_id != task_id
+    ):
+        return None
+    row = conn.execute(
+        "SELECT status, assignee, model_override, provider_override, "
+        "reasoning_effort, workspace_kind, workspace_path, branch_name, "
+        "current_run_id, claim_lock FROM tasks WHERE id = ?",
+        (task_id,),
+    ).fetchone()
+    if row is None:
+        return None
+    status = row["status"]
+    current_run_id = row["current_run_id"]
+    if (
+        type(status) is not str
+        or (current_run_id is not None and type(current_run_id) is not int)
+        or current_run_id is not None
+        or (purpose is ReleasePurpose.CLAIM and status != "ready")
+        or (purpose is ReleasePurpose.CLAIM and row["claim_lock"] is not None)
+        or (purpose is ReleasePurpose.G4 and status != "review")
+    ):
+        return None
+    try:
+        route = UpstreamRouteSelector(
+            assignee=row["assignee"],
+            model_override=row["model_override"],
+            provider_override=row["provider_override"],
+            reasoning_effort=row["reasoning_effort"],
+        ).normalized()
+        if route != artifacts.actual_route.normalized():
+            return None
+        handoff_sha256 = artifacts.handoff.digest()
+        observation = getattr(artifacts, "workspace_observation", None)
+        workspace_source_sha256 = canonical_sha256(
+            {
+                "schema": "hermes.change-gate.workspace-source-binding/v1",
+                "workspace_kind": row["workspace_kind"],
+                "workspace_path": row["workspace_path"],
+                "branch_name": row["branch_name"],
+                "source": artifacts.actual_source,
+                "workspace_observation_sha256": canonical_sha256(observation),
+            }
+        )
+        route_sha256 = canonical_sha256(route)
+    except (TypeError, ValueError):
+        return None
+
+    event = conn.execute(
+        "SELECT id, kind, payload FROM task_events "
+        "WHERE task_id = ? ORDER BY id DESC LIMIT 1",
+        (task_id,),
+    ).fetchone()
+    latest_event_id: int | None = None
+    latest_event_kind: str | None = None
+    latest_event_payload_sha256: str | None = None
+    if event is not None:
+        payload = event["payload"]
+        if (
+            type(event["id"]) is not int
+            or event["id"] < 1
+            or type(event["kind"]) is not str
+            or not event["kind"]
+            or len(event["kind"]) > 128
+            or "\0" in event["kind"]
+            or (payload is not None and type(payload) is not str)
+        ):
+            return None
+        payload_bytes = b"" if payload is None else payload.encode("utf-8")
+        if len(payload_bytes) > _MAX_CHANGE_GATE_EVENT_PAYLOAD_BYTES:
+            return None
+        latest_event_id = int(event["id"])
+        latest_event_kind = event["kind"]
+        latest_event_payload_sha256 = canonical_sha256({"payload": payload})
+
+    review_bundle_sha256: str | None = None
+    selected_review_set_sha256: str | None = None
+    selected_reviews = tuple(reviews)
+    if any(type(review) is not ReviewResult for review in selected_reviews):
+        return None
+    if purpose is ReleasePurpose.CLAIM:
+        if selected_reviews:
+            return None
+    else:
+        try:
+            review_bundle_sha256 = artifacts.handoff.review_bundle_sha256()
+            selected_review_set_sha256 = canonical_sha256(
+                tuple(
+                    sorted(
+                        selected_reviews,
+                        key=lambda review: (
+                            review.reviewer_class.value,
+                            review.attempt_id,
+                        ),
+                    )
+                )
+            )
+        except (TypeError, ValueError):
+            return None
+
+    try:
+        return TransitionAnchor(
+            task_id=task_id,
+            purpose=purpose,
+            status=status,
+            route_sha256=route_sha256,
+            workspace_source_sha256=workspace_source_sha256,
+            current_run_id=None,
+            latest_event_id=latest_event_id,
+            latest_event_kind=latest_event_kind,
+            latest_event_payload_sha256=latest_event_payload_sha256,
+            frozen_handoff_sha256=handoff_sha256,
+            review_bundle_sha256=review_bundle_sha256,
+            selected_review_set_sha256=selected_review_set_sha256,
+        )
+    except (TypeError, ValueError):
+        return None
+
+
 def _store_change_gate_release(
     conn: sqlite3.Connection,
     release: DurableReleaseArtifact,
+    *,
+    _allow_nested: bool = False,
 ) -> str:
     """Persist one already-authorized release; never creates the schema.
 
@@ -4350,19 +4518,23 @@ def _store_change_gate_release(
     data = encode_artifact(release)
     artifact_sha256 = hashlib.sha256(data).hexdigest()
     authority_receipt_sha256 = canonical_sha256(release.authority_receipt)
-    with write_txn(conn):
+    transition_anchor_sha256 = release.transition_anchor.digest()
+    with write_txn(conn, allow_nested=_allow_nested):
         conn.execute(
             """
             INSERT INTO change_gate_releases (
-                release_id, artifact_sha256, task_id, work_id, purpose,
+                release_id, artifact_sha256, artifact_schema,
+                transition_anchor_sha256, task_id, work_id, purpose,
                 handoff_sha256, evidence_sha256, inventory_sha256,
                 artifact_set_sha256, route_sha256, authority_receipt_sha256,
                 issued_at, expires_at, max_consumptions, artifact_json, state
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'ISSUED')
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'ISSUED')
             """,
             (
                 release.release_id,
                 artifact_sha256,
+                release.schema,
+                transition_anchor_sha256,
                 release.task_id,
                 release.work_id,
                 release.purpose.value,
@@ -4403,6 +4575,7 @@ def persist_foreground_change_gate_release(
     from hermes_cli.change_gate_runtime import (
         load_runtime_policy,
         load_task_gate_artifacts,
+        project_upstream_reviews,
     )
 
     if type(release) is not DurableReleaseArtifact:
@@ -4413,29 +4586,53 @@ def persist_foreground_change_gate_release(
     policy = load_runtime_policy()
     if policy.enabled is not True or policy.valid is not True:
         raise PermissionError("change_gate_runtime_not_enabled")
-    load = load_task_gate_artifacts(
-        conn,
-        release.task_id,
-        policy=policy,
-        attachment_root=task_attachments_dir(release.task_id, board=board),
-    )
-    if not load.ok or load.artifacts is None:
-        raise PermissionError("change_gate_artifact_binding_required")
-    if validate_durable_release_artifact(
-        release,
-        purpose=release.purpose,
-        evidence=load.artifacts.evidence,
-        handoff=load.artifacts.handoff,
-        now_epoch=now,
-    ) is not ChangeGateReason.ALLOWED:
-        raise PermissionError("change_gate_release_binding_required")
-    if not validate_current_turn_release_receipt(
-        release.authority_receipt,
-        handoff_sha256=release.handoff_sha256,
-        purpose=release.purpose,
-    ):
-        raise PermissionError("foreground_release_authority_required")
-    return _store_change_gate_release(conn, release)
+    # Bind DB lifecycle state and insertion under one owner transaction.  Git
+    # remains an external read-only source, so it is re-observed inside this
+    # bounded section immediately before the row is written.
+    with write_txn(conn):
+        load = load_task_gate_artifacts(
+            conn,
+            release.task_id,
+            policy=policy,
+            attachment_root=task_attachments_dir(release.task_id, board=board),
+        )
+        if not load.ok or load.artifacts is None:
+            raise PermissionError("change_gate_artifact_binding_required")
+        reviews: tuple[ReviewResult, ...] = ()
+        if release.purpose is ReleasePurpose.G4:
+            projection = project_upstream_reviews(
+                conn,
+                release.task_id,
+                handoff=load.artifacts.handoff,
+            )
+            if not projection.ok:
+                raise PermissionError("change_gate_review_binding_required")
+            reviews = projection.reviews
+        transition_anchor = derive_change_gate_transition_anchor(
+            conn,
+            release.task_id,
+            purpose=release.purpose,
+            artifacts=load.artifacts,
+            reviews=reviews,
+        )
+        if transition_anchor is None:
+            raise PermissionError("change_gate_transition_anchor_required")
+        if validate_durable_release_artifact(
+            release,
+            purpose=release.purpose,
+            evidence=load.artifacts.evidence,
+            handoff=load.artifacts.handoff,
+            now_epoch=now,
+            expected_transition_anchor=transition_anchor,
+        ) is not ChangeGateReason.ALLOWED:
+            raise PermissionError("change_gate_release_binding_required")
+        if not validate_current_turn_release_receipt(
+            release.authority_receipt,
+            handoff_sha256=release.handoff_sha256,
+            purpose=release.purpose,
+        ):
+            raise PermissionError("foreground_release_authority_required")
+        return _store_change_gate_release(conn, release, _allow_nested=True)
 
 
 def _load_change_gate_release(
@@ -4445,7 +4642,10 @@ def _load_change_gate_release(
     if not change_gate_runtime_schema_exists(conn):
         return None
     row = conn.execute(
-        "SELECT artifact_json, artifact_sha256 FROM change_gate_releases WHERE release_id = ?",
+        "SELECT artifact_json, artifact_sha256, artifact_schema, "
+        "transition_anchor_sha256, task_id, work_id, purpose, handoff_sha256, "
+        "evidence_sha256, inventory_sha256, artifact_set_sha256, route_sha256 "
+        "FROM change_gate_releases WHERE release_id = ?",
         (release_id,),
     ).fetchone()
     if row is None or type(row["artifact_json"]) is not str:
@@ -4459,6 +4659,18 @@ def _load_change_gate_release(
         or type(decoded.value) is not DurableReleaseArtifact
         or decoded.sha256 != row["artifact_sha256"]
         or decoded.value.release_id != release_id
+        or row["artifact_schema"] != DURABLE_RELEASE_SCHEMA
+        or decoded.value.schema != row["artifact_schema"]
+        or decoded.value.transition_anchor.digest()
+        != row["transition_anchor_sha256"]
+        or decoded.value.task_id != row["task_id"]
+        or decoded.value.work_id != row["work_id"]
+        or decoded.value.purpose.value != row["purpose"]
+        or decoded.value.handoff_sha256 != row["handoff_sha256"]
+        or decoded.value.evidence_sha256 != row["evidence_sha256"]
+        or decoded.value.inventory_sha256 != row["inventory_sha256"]
+        or decoded.value.artifact_set_sha256 != row["artifact_set_sha256"]
+        or decoded.value.route_sha256 != row["route_sha256"]
     ):
         return None
     return decoded.value
@@ -4480,10 +4692,11 @@ def latest_change_gate_release_id(
         """
         SELECT release_id FROM change_gate_releases
         WHERE task_id = ? AND purpose = ? AND state = 'ISSUED'
+          AND artifact_schema = ? AND transition_anchor_sha256 IS NOT NULL
           AND issued_at <= ? AND expires_at > ?
         ORDER BY issued_at DESC, rowid DESC LIMIT 1
         """,
-        (task_id, purpose.value, now, now),
+        (task_id, purpose.value, DURABLE_RELEASE_SCHEMA, now, now),
     ).fetchone()
     return str(row["release_id"]) if row is not None else None
 
@@ -4494,11 +4707,13 @@ def _change_gate_release_for_transition(
     *,
     purpose: ReleasePurpose,
     now_epoch: int,
+    expected_transition_anchor: TransitionAnchor | None = None,
 ) -> tuple[DurableReleaseArtifact | None, ChangeGateReason]:
     if not change_gate_runtime_schema_exists(conn):
         return None, ChangeGateReason.RELEASE_MISSING
     row = conn.execute(
-        "SELECT release_id, purpose, state, issued_at, expires_at FROM change_gate_releases "
+        "SELECT release_id, purpose, state, issued_at, expires_at, "
+        "artifact_schema, transition_anchor_sha256 FROM change_gate_releases "
         "WHERE task_id = ? AND purpose = ? ORDER BY issued_at DESC, rowid DESC LIMIT 1",
         (task_id, purpose.value),
     ).fetchone()
@@ -4521,41 +4736,26 @@ def _change_gate_release_for_transition(
         return None, ChangeGateReason.RELEASE_ARTIFACT_MALFORMED
     if now_epoch < row["issued_at"] or now_epoch >= row["expires_at"]:
         return None, ChangeGateReason.RELEASE_EXPIRED
+    if row["artifact_schema"] != DURABLE_RELEASE_SCHEMA:
+        return None, ChangeGateReason.RELEASE_ARTIFACT_MALFORMED
+    if type(expected_transition_anchor) is not TransitionAnchor:
+        return None, ChangeGateReason.RELEASE_TRANSITION_STALE
+    try:
+        expected_anchor_sha256 = expected_transition_anchor.digest()
+    except (TypeError, ValueError):
+        return None, ChangeGateReason.RELEASE_TRANSITION_STALE
+    if row["transition_anchor_sha256"] != expected_anchor_sha256:
+        return None, ChangeGateReason.RELEASE_TRANSITION_STALE
     release = _load_change_gate_release(conn, row["release_id"])
+    if (
+        release is not None
+        and release.transition_anchor != expected_transition_anchor
+    ):
+        return None, ChangeGateReason.RELEASE_TRANSITION_STALE
     return (
         (release, ChangeGateReason.ALLOWED)
         if release is not None
         else (None, ChangeGateReason.RELEASE_ARTIFACT_MALFORMED)
-    )
-
-
-def _change_gate_request_from_release(
-    conn: sqlite3.Connection,
-    release_id: str,
-    *,
-    purpose: ReleasePurpose,
-    evidence: EvidencePacket,
-    handoff: FrozenHandoff,
-    reviews: Iterable[ReviewResult] = (),
-    now_epoch: int,
-) -> ChangeGateRequest | None:
-    release = _load_change_gate_release(conn, release_id)
-    if release is None:
-        return None
-    reason = validate_durable_release_artifact(
-        release,
-        purpose=purpose,
-        evidence=evidence,
-        handoff=handoff,
-        now_epoch=now_epoch,
-    )
-    if reason is not ChangeGateReason.ALLOWED:
-        return None
-    return request_from_durable_release(
-        release,
-        evidence=evidence,
-        handoff=handoff,
-        reviews=tuple(reviews),
     )
 
 
@@ -4577,6 +4777,7 @@ def _mark_change_gate_release_consumed(
            SET state = 'CONSUMED', consumed_at = ?, consumed_run_id = ?,
                consumed_event_id = ?, consumed_from_status = ?, consumed_to_status = ?
          WHERE release_id = ? AND artifact_sha256 = ? AND task_id = ?
+           AND artifact_schema = ? AND transition_anchor_sha256 = ?
            AND work_id = ? AND purpose = ? AND handoff_sha256 = ?
            AND evidence_sha256 = ? AND inventory_sha256 = ?
            AND artifact_set_sha256 = ? AND route_sha256 = ?
@@ -4592,6 +4793,8 @@ def _mark_change_gate_release_consumed(
             release.release_id,
             release.digest(),
             release.task_id,
+            release.schema,
+            release.transition_anchor.digest(),
             release.work_id,
             release.purpose.value,
             release.handoff_sha256,
@@ -4722,7 +4925,8 @@ def change_gate_release_state(conn: sqlite3.Connection, release_id: str) -> dict
     if not change_gate_runtime_schema_exists(conn):
         return None
     row = conn.execute(
-        "SELECT release_id, artifact_sha256, task_id, work_id, purpose, state, "
+        "SELECT release_id, artifact_sha256, artifact_schema, "
+        "transition_anchor_sha256, task_id, work_id, purpose, state, "
         "consumed_run_id, consumed_event_id, consumed_from_status, consumed_to_status, "
         "revoked_reason FROM change_gate_releases WHERE release_id = ?",
         (release_id,),
@@ -5175,11 +5379,25 @@ def evaluate_change_gate_claim_runtime(
         policy=runtime_policy,
         attachment_root=task_attachments_dir(task_id, board=board),
     )
-    if not load.applicable:
+    if not load.applicable or not load.ok or load.artifacts is None:
         return evaluate_loaded_runtime(
             load,
             purpose=ReleasePurpose.CLAIM,
             release=None,
+            now_epoch=now,
+        )
+    transition_anchor = derive_change_gate_transition_anchor(
+        conn,
+        task_id,
+        purpose=ReleasePurpose.CLAIM,
+        artifacts=load.artifacts,
+    )
+    if transition_anchor is None:
+        return evaluate_loaded_runtime(
+            load,
+            purpose=ReleasePurpose.CLAIM,
+            release=None,
+            release_reason=ChangeGateReason.RELEASE_TRANSITION_STALE,
             now_epoch=now,
         )
     release, release_reason = _change_gate_release_for_transition(
@@ -5187,6 +5405,7 @@ def evaluate_change_gate_claim_runtime(
         task_id,
         purpose=ReleasePurpose.CLAIM,
         now_epoch=now,
+        expected_transition_anchor=transition_anchor,
     )
     return evaluate_loaded_runtime(
         load,
@@ -5256,6 +5475,15 @@ def evaluate_change_gate_g4_runtime(
         task_id,
         purpose=ReleasePurpose.G4,
         now_epoch=now,
+        expected_transition_anchor=(
+            derive_change_gate_transition_anchor(
+                conn,
+                task_id,
+                purpose=ReleasePurpose.G4,
+                artifacts=load.artifacts,
+                reviews=projection.reviews,
+            )
+        ),
     )
     return evaluate_loaded_runtime(
         load,
@@ -5306,6 +5534,27 @@ def claim_task(
                     board=board,
                 )
                 if runtime_evaluation.applicable and not runtime_evaluation.result.allowed:
+                    if (
+                        runtime_evaluation.artifacts is not None
+                        and runtime_evaluation.result.decision
+                        in {GateDecision.SCOPE_DEVIATION, GateDecision.REPLAN_REQUIRED}
+                    ):
+                        consequence = apply_change_gate_planner_consequence(
+                            conn,
+                            task_id,
+                            decision=runtime_evaluation.result.decision,
+                            reason=runtime_evaluation.result.reason,
+                            handoff_sha256=(
+                                runtime_evaluation.artifacts.handoff.digest()
+                            ),
+                            planner_assignee=runtime_policy.planner_assignee,
+                            board=board,
+                            _allow_nested=True,
+                        )
+                        if not consequence.applied:
+                            raise _ChangeGateAtomicAbort(
+                                "change_gate_planner_consequence_failed"
+                            )
                     return None
             elif change_gate_adapter is not None:
                 gate_result = _evaluate_change_gate_claim(
@@ -6143,6 +6392,20 @@ def _complete_task_impl(
             board=board,
         )
         if preflight.applicable and not preflight.result.allowed:
+            if (
+                preflight.artifacts is not None
+                and preflight.result.decision
+                in {GateDecision.SCOPE_DEVIATION, GateDecision.REPLAN_REQUIRED}
+            ):
+                apply_change_gate_planner_consequence(
+                    conn,
+                    task_id,
+                    decision=preflight.result.decision,
+                    reason=preflight.result.reason,
+                    handoff_sha256=preflight.artifacts.handoff.digest(),
+                    planner_assignee=runtime_policy.planner_assignee,
+                    board=board,
+                )
             return False
     # Fail before validating cards or staging artifacts; re-check inside the
     # final write transaction below to close the parent-reopen race.
@@ -6191,6 +6454,27 @@ def _complete_task_impl(
                 board=board,
             )
             if g4_evaluation.applicable and not g4_evaluation.result.allowed:
+                if (
+                    g4_evaluation.artifacts is not None
+                    and g4_evaluation.result.decision
+                    in {GateDecision.SCOPE_DEVIATION, GateDecision.REPLAN_REQUIRED}
+                ):
+                    consequence = apply_change_gate_planner_consequence(
+                        conn,
+                        task_id,
+                        decision=g4_evaluation.result.decision,
+                        reason=g4_evaluation.result.reason,
+                        handoff_sha256=(
+                            g4_evaluation.artifacts.handoff.digest()
+                        ),
+                        planner_assignee=runtime_policy.planner_assignee,
+                        board=board,
+                        _allow_nested=True,
+                    )
+                    if not consequence.applied:
+                        raise _ChangeGateAtomicAbort(
+                            "change_gate_planner_consequence_failed"
+                        )
                 return False
         # Parent completion is a hard invariant even for direct human review
         # approval. A parent may have been reopened after this task entered

@@ -21,6 +21,7 @@ from hermes_cli.change_gate import (
     RiskLevel,
     RouteProjection,
     SourceIdentity,
+    TransitionAnchor,
     UpstreamRouteSelector,
     WorkIdentity,
     canonical_sha256,
@@ -105,6 +106,41 @@ def _inventory(evidence: EvidencePacket) -> ArchitectureInventoryRecord:
     )
 
 
+def _transition_anchor(
+    *,
+    purpose: ReleasePurpose,
+    evidence: EvidencePacket,
+    handoff_sha256: str,
+    route_sha256: str,
+) -> TransitionAnchor:
+    return TransitionAnchor(
+        task_id=evidence.work.task_id,
+        purpose=purpose,
+        status="ready" if purpose is ReleasePurpose.CLAIM else "review",
+        route_sha256=route_sha256,
+        workspace_source_sha256=canonical_sha256(
+            {
+                "schema": "test.change-gate.workspace-source-binding/v1",
+                "source": evidence.source,
+                "observed_paths": (),
+            }
+        ),
+        current_run_id=None,
+        latest_event_id=None,
+        latest_event_kind=None,
+        latest_event_payload_sha256=None,
+        frozen_handoff_sha256=handoff_sha256,
+        review_bundle_sha256=(
+            None
+            if purpose is ReleasePurpose.CLAIM
+            else canonical_sha256((evidence.route, evidence.allowed_paths))
+        ),
+        selected_review_set_sha256=(
+            None if purpose is ReleasePurpose.CLAIM else canonical_sha256(())
+        ),
+    )
+
+
 def _release(
     *,
     purpose: ReleasePurpose = ReleasePurpose.CLAIM,
@@ -132,20 +168,29 @@ def _release(
         user_message_index=1,
         source_role="human",
     )
+    handoff_sha256 = handoff.digest()
+    route_sha256 = canonical_sha256(handoff.route)
+    anchor_route_sha256 = canonical_sha256(handoff.route.executor)
     return DurableReleaseArtifact(
         release_id=release_id,
         purpose=purpose,
-        handoff_sha256=handoff.digest(),
+        handoff_sha256=handoff_sha256,
         evidence_sha256=evidence.digest(),
         inventory_sha256=handoff.inventory_sha256,
         artifact_set_sha256=canonical_sha256(
             handoff.required_inputs + handoff.produced_artifacts
         ),
-        route_sha256=canonical_sha256(handoff.route),
+        route_sha256=route_sha256,
         task_id=evidence.work.task_id,
         work_id=evidence.work.work_id,
         source=evidence.source,
         authority_receipt=receipt,
+        transition_anchor=_transition_anchor(
+            purpose=purpose,
+            evidence=evidence,
+            handoff_sha256=handoff_sha256,
+            route_sha256=anchor_route_sha256,
+        ),
         issued_at_epoch=issued_at,
         expires_at_epoch=expires_at,
     )
@@ -168,7 +213,15 @@ def test_explicit_runtime_schema_initialization_is_idempotent(tmp_path: Path) ->
             for row in conn.execute("PRAGMA table_info(change_gate_releases)").fetchall()
         }
 
-    assert {"release_id", "artifact_sha256", "task_id", "purpose", "state"} <= columns
+    assert {
+        "release_id",
+        "artifact_sha256",
+        "artifact_schema",
+        "transition_anchor_sha256",
+        "task_id",
+        "purpose",
+        "state",
+    } <= columns
 
 
 def test_store_load_round_trips_canonical_durable_release(tmp_path: Path) -> None:
@@ -183,7 +236,59 @@ def test_store_load_round_trips_canonical_durable_release(tmp_path: Path) -> Non
     assert loaded == release
     assert row is not None
     assert row["artifact_sha256"] == release.digest()
+    assert row["artifact_schema"] == release.schema
+    assert row["transition_anchor_sha256"] == release.transition_anchor.digest()
     assert row["state"] == "ISSUED"
+
+
+def test_transition_requires_matching_anchor(tmp_path: Path) -> None:
+    release = _release()
+    stale_anchor = replace(release.transition_anchor, latest_event_id=99)
+    with _connect(tmp_path / "kanban.db") as conn:
+        kb.initialize_change_gate_runtime_schema(conn)
+        kb._store_change_gate_release(conn, release)
+
+        matched = kb._change_gate_release_for_transition(
+            conn,
+            release.task_id,
+            purpose=ReleasePurpose.CLAIM,
+            now_epoch=NOW + 1,
+            expected_transition_anchor=release.transition_anchor,
+        )
+        stale = kb._change_gate_release_for_transition(
+            conn,
+            release.task_id,
+            purpose=ReleasePurpose.CLAIM,
+            now_epoch=NOW + 1,
+            expected_transition_anchor=stale_anchor,
+        )
+
+    assert matched == (release, kb.ChangeGateReason.ALLOWED)
+    assert stale == (None, kb.ChangeGateReason.RELEASE_TRANSITION_STALE)
+
+
+def test_legacy_release_schema_fails_closed_at_transition(tmp_path: Path) -> None:
+    release = _release()
+    with _connect(tmp_path / "kanban.db") as conn:
+        kb.initialize_change_gate_runtime_schema(conn)
+        kb._store_change_gate_release(conn, release)
+        conn.execute(
+            "UPDATE change_gate_releases SET artifact_schema = ? WHERE release_id = ?",
+            ("hermes.change-gate.durable-release/v1", release.release_id),
+        )
+        conn.commit()
+
+        loaded = kb._load_change_gate_release(conn, release.release_id)
+        transition = kb._change_gate_release_for_transition(
+            conn,
+            release.task_id,
+            purpose=ReleasePurpose.CLAIM,
+            now_epoch=NOW + 1,
+            expected_transition_anchor=release.transition_anchor,
+        )
+
+    assert loaded is None
+    assert transition == (None, kb.ChangeGateReason.RELEASE_ARTIFACT_MALFORMED)
 
 
 def test_store_refuses_to_create_default_off_schema(tmp_path: Path) -> None:

@@ -1174,6 +1174,94 @@ def test_high_risk_review_projection_requires_normal_then_deep_passes(
         assert g4_state["state"] == "CONSUMED"
 
 
+def test_high_projection_rejects_interleaved_row_claiming_latest_deep_attempt(
+    tmp_path: Path,
+    isolated_home: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    with _connect(tmp_path / "kanban.db") as conn:
+        task_id = _create_ready_task(conn)
+        fixture = _attach_runtime_artifacts(
+            conn,
+            tmp_path,
+            task_id,
+            risk=RiskLevel.HIGH,
+        )
+        _enable_runtime(monkeypatch, tmp_path / "inventory")
+        _store_release(conn, fixture, ReleasePurpose.CLAIM, "d")
+        executor = kb.claim_task(conn, task_id)
+        assert executor is not None and executor.current_run_id is not None
+        assert kb.request_review(
+            conn,
+            task_id,
+            expected_run_id=int(executor.current_run_id),
+        )
+
+        normal = kb.claim_review_task(conn, task_id)
+        assert normal is not None and normal.current_run_id is not None
+        assert kb.request_review(
+            conn,
+            task_id,
+            expected_run_id=int(normal.current_run_id),
+            change_gate_review={
+                "reviewer_class": ReviewerClass.NORMAL.value,
+                "verdict": ReviewVerdict.PASS.value,
+                "finding_codes": [],
+            },
+        )
+
+        placeholder = conn.execute(
+            "INSERT INTO task_runs "
+            "(task_id, profile, status, started_at, ended_at, outcome) "
+            "VALUES (?, 'reviewer-deep', 'review_requested', 1, 2, 'review_requested')",
+            (task_id,),
+        )
+        assert placeholder.lastrowid is not None
+        placeholder_id = int(placeholder.lastrowid)
+
+        deep = kb.claim_review_task(conn, task_id)
+        assert deep is not None and deep.current_run_id is not None
+        deep_run_id = int(deep.current_run_id)
+        assert placeholder_id < deep_run_id
+        assert kb.request_review(
+            conn,
+            task_id,
+            expected_run_id=deep_run_id,
+            change_gate_review={
+                "reviewer_class": ReviewerClass.DEEP.value,
+                "verdict": ReviewVerdict.PASS.value,
+                "finding_codes": [],
+            },
+        )
+        deep_row = conn.execute(
+            "SELECT profile, ended_at FROM task_runs WHERE id = ?",
+            (deep_run_id,),
+        ).fetchone()
+        assert deep_row is not None
+        collision = ReviewResult(
+            bundle_sha256=_handoff(fixture).review_bundle_sha256(),
+            reviewer_class=ReviewerClass.DEEP,
+            reviewer_identity=str(deep_row["profile"]),
+            attempt_id=str(deep_run_id),
+            verdict=ReviewVerdict.PASS,
+            finding_codes=(),
+            completed_at_epoch=int(deep_row["ended_at"]),
+        )
+        conn.execute(
+            "UPDATE task_runs SET metadata = ? WHERE id = ?",
+            (json.dumps(build_review_result_metadata(collision)), placeholder_id),
+        )
+        conn.commit()
+
+        projection = project_upstream_reviews(
+            conn,
+            task_id,
+            handoff=_handoff(fixture),
+        )
+        assert not projection.ok
+        assert projection.reason is ChangeGateReason.REVIEW_RESULT_MALFORMED
+
+
 def test_bounded_correction_reaches_latest_pass_and_atomic_g4(
     tmp_path: Path,
     isolated_home: Path,

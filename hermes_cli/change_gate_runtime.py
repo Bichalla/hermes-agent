@@ -662,9 +662,9 @@ def project_upstream_reviews(
                 continue
             return ReviewProjection((), ChangeGateReason.REVIEW_RESULT_MALFORMED)
         review = decoded.value
+        if review.attempt_id in selected_attempts:
+            return ReviewProjection((), ChangeGateReason.REVIEW_RESULT_MALFORMED)
         if have_required:
-            if review.attempt_id in selected_attempts:
-                return ReviewProjection((), ChangeGateReason.REVIEW_RESULT_MALFORMED)
             continue
         if review.reviewer_class not in required:
             return ReviewProjection((), ChangeGateReason.REVIEW_CLASS_UNEXPECTED)

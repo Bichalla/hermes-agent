@@ -771,6 +771,7 @@ def _handle_complete(args: dict, **kw) -> str:
                     result=result, summary=summary, metadata=metadata,
                     created_cards=created_cards,
                     expected_run_id=_worker_run_id(tid),
+                    board=board,
                 )
             except kb.ArtifactPreservationError as artifact_err:
                 return tool_error(
@@ -951,6 +952,8 @@ def _handle_request_review(args: dict, **kw) -> str:
                 reviewer=reviewer,
                 expected_run_id=_worker_run_id(tid),
                 with_reason=True,
+                change_gate_review=args.get("change_gate_review"),
+                board=board,
             )
             if not ok:
                 detail = fail_reason or "unknown id or not in running/ready"
@@ -999,6 +1002,8 @@ def _handle_request_changes(args: dict, **kw) -> str:
                 tid,
                 reason=reason,
                 expected_run_id=_worker_run_id(tid),
+                change_gate_review=args.get("change_gate_review"),
+                board=board,
             )
             if not ok:
                 return tool_error(
@@ -1942,6 +1947,27 @@ KANBAN_REQUEST_REVIEW_SCHEMA = {
                 ),
                 "additionalProperties": True,
             },
+            "change_gate_review": {
+                "type": "object",
+                "description": (
+                    "Enabled Change Gate reviewer PASS proof. Omit for the "
+                    "initial implementation-to-review handoff."
+                ),
+                "properties": {
+                    "reviewer_class": {
+                        "type": "string",
+                        "enum": ["REVIEWER", "NORMAL", "DEEP"],
+                    },
+                    "verdict": {"type": "string", "enum": ["PASS"]},
+                    "finding_codes": {
+                        "type": "array",
+                        "items": {"type": "string"},
+                        "maxItems": 32,
+                    },
+                },
+                "required": ["reviewer_class", "verdict", "finding_codes"],
+                "additionalProperties": False,
+            },
             "board": _board_schema_prop(),
         },
         "required": ["summary"],
@@ -1970,6 +1996,28 @@ KANBAN_REQUEST_CHANGES_SCHEMA = {
                     "Specific, actionable changes the implementer must make "
                     "before requesting another review."
                 ),
+            },
+            "change_gate_review": {
+                "type": "object",
+                "description": "Enabled Change Gate reviewer REQUEST_CHANGES proof.",
+                "properties": {
+                    "reviewer_class": {
+                        "type": "string",
+                        "enum": ["REVIEWER", "NORMAL", "DEEP"],
+                    },
+                    "verdict": {
+                        "type": "string",
+                        "enum": ["REQUEST_CHANGES", "REPLAN_REQUIRED"],
+                    },
+                    "finding_codes": {
+                        "type": "array",
+                        "items": {"type": "string"},
+                        "minItems": 1,
+                        "maxItems": 32,
+                    },
+                },
+                "required": ["reviewer_class", "verdict", "finding_codes"],
+                "additionalProperties": False,
             },
             "board": _board_schema_prop(),
         },

@@ -11,6 +11,7 @@ from __future__ import annotations
 import hashlib
 import hmac
 import json
+import secrets
 import time
 from collections.abc import Callable
 from dataclasses import dataclass, fields, is_dataclass
@@ -25,8 +26,11 @@ ARCHITECTURE_INVENTORY_SCHEMA = "hermes.change-gate.architecture-inventory/v1"
 REVIEW_RESULT_SCHEMA = "hermes.change-gate.review-result/v1"
 REVIEW_BUNDLE_SCHEMA = "hermes.change-gate.review-bundle/v1"
 RELEASE_RECEIPT_SCHEMA = "hermes.change-gate.current-turn-release/v1"
+DURABLE_RELEASE_SCHEMA = "hermes.change-gate.durable-release/v1"
 CONVERGENCE_RULE = "exact-required-classes-pass-same-frozen-bundle/v1"
 MAX_EVIDENCE_LIFETIME_SECONDS = 600
+MAX_RELEASE_LIFETIME_SECONDS = 600
+MAX_RUNTIME_ARTIFACT_BYTES = 256 * 1024
 
 
 def _system_epoch_seconds() -> int:
@@ -95,6 +99,13 @@ class ChangeGateReason(StrEnum):
     EFFECT_MISMATCH = "effect_mismatch"
     ALLOWED_PATH_VIOLATION = "allowed_path_violation"
     ARTIFACT_BINDING_MISMATCH = "artifact_binding_mismatch"
+    ARTIFACT_AMBIGUOUS = "artifact_ambiguous"
+    ARTIFACT_DIGEST_MISMATCH = "artifact_digest_mismatch"
+    ARTIFACT_PATH_INVALID = "artifact_path_invalid"
+    ARTIFACT_READ_FAILED = "artifact_read_failed"
+    ARTIFACT_ROLE_MISMATCH = "artifact_role_mismatch"
+    ARTIFACT_SYMLINK = "artifact_symlink"
+    ARTIFACT_TOO_LARGE = "artifact_too_large"
     SCOPE_DEVIATION = "scope_deviation"
     ROUTE_POLICY_CONFLICT = "route_policy_conflict"
     ROUTE_PROJECTION_MISMATCH = "route_projection_mismatch"
@@ -103,13 +114,24 @@ class ChangeGateReason(StrEnum):
     INVENTORY_READ_FAILED = "inventory_read_failed"
     RELEASE_RECEIPT_MISSING = "release_receipt_missing"
     RELEASE_RECEIPT_STALE = "release_receipt_stale"
+    RELEASE_MISSING = "release_missing"
+    RELEASE_ARTIFACT_MALFORMED = "release_artifact_malformed"
+    RELEASE_ARTIFACT_DIGEST_MISMATCH = "release_artifact_digest_mismatch"
+    RELEASE_EXPIRED = "release_expired"
+    RELEASE_REVOKED = "release_revoked"
+    RELEASE_REPLAY = "release_replay"
+    RELEASE_TASK_MISMATCH = "release_task_mismatch"
     RELEASE_PURPOSE_UNSUPPORTED = "release_purpose_unsupported"
+    RUNTIME_CONFIG_INVALID = "runtime_config_invalid"
+    SOURCE_READ_FAILED = "source_read_failed"
     REVIEW_RESULT_MALFORMED = "review_result_malformed"
     REVIEW_BUNDLE_MISMATCH = "review_bundle_mismatch"
     REVIEW_CLASS_UNEXPECTED = "review_class_unexpected"
     REVIEW_DUPLICATE_CLASS = "review_duplicate_class"
     REVIEW_IDENTITY_COLLISION = "review_identity_collision"
     REVIEW_MISSING_REQUIRED_CLASS = "review_missing_required_class"
+    REVIEW_CONVERGED_AWAITING_G4 = "review_converged_awaiting_g4"
+    CORRECTION_LIMIT_EXCEEDED = "correction_limit_exceeded"
     REVIEW_REQUEST_CHANGES = "review_request_changes"
     REVIEW_REPLAN_REQUIRED = "review_replan_required"
 
@@ -296,6 +318,35 @@ class HumanReleaseReceipt:
 
 
 @dataclass(frozen=True, slots=True)
+class DurableReleaseArtifact:
+    """Raw-free immutable release evidence stored only by the trusted owner.
+
+    The artifact is deliberately not a bearer token.  It contains exact
+    digests and a raw-free snapshot of the foreground authority receipt; the
+    protected Kanban row owns issuance, state, revocation, and consumption.
+    """
+
+    release_id: str
+    purpose: ReleasePurpose
+    handoff_sha256: str
+    evidence_sha256: str
+    inventory_sha256: str
+    artifact_set_sha256: str
+    route_sha256: str
+    task_id: str
+    work_id: str
+    source: SourceIdentity
+    authority_receipt: HumanReleaseReceipt
+    issued_at_epoch: int
+    expires_at_epoch: int
+    max_consumptions: int = 1
+    schema: str = DURABLE_RELEASE_SCHEMA
+
+    def digest(self) -> str:
+        return canonical_sha256(self)
+
+
+@dataclass(frozen=True, slots=True)
 class ChangeGateRequest:
     evidence: EvidencePacket | None
     frozen_handoff: FrozenHandoff | None
@@ -307,6 +358,7 @@ class ChangeGateRequest:
     observed_outputs: tuple[ArtifactBinding, ...]
     reviews: tuple[ReviewResult, ...]
     purpose: ReleasePurpose = ReleasePurpose.CLAIM
+    durable_release: DurableReleaseArtifact | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -360,7 +412,11 @@ class ChangeGateAdapter:
             now_epoch = self.clock()
         except Exception:
             return _deny(ChangeGateReason.EVIDENCE_MALFORMED, GatePhase.G0_EVIDENCE)
-        evidence_reason = _validate_evidence(evidence, now_epoch=now_epoch)
+        evidence_reason = _validate_evidence(
+            evidence,
+            now_epoch=now_epoch,
+            require_fresh=request.purpose is ReleasePurpose.CLAIM,
+        )
         if evidence_reason is not None:
             if evidence_reason is ChangeGateReason.ROUTE_POLICY_CONFLICT:
                 return _replan(evidence_reason, GatePhase.G0_EVIDENCE)
@@ -435,6 +491,17 @@ class ChangeGateAdapter:
             return inventory_result
 
         if request.purpose is ReleasePurpose.CLAIM:
+            if request.durable_release is not None:
+                durable_reason = validate_durable_release_artifact(
+                    request.durable_release,
+                    purpose=ReleasePurpose.CLAIM,
+                    evidence=evidence,
+                    handoff=handoff,
+                    now_epoch=now_epoch,
+                )
+                if durable_reason is not ChangeGateReason.ALLOWED:
+                    return _deny(durable_reason, GatePhase.G2_CLAIM, route=route)
+                return _allow(ChangeGateReason.ALLOWED, GatePhase.G2_CLAIM, route=route)
             if request.release_receipt is None:
                 return _deny(ChangeGateReason.RELEASE_RECEIPT_MISSING, GatePhase.G2_CLAIM, route=route)
             if not validate_current_turn_release_receipt(
@@ -462,7 +529,18 @@ class ChangeGateAdapter:
                 required_reviewers=route.required_reviewers,
             )
         if request.release_receipt is None:
-            return _deny(ChangeGateReason.RELEASE_RECEIPT_MISSING, GatePhase.G4_RELEASE, route=route)
+            if request.durable_release is None:
+                return _deny(ChangeGateReason.RELEASE_RECEIPT_MISSING, GatePhase.G4_RELEASE, route=route)
+            durable_reason = validate_durable_release_artifact(
+                request.durable_release,
+                purpose=ReleasePurpose.G4,
+                evidence=evidence,
+                handoff=handoff,
+                now_epoch=now_epoch,
+            )
+            if durable_reason is not ChangeGateReason.ALLOWED:
+                return _deny(durable_reason, GatePhase.G4_RELEASE, route=route)
+            return _allow(ChangeGateReason.ALLOWED, GatePhase.G4_RELEASE, route=route)
         if not validate_current_turn_release_receipt(
             request.release_receipt,
             handoff_sha256=handoff.digest(),
@@ -676,6 +754,229 @@ def issue_current_turn_release_receipt(
     )
 
 
+def issue_durable_release_artifact(
+    *,
+    purpose: ReleasePurpose,
+    handoff: FrozenHandoff,
+    evidence: EvidencePacket,
+    ttl_seconds: int,
+    clock: Callable[[], int] = _system_epoch_seconds,
+) -> DurableReleaseArtifact | None:
+    """Mint a persisted release only from the existing live foreground authority."""
+
+    if type(purpose) is not ReleasePurpose or type(handoff) is not FrozenHandoff:
+        return None
+    if type(evidence) is not EvidencePacket:
+        return None
+    if type(ttl_seconds) is not int or ttl_seconds < 1 or ttl_seconds > MAX_RELEASE_LIFETIME_SECONDS:
+        return None
+    try:
+        evidence_sha256 = evidence.digest()
+        handoff_sha256 = handoff.digest()
+        artifact_set_sha256 = _artifact_set_sha256(handoff)
+        route_sha256 = canonical_sha256(handoff.route)
+    except (TypeError, ValueError):
+        return None
+    if handoff.evidence_sha256 != evidence_sha256 or handoff.source != evidence.source:
+        return None
+    receipt = issue_current_turn_release_receipt(
+        purpose=purpose,
+        handoff_sha256=handoff_sha256,
+    )
+    if receipt is None:
+        return None
+    try:
+        now = clock()
+    except Exception:
+        return None
+    if type(now) is not int:
+        return None
+    return DurableReleaseArtifact(
+        release_id="cgr_" + secrets.token_hex(32),
+        purpose=purpose,
+        handoff_sha256=handoff_sha256,
+        evidence_sha256=evidence_sha256,
+        inventory_sha256=handoff.inventory_sha256,
+        artifact_set_sha256=artifact_set_sha256,
+        route_sha256=route_sha256,
+        task_id=evidence.work.task_id,
+        work_id=evidence.work.work_id,
+        source=evidence.source,
+        authority_receipt=receipt,
+        issued_at_epoch=now,
+        expires_at_epoch=now + ttl_seconds,
+    )
+
+
+def request_from_durable_release(
+    release: DurableReleaseArtifact,
+    *,
+    evidence: EvidencePacket,
+    handoff: FrozenHandoff,
+    reviews: Sequence[ReviewResult] = (),
+) -> ChangeGateRequest | None:
+    reason = validate_durable_release_artifact(
+        release,
+        purpose=release.purpose if type(release) is DurableReleaseArtifact else ReleasePurpose.CLAIM,
+        evidence=evidence,
+        handoff=handoff,
+        now_epoch=release.issued_at_epoch if type(release) is DurableReleaseArtifact else 0,
+        require_unexpired=False,
+    )
+    if reason is not ChangeGateReason.ALLOWED:
+        return None
+    return ChangeGateRequest(
+        evidence=evidence,
+        frozen_handoff=handoff,
+        release_receipt=None,
+        source=release.source,
+        work=evidence.work,
+        requested_paths=evidence.allowed_paths,
+        observed_inputs=evidence.required_inputs,
+        observed_outputs=evidence.produced_artifacts,
+        reviews=tuple(reviews),
+        purpose=release.purpose,
+        durable_release=release,
+    )
+
+
+def validate_durable_release_artifact(
+    release: DurableReleaseArtifact,
+    *,
+    purpose: ReleasePurpose,
+    evidence: EvidencePacket,
+    handoff: FrozenHandoff,
+    now_epoch: int,
+    require_unexpired: bool = True,
+) -> ChangeGateReason:
+    if type(release) is not DurableReleaseArtifact:
+        return ChangeGateReason.RELEASE_ARTIFACT_MALFORMED
+    if type(evidence) is not EvidencePacket or type(handoff) is not FrozenHandoff:
+        return ChangeGateReason.RELEASE_ARTIFACT_MALFORMED
+    try:
+        evidence_sha256 = evidence.digest()
+        handoff_sha256 = handoff.digest()
+        artifact_set_sha256 = _artifact_set_sha256(handoff)
+        route_sha256 = canonical_sha256(handoff.route)
+    except (TypeError, ValueError):
+        return ChangeGateReason.RELEASE_ARTIFACT_MALFORMED
+    if (
+        release.schema != DURABLE_RELEASE_SCHEMA
+        or not _valid_release_id(release.release_id)
+        or type(release.purpose) is not ReleasePurpose
+        or release.purpose is not purpose
+        or not all(
+            _is_sha256(value)
+            for value in (
+                release.handoff_sha256,
+                release.evidence_sha256,
+                release.inventory_sha256,
+                release.artifact_set_sha256,
+                release.route_sha256,
+            )
+        )
+        or release.task_id != evidence.work.task_id
+        or release.work_id != evidence.work.work_id
+        or release.source != evidence.source
+        or release.max_consumptions != 1
+        or type(release.issued_at_epoch) is not int
+        or type(release.expires_at_epoch) is not int
+        or type(now_epoch) is not int
+        or type(require_unexpired) is not bool
+    ):
+        return ChangeGateReason.RELEASE_ARTIFACT_MALFORMED
+    ttl = release.expires_at_epoch - release.issued_at_epoch
+    if ttl < 1 or ttl > MAX_RELEASE_LIFETIME_SECONDS:
+        return ChangeGateReason.RELEASE_ARTIFACT_MALFORMED
+    if require_unexpired and (
+        now_epoch < release.issued_at_epoch or now_epoch >= release.expires_at_epoch
+    ):
+        return ChangeGateReason.RELEASE_EXPIRED
+    if _validate_evidence(
+        evidence,
+        now_epoch=now_epoch,
+        require_fresh=purpose is ReleasePurpose.CLAIM,
+    ) is not None:
+        return ChangeGateReason.EVIDENCE_MALFORMED
+    if _validate_handoff(handoff) is not None:
+        return ChangeGateReason.FROZEN_HANDOFF_MALFORMED
+    if handoff.evidence_sha256 != evidence_sha256:
+        return ChangeGateReason.EVIDENCE_DIGEST_MISMATCH
+    if _compare_handoff_to_evidence(handoff, evidence) is not None:
+        return ChangeGateReason.HANDOFF_BINDING_MISMATCH
+    if not (
+        hmac.compare_digest(release.handoff_sha256, handoff_sha256)
+        and hmac.compare_digest(release.evidence_sha256, evidence_sha256)
+        and hmac.compare_digest(release.inventory_sha256, handoff.inventory_sha256)
+        and hmac.compare_digest(release.artifact_set_sha256, artifact_set_sha256)
+        and hmac.compare_digest(release.route_sha256, route_sha256)
+    ):
+        return ChangeGateReason.RELEASE_ARTIFACT_DIGEST_MISMATCH
+    if not _valid_persisted_authority_receipt(
+        release.authority_receipt,
+        purpose=purpose,
+        handoff_sha256=handoff_sha256,
+    ):
+        return ChangeGateReason.RELEASE_ARTIFACT_MALFORMED
+    return ChangeGateReason.ALLOWED
+
+
+def _artifact_set_sha256(handoff: FrozenHandoff) -> str:
+    return canonical_sha256(
+        {
+            "allowed_paths": handoff.allowed_paths,
+            "required_inputs": handoff.required_inputs,
+            "produced_artifacts": handoff.produced_artifacts,
+        }
+    )
+
+
+def _valid_release_id(value: object) -> bool:
+    return (
+        type(value) is str
+        and len(value) == 68
+        and value.startswith("cgr_")
+        and all(char in "0123456789abcdef" for char in value[4:])
+    )
+
+
+def _valid_persisted_authority_receipt(
+    receipt: HumanReleaseReceipt,
+    *,
+    purpose: ReleasePurpose,
+    handoff_sha256: str,
+) -> bool:
+    """Validate raw-free issuance evidence after the originating turn ended.
+
+    The live host signature is intentionally not persisted.  Authenticity is
+    supplied by the protected owner-only insert path; this check proves the
+    immutable snapshot still matches the exact statement and binding.
+    """
+
+    from tools.workflow_authority import fingerprint_user_action
+
+    if type(receipt) is not HumanReleaseReceipt:
+        return False
+    try:
+        action_fingerprint = fingerprint_user_action(
+            expected_release_statement(purpose=purpose, handoff_sha256=handoff_sha256)
+        )
+    except (TypeError, ValueError):
+        return False
+    return (
+        receipt.schema == RELEASE_RECEIPT_SCHEMA
+        and receipt.purpose is purpose
+        and hmac.compare_digest(receipt.handoff_sha256, handoff_sha256)
+        and hmac.compare_digest(receipt.action_fingerprint, action_fingerprint)
+        and _is_sha256(receipt.turn_id_sha256)
+        and _is_sha256(receipt.session_scope_sha256)
+        and _is_sha256(receipt.platform_scope_sha256)
+        and type(receipt.user_message_index) is int
+        and receipt.user_message_index >= 0
+        and receipt.source_role == "user"
+    )
+
+
 def validate_current_turn_release_receipt(
     receipt: HumanReleaseReceipt,
     *,
@@ -739,6 +1040,20 @@ def validate_current_turn_release_receipt(
     )
 
 
+def consequence_for_review_result(result: ChangeGateResult) -> GateDecision:
+    """Thin precedence adapter; upstream transitions still own mutation."""
+
+    if result.decision is GateDecision.REPLAN_REQUIRED:
+        return GateDecision.REPLAN_REQUIRED
+    if result.decision is GateDecision.REQUEST_CHANGES:
+        return GateDecision.REQUEST_CHANGES
+    if result.decision is GateDecision.SCOPE_DEVIATION:
+        return GateDecision.SCOPE_DEVIATION
+    if result.decision is GateDecision.ALLOW:
+        return GateDecision.ALLOW
+    return GateDecision.DENY
+
+
 def canonical_sha256(value: object) -> str:
     return hashlib.sha256(_canonical_bytes(value)).hexdigest()
 
@@ -751,6 +1066,10 @@ def _canonical_bytes(value: object) -> bytes:
         ensure_ascii=False,
         allow_nan=False,
     ).encode("utf-8")
+
+
+def canonical_json_bytes(value: object) -> bytes:
+    return _canonical_bytes(value)
 
 
 def _plain(value: object) -> object:
@@ -779,6 +1098,7 @@ def _validate_evidence(
     evidence: EvidencePacket,
     *,
     now_epoch: int,
+    require_fresh: bool = True,
 ) -> ChangeGateReason | None:
     if (
         _validate_source(evidence.source) is not None
@@ -798,7 +1118,7 @@ def _validate_evidence(
     lifetime = evidence.expires_at_epoch - evidence.created_at_epoch
     if lifetime < 1 or lifetime > MAX_EVIDENCE_LIFETIME_SECONDS:
         return ChangeGateReason.EVIDENCE_MALFORMED
-    if now_epoch < evidence.created_at_epoch or now_epoch >= evidence.expires_at_epoch:
+    if require_fresh and (now_epoch < evidence.created_at_epoch or now_epoch >= evidence.expires_at_epoch):
         return ChangeGateReason.EVIDENCE_EXPIRED
     try:
         normalized = project_route(evidence.risk, evidence.route.executor, evidence.route.reviews)
@@ -1114,6 +1434,11 @@ def _scope_deviation(
 
 __all__ = [
     "ARCHITECTURE_INVENTORY_SCHEMA",
+    "DURABLE_RELEASE_SCHEMA",
+    "EVIDENCE_PACKET_SCHEMA",
+    "FROZEN_HANDOFF_SCHEMA",
+    "MAX_RUNTIME_ARTIFACT_BYTES",
+    "REVIEW_RESULT_SCHEMA",
     "ArchitectureInventoryReader",
     "ArchitectureInventoryRecord",
     "ArtifactBinding",
@@ -1126,6 +1451,7 @@ __all__ = [
     "GateDecision",
     "GatePhase",
     "HumanReleaseReceipt",
+    "DurableReleaseArtifact",
     "ReleasePurpose",
     "ReviewResult",
     "ReviewRoute",
@@ -1138,10 +1464,15 @@ __all__ = [
     "UpstreamRouteSelector",
     "WorkIdentity",
     "canonical_sha256",
+    "canonical_json_bytes",
+    "consequence_for_review_result",
     "evaluate_reviews",
     "expected_release_statement",
     "freeze_handoff",
+    "issue_durable_release_artifact",
     "issue_current_turn_release_receipt",
+    "request_from_durable_release",
+    "validate_durable_release_artifact",
     "project_route",
     "validate_current_turn_release_receipt",
 ]

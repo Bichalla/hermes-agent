@@ -56,6 +56,7 @@ DELEGATE_BLOCKED_TOOLS = frozenset(
         "cronjob",  # no scheduling more work in the parent's name
         "registered_local_workflow",  # foreground user authority never delegates
         "registered_review_ledger",  # main-controller protocol never delegates
+        "change_gate_release",  # foreground user authority never delegates
     ]
 )
 

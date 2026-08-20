@@ -94,10 +94,19 @@ from hermes_cli.change_gate import (
     ChangeGateReason,
     ChangeGateRequest,
     ChangeGateResult,
+    DURABLE_RELEASE_SCHEMA,
+    DurableReleaseArtifact,
+    EvidencePacket,
+    FrozenHandoff,
     GateDecision,
     GatePhase,
     ReleasePurpose,
+    ReviewResult,
+    ReviewVerdict,
     UpstreamRouteSelector,
+    canonical_sha256,
+    request_from_durable_release,
+    validate_durable_release_artifact,
 )
 from hermes_cli.sqlite_util import add_column_if_missing as _add_column_if_missing
 from toolsets import get_toolset_names
@@ -350,6 +359,7 @@ def _fire_dispatch_tick_hook(
             result.auto_blocked,
             result.rate_limited,
             result.auto_assigned_default,
+            result.change_gate_denied,
             result.respawn_guarded,
             result.skipped_per_profile_capped,
             result.skipped_unassigned,
@@ -1534,6 +1544,39 @@ CREATE INDEX IF NOT EXISTS idx_runs_task             ON task_runs(task_id, start
 CREATE INDEX IF NOT EXISTS idx_runs_status           ON task_runs(status);
 CREATE INDEX IF NOT EXISTS idx_attachments_task      ON task_attachments(task_id, created_at);
 CREATE INDEX IF NOT EXISTS idx_notify_task           ON kanban_notify_subs(task_id);
+"""
+
+# Installed only by the exact-True Change Gate runtime composition.  Keeping
+# this out of SCHEMA_SQL preserves byte-semantic default-off database setup and
+# avoids migrating historical or live boards merely by importing/connecting.
+_CHANGE_GATE_SCHEMA_SQL = """
+CREATE TABLE IF NOT EXISTS change_gate_releases (
+    release_id               TEXT PRIMARY KEY,
+    artifact_sha256          TEXT NOT NULL UNIQUE,
+    task_id                  TEXT NOT NULL,
+    work_id                  TEXT NOT NULL,
+    purpose                  TEXT NOT NULL CHECK (purpose IN ('CLAIM', 'G4')),
+    handoff_sha256           TEXT NOT NULL,
+    evidence_sha256          TEXT NOT NULL,
+    inventory_sha256         TEXT NOT NULL,
+    artifact_set_sha256      TEXT NOT NULL,
+    route_sha256             TEXT NOT NULL,
+    authority_receipt_sha256 TEXT NOT NULL,
+    issued_at                INTEGER NOT NULL,
+    expires_at               INTEGER NOT NULL,
+    max_consumptions         INTEGER NOT NULL CHECK (max_consumptions = 1),
+    artifact_json            TEXT NOT NULL,
+    state                    TEXT NOT NULL CHECK (state IN ('ISSUED', 'CONSUMED', 'REVOKED')),
+    revoked_at               INTEGER,
+    revoked_reason           TEXT,
+    consumed_at              INTEGER,
+    consumed_run_id          INTEGER,
+    consumed_event_id        INTEGER,
+    consumed_from_status     TEXT,
+    consumed_to_status       TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_change_gate_task
+    ON change_gate_releases(task_id, purpose, state, expires_at, issued_at);
 """
 
 
@@ -3836,10 +3879,16 @@ def set_reasoning_effort(
 # Links
 # ---------------------------------------------------------------------------
 
-def link_tasks(conn: sqlite3.Connection, parent_id: str, child_id: str) -> None:
+def link_tasks(
+    conn: sqlite3.Connection,
+    parent_id: str,
+    child_id: str,
+    *,
+    _allow_nested: bool = False,
+) -> None:
     if parent_id == child_id:
         raise ValueError("a task cannot depend on itself")
-    with write_txn(conn):
+    with write_txn(conn, allow_nested=_allow_nested):
         missing = _find_missing_parents(conn, [parent_id, child_id])
         if missing:
             raise ValueError(f"unknown task(s): {', '.join(missing)}")
@@ -4259,6 +4308,428 @@ def get_attachment(conn: sqlite3.Connection, attachment_id: int) -> Optional[Att
     )
 
 
+def initialize_change_gate_runtime_schema(conn: sqlite3.Connection) -> None:
+    """Idempotently install the narrow release table for an enabled runtime.
+
+    Callers must first prove the exact-True feature configuration.  Ordinary
+    ``connect``/``init_db`` never call this function, so default-off boards are
+    not migrated simply because this candidate is installed.
+    """
+
+    with write_txn(conn):
+        for statement in _CHANGE_GATE_SCHEMA_SQL.split(";"):
+            sql = statement.strip()
+            if sql:
+                conn.execute(sql)
+
+
+def change_gate_runtime_schema_exists(conn: sqlite3.Connection) -> bool:
+    return conn.execute(
+        "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?",
+        ("change_gate_releases",),
+    ).fetchone() is not None
+
+
+def _store_change_gate_release(
+    conn: sqlite3.Connection,
+    release: DurableReleaseArtifact,
+) -> str:
+    """Persist one already-authorized release; never creates the schema.
+
+    This is deliberately private.  Synthetic storage tests may exercise it,
+    but production callers must use :func:`persist_foreground_change_gate_release`
+    so caller-supplied raw-free receipt snapshots cannot become authority.
+    """
+
+    if type(release) is not DurableReleaseArtifact:
+        raise ValueError("release_artifact_required")
+    if not change_gate_runtime_schema_exists(conn):
+        raise RuntimeError("change_gate_schema_not_initialized")
+    from hermes_cli.change_gate_codec import encode_artifact
+
+    data = encode_artifact(release)
+    artifact_sha256 = hashlib.sha256(data).hexdigest()
+    authority_receipt_sha256 = canonical_sha256(release.authority_receipt)
+    with write_txn(conn):
+        conn.execute(
+            """
+            INSERT INTO change_gate_releases (
+                release_id, artifact_sha256, task_id, work_id, purpose,
+                handoff_sha256, evidence_sha256, inventory_sha256,
+                artifact_set_sha256, route_sha256, authority_receipt_sha256,
+                issued_at, expires_at, max_consumptions, artifact_json, state
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'ISSUED')
+            """,
+            (
+                release.release_id,
+                artifact_sha256,
+                release.task_id,
+                release.work_id,
+                release.purpose.value,
+                release.handoff_sha256,
+                release.evidence_sha256,
+                release.inventory_sha256,
+                release.artifact_set_sha256,
+                release.route_sha256,
+                authority_receipt_sha256,
+                release.issued_at_epoch,
+                release.expires_at_epoch,
+                release.max_consumptions,
+                data.decode("utf-8"),
+            ),
+        )
+    return release.release_id
+
+
+def persist_foreground_change_gate_release(
+    conn: sqlite3.Connection,
+    release: DurableReleaseArtifact,
+    *,
+    board: Optional[str] = None,
+    now_epoch: Optional[int] = None,
+) -> str:
+    """Persist only a current, task-derived foreground release.
+
+    The production path derives the task artifacts again instead of trusting
+    a caller to pair an otherwise-valid receipt with a different task, source,
+    route, or handoff. Review convergence is intentionally rechecked by the G4
+    transition itself; it is not encoded as bearer authority in this row.
+    """
+
+    from hermes_cli.change_gate import (
+        validate_current_turn_release_receipt,
+        validate_durable_release_artifact,
+    )
+    from hermes_cli.change_gate_runtime import (
+        load_runtime_policy,
+        load_task_gate_artifacts,
+    )
+
+    if type(release) is not DurableReleaseArtifact:
+        raise ValueError("release_artifact_required")
+    now = int(time.time()) if now_epoch is None else now_epoch
+    if type(now) is not int:
+        raise ValueError("release_time_invalid")
+    policy = load_runtime_policy()
+    if policy.enabled is not True or policy.valid is not True:
+        raise PermissionError("change_gate_runtime_not_enabled")
+    load = load_task_gate_artifacts(
+        conn,
+        release.task_id,
+        policy=policy,
+        attachment_root=task_attachments_dir(release.task_id, board=board),
+    )
+    if not load.ok or load.artifacts is None:
+        raise PermissionError("change_gate_artifact_binding_required")
+    if validate_durable_release_artifact(
+        release,
+        purpose=release.purpose,
+        evidence=load.artifacts.evidence,
+        handoff=load.artifacts.handoff,
+        now_epoch=now,
+    ) is not ChangeGateReason.ALLOWED:
+        raise PermissionError("change_gate_release_binding_required")
+    if not validate_current_turn_release_receipt(
+        release.authority_receipt,
+        handoff_sha256=release.handoff_sha256,
+        purpose=release.purpose,
+    ):
+        raise PermissionError("foreground_release_authority_required")
+    return _store_change_gate_release(conn, release)
+
+
+def _load_change_gate_release(
+    conn: sqlite3.Connection,
+    release_id: str,
+) -> DurableReleaseArtifact | None:
+    if not change_gate_runtime_schema_exists(conn):
+        return None
+    row = conn.execute(
+        "SELECT artifact_json, artifact_sha256 FROM change_gate_releases WHERE release_id = ?",
+        (release_id,),
+    ).fetchone()
+    if row is None or type(row["artifact_json"]) is not str:
+        return None
+    from hermes_cli.change_gate_codec import decode_artifact
+
+    data = row["artifact_json"].encode("utf-8")
+    decoded = decode_artifact(data, expected_schema=DURABLE_RELEASE_SCHEMA)
+    if (
+        not decoded.ok
+        or type(decoded.value) is not DurableReleaseArtifact
+        or decoded.sha256 != row["artifact_sha256"]
+        or decoded.value.release_id != release_id
+    ):
+        return None
+    return decoded.value
+
+
+def latest_change_gate_release_id(
+    conn: sqlite3.Connection,
+    task_id: str,
+    *,
+    purpose: ReleasePurpose,
+    now_epoch: Optional[int] = None,
+) -> str | None:
+    if type(purpose) is not ReleasePurpose or not change_gate_runtime_schema_exists(conn):
+        return None
+    now = int(time.time()) if now_epoch is None else now_epoch
+    if type(now) is not int:
+        return None
+    row = conn.execute(
+        """
+        SELECT release_id FROM change_gate_releases
+        WHERE task_id = ? AND purpose = ? AND state = 'ISSUED'
+          AND issued_at <= ? AND expires_at > ?
+        ORDER BY issued_at DESC, rowid DESC LIMIT 1
+        """,
+        (task_id, purpose.value, now, now),
+    ).fetchone()
+    return str(row["release_id"]) if row is not None else None
+
+
+def _change_gate_release_for_transition(
+    conn: sqlite3.Connection,
+    task_id: str,
+    *,
+    purpose: ReleasePurpose,
+    now_epoch: int,
+) -> tuple[DurableReleaseArtifact | None, ChangeGateReason]:
+    if not change_gate_runtime_schema_exists(conn):
+        return None, ChangeGateReason.RELEASE_MISSING
+    row = conn.execute(
+        "SELECT release_id, purpose, state, issued_at, expires_at FROM change_gate_releases "
+        "WHERE task_id = ? AND purpose = ? ORDER BY issued_at DESC, rowid DESC LIMIT 1",
+        (task_id, purpose.value),
+    ).fetchone()
+    if row is None:
+        other = conn.execute(
+            "SELECT 1 FROM change_gate_releases WHERE task_id = ? LIMIT 1",
+            (task_id,),
+        ).fetchone()
+        return (
+            None,
+            ChangeGateReason.RELEASE_PURPOSE_UNSUPPORTED
+            if other is not None
+            else ChangeGateReason.RELEASE_MISSING,
+        )
+    if row["state"] == "CONSUMED":
+        return None, ChangeGateReason.RELEASE_REPLAY
+    if row["state"] == "REVOKED":
+        return None, ChangeGateReason.RELEASE_REVOKED
+    if type(row["issued_at"]) is not int or type(row["expires_at"]) is not int:
+        return None, ChangeGateReason.RELEASE_ARTIFACT_MALFORMED
+    if now_epoch < row["issued_at"] or now_epoch >= row["expires_at"]:
+        return None, ChangeGateReason.RELEASE_EXPIRED
+    release = _load_change_gate_release(conn, row["release_id"])
+    return (
+        (release, ChangeGateReason.ALLOWED)
+        if release is not None
+        else (None, ChangeGateReason.RELEASE_ARTIFACT_MALFORMED)
+    )
+
+
+def _change_gate_request_from_release(
+    conn: sqlite3.Connection,
+    release_id: str,
+    *,
+    purpose: ReleasePurpose,
+    evidence: EvidencePacket,
+    handoff: FrozenHandoff,
+    reviews: Iterable[ReviewResult] = (),
+    now_epoch: int,
+) -> ChangeGateRequest | None:
+    release = _load_change_gate_release(conn, release_id)
+    if release is None:
+        return None
+    reason = validate_durable_release_artifact(
+        release,
+        purpose=purpose,
+        evidence=evidence,
+        handoff=handoff,
+        now_epoch=now_epoch,
+    )
+    if reason is not ChangeGateReason.ALLOWED:
+        return None
+    return request_from_durable_release(
+        release,
+        evidence=evidence,
+        handoff=handoff,
+        reviews=reviews,
+    )
+
+
+def _mark_change_gate_release_consumed(
+    conn: sqlite3.Connection,
+    release: DurableReleaseArtifact,
+    *,
+    run_id: Optional[int],
+    event_id: Optional[int],
+    from_status: str,
+    to_status: str,
+    now_epoch: int,
+) -> bool:
+    if type(now_epoch) is not int:
+        return False
+    cur = conn.execute(
+        """
+        UPDATE change_gate_releases
+           SET state = 'CONSUMED', consumed_at = ?, consumed_run_id = ?,
+               consumed_event_id = ?, consumed_from_status = ?, consumed_to_status = ?
+         WHERE release_id = ? AND artifact_sha256 = ? AND task_id = ?
+           AND work_id = ? AND purpose = ? AND handoff_sha256 = ?
+           AND evidence_sha256 = ? AND inventory_sha256 = ?
+           AND artifact_set_sha256 = ? AND route_sha256 = ?
+           AND state = 'ISSUED' AND max_consumptions = 1
+           AND issued_at <= ? AND expires_at > ?
+        """,
+        (
+            now_epoch,
+            run_id,
+            event_id,
+            from_status,
+            to_status,
+            release.release_id,
+            release.digest(),
+            release.task_id,
+            release.work_id,
+            release.purpose.value,
+            release.handoff_sha256,
+            release.evidence_sha256,
+            release.inventory_sha256,
+            release.artifact_set_sha256,
+            release.route_sha256,
+            now_epoch,
+            now_epoch,
+        ),
+    )
+    return cur.rowcount == 1
+
+
+def revoke_change_gate_releases(
+    conn: sqlite3.Connection,
+    task_id: str,
+    *,
+    reason: ChangeGateReason,
+    now_epoch: Optional[int] = None,
+    _allow_nested: bool = False,
+) -> int:
+    """Revoke only still-issued Change Gate rows using a bounded reason."""
+
+    if type(reason) is not ChangeGateReason or not change_gate_runtime_schema_exists(conn):
+        return 0
+    now = int(time.time()) if now_epoch is None else now_epoch
+    if type(now) is not int:
+        return 0
+    with write_txn(conn, allow_nested=_allow_nested):
+        cur = conn.execute(
+            "UPDATE change_gate_releases SET state = 'REVOKED', revoked_at = ?, "
+            "revoked_reason = ? WHERE task_id = ? AND state = 'ISSUED'",
+            (now, reason.value, task_id),
+        )
+    return int(cur.rowcount)
+
+
+@dataclass(frozen=True, slots=True)
+class ChangeGateConsequenceApplication:
+    """Bounded outcome from the thin upstream consequence adapter."""
+
+    applied: bool
+    decision: GateDecision
+    reason: ChangeGateReason
+    planner_task_id: str | None = None
+
+
+def apply_change_gate_planner_consequence(
+    conn: sqlite3.Connection,
+    task_id: str,
+    *,
+    decision: GateDecision,
+    reason: ChangeGateReason,
+    handoff_sha256: str,
+    planner_assignee: str,
+    board: Optional[str] = None,
+    _allow_nested: bool = False,
+) -> ChangeGateConsequenceApplication:
+    """Route a semantic stop through existing create/link task mechanics.
+
+    This adds no workflow state machine.  The Planner card is an idempotent
+    ordinary upstream task and becomes a parent of the gated card, so an
+    Executor card in ``ready`` is demoted by :func:`link_tasks` and cannot
+    continue until the Planner finishes.  Only bounded reason codes are
+    persisted; no artifact contents or raw user text cross this boundary.
+    """
+
+    if type(decision) is not GateDecision or decision not in {
+        GateDecision.SCOPE_DEVIATION,
+        GateDecision.REPLAN_REQUIRED,
+    }:
+        return ChangeGateConsequenceApplication(False, decision, reason)
+    if (
+        type(reason) is not ChangeGateReason
+        or type(handoff_sha256) is not str
+        or len(handoff_sha256) != 64
+        or any(char not in "0123456789abcdef" for char in handoff_sha256)
+        or type(planner_assignee) is not str
+        or not planner_assignee.strip()
+        or planner_assignee != planner_assignee.strip()
+        or "\0" in planner_assignee
+    ):
+        return ChangeGateConsequenceApplication(False, decision, reason)
+    if get_task(conn, task_id) is None:
+        return ChangeGateConsequenceApplication(False, decision, reason)
+
+    revoke_change_gate_releases(
+        conn,
+        task_id,
+        reason=reason,
+        _allow_nested=_allow_nested,
+    )
+    idempotency_key = (
+        f"change-gate-planner:{task_id}:{handoff_sha256}:{decision.value}:{reason.value}"
+    )
+    planner_task_id = create_task(
+        conn,
+        title=f"Change Gate Planner return for {task_id}",
+        body=(
+            f"Decision: {decision.value}\n"
+            f"Reason: {reason.value}\n"
+            f"Frozen handoff: {handoff_sha256}\n"
+            "Replan within the frozen authority boundary; do not widen scope, "
+            "effects, paths, or release authority."
+        ),
+        assignee=planner_assignee,
+        created_by="change-gate-runtime",
+        idempotency_key=idempotency_key,
+        board=board,
+    )
+    if planner_task_id not in parent_ids(conn, task_id):
+        link_tasks(
+            conn,
+            planner_task_id,
+            task_id,
+            _allow_nested=_allow_nested,
+        )
+    return ChangeGateConsequenceApplication(
+        True,
+        decision,
+        reason,
+        planner_task_id,
+    )
+
+
+def change_gate_release_state(conn: sqlite3.Connection, release_id: str) -> dict | None:
+    if not change_gate_runtime_schema_exists(conn):
+        return None
+    row = conn.execute(
+        "SELECT release_id, artifact_sha256, task_id, work_id, purpose, state, "
+        "consumed_run_id, consumed_event_id, consumed_from_status, consumed_to_status, "
+        "revoked_reason FROM change_gate_releases WHERE release_id = ?",
+        (release_id,),
+    ).fetchone()
+    return dict(row) if row is not None else None
+
+
 def delete_attachment(conn: sqlite3.Connection, attachment_id: int) -> Optional[Attachment]:
     """Delete an attachment row and its on-disk blob. Returns the removed row.
 
@@ -4314,7 +4785,7 @@ def _append_event(
     payload: Optional[dict] = None,
     *,
     run_id: Optional[int] = None,
-) -> None:
+) -> int:
     """Record an event row.  Called from within an already-open txn.
 
     ``run_id`` is optional: pass the current run id so UIs can group
@@ -4324,11 +4795,12 @@ def _append_event(
     """
     now = int(time.time())
     pl = json.dumps(payload, ensure_ascii=False) if payload else None
-    conn.execute(
+    cur = conn.execute(
         "INSERT INTO task_events (task_id, run_id, kind, payload, created_at) "
         "VALUES (?, ?, ?, ?, ?)",
         (task_id, run_id, kind, pl, now),
     )
+    return int(cur.lastrowid or 0)
 
 
 def _end_run(
@@ -4340,6 +4812,7 @@ def _end_run(
     error: Optional[str] = None,
     metadata: Optional[dict] = None,
     status: Optional[str] = None,
+    ended_at: Optional[int] = None,
 ) -> Optional[int]:
     """Close the currently-active run for ``task_id`` and clear the pointer.
 
@@ -4350,7 +4823,9 @@ def _end_run(
     existed (e.g. a CLI user calling ``hermes kanban complete`` on a
     task that was never claimed).
     """
-    now = int(time.time())
+    now = int(time.time()) if ended_at is None else ended_at
+    if type(now) is not int:
+        raise ValueError("ended_at must be an integer epoch")
     row = conn.execute(
         "SELECT current_run_id FROM tasks WHERE id = ?", (task_id,),
     ).fetchone()
@@ -4676,12 +5151,133 @@ def _evaluate_change_gate_claim(
         )
 
 
+def evaluate_change_gate_claim_runtime(
+    conn: sqlite3.Connection,
+    task_id: str,
+    *,
+    now_epoch: Optional[int] = None,
+    policy=None,
+    board: Optional[str] = None,
+):
+    """Read-only enabled-runtime preflight used by dispatch diagnostics."""
+
+    from hermes_cli.change_gate_runtime import (
+        evaluate_loaded_runtime,
+        load_runtime_policy,
+        load_task_gate_artifacts,
+    )
+
+    runtime_policy = load_runtime_policy() if policy is None else policy
+    now = int(time.time()) if now_epoch is None else now_epoch
+    load = load_task_gate_artifacts(
+        conn,
+        task_id,
+        policy=runtime_policy,
+        attachment_root=task_attachments_dir(task_id, board=board),
+    )
+    if not load.applicable:
+        return evaluate_loaded_runtime(
+            load,
+            purpose=ReleasePurpose.CLAIM,
+            release=None,
+            now_epoch=now,
+        )
+    release, release_reason = _change_gate_release_for_transition(
+        conn,
+        task_id,
+        purpose=ReleasePurpose.CLAIM,
+        now_epoch=now,
+    )
+    return evaluate_loaded_runtime(
+        load,
+        purpose=ReleasePurpose.CLAIM,
+        release=release,
+        release_reason=release_reason,
+        now_epoch=now,
+    )
+
+
+def evaluate_change_gate_g4_runtime(
+    conn: sqlite3.Connection,
+    task_id: str,
+    *,
+    now_epoch: Optional[int] = None,
+    policy=None,
+    board: Optional[str] = None,
+):
+    """Read-only G4 preflight over current artifacts and upstream reviews."""
+
+    from hermes_cli.change_gate_runtime import (
+        RuntimeEvaluation,
+        evaluate_loaded_runtime,
+        load_runtime_policy,
+        load_task_gate_artifacts,
+        project_upstream_reviews,
+    )
+
+    runtime_policy = load_runtime_policy() if policy is None else policy
+    now = int(time.time()) if now_epoch is None else now_epoch
+    load = load_task_gate_artifacts(
+        conn,
+        task_id,
+        policy=runtime_policy,
+        attachment_root=task_attachments_dir(task_id, board=board),
+    )
+    if not load.applicable or not load.ok or load.artifacts is None:
+        return evaluate_loaded_runtime(
+            load,
+            purpose=ReleasePurpose.G4,
+            release=None,
+            now_epoch=now,
+        )
+
+    projection = project_upstream_reviews(
+        conn,
+        task_id,
+        handoff=load.artifacts.handoff,
+    )
+    if not projection.ok:
+        return RuntimeEvaluation(
+            True,
+            ChangeGateResult(
+                GateDecision.DENY,
+                projection.reason,
+                GatePhase.G3_REVIEW,
+                route=load.artifacts.actual_route,
+                required_reviewers=(
+                    load.artifacts.handoff.route.required_reviewers
+                ),
+            ),
+            load.artifacts,
+        )
+
+    release, release_reason = _change_gate_release_for_transition(
+        conn,
+        task_id,
+        purpose=ReleasePurpose.G4,
+        now_epoch=now,
+    )
+    return evaluate_loaded_runtime(
+        load,
+        purpose=ReleasePurpose.G4,
+        release=release,
+        release_reason=release_reason,
+        now_epoch=now,
+        reviews=projection.reviews,
+    )
+
+
+class _ChangeGateAtomicAbort(RuntimeError):
+    """Internal sentinel used only to force a full transaction rollback."""
+
+
 def claim_task(
     conn: sqlite3.Connection,
     task_id: str,
     *,
     ttl_seconds: Optional[int] = None,
     claimer: Optional[str] = None,
+    board: Optional[str] = None,
     change_gate_adapter: ChangeGateAdapter | None = None,
     change_gate_request: ChangeGateRequest | None = None,
 ) -> Optional[Task]:
@@ -4693,113 +5289,146 @@ def claim_task(
     now = int(time.time())
     lock = claimer or _claimer_id()
     expires = now + _resolve_claim_ttl_seconds(ttl_seconds)
-    with write_txn(conn):
-        if change_gate_adapter is not None:
-            gate_result = _evaluate_change_gate_claim(
-                conn,
-                task_id,
-                change_gate_adapter,
-                change_gate_request,
-            )
-            if not gate_result.allowed:
+    from hermes_cli.change_gate_runtime import load_runtime_policy
+
+    runtime_policy = load_runtime_policy()
+    if runtime_policy.enabled is True and runtime_policy.valid:
+        initialize_change_gate_runtime_schema(conn)
+    runtime_evaluation = None
+    try:
+        with write_txn(conn):
+            if runtime_policy.enabled is True:
+                runtime_evaluation = evaluate_change_gate_claim_runtime(
+                    conn,
+                    task_id,
+                    now_epoch=now,
+                    policy=runtime_policy,
+                    board=board,
+                )
+                if runtime_evaluation.applicable and not runtime_evaluation.result.allowed:
+                    return None
+            elif change_gate_adapter is not None:
+                gate_result = _evaluate_change_gate_claim(
+                    conn,
+                    task_id,
+                    change_gate_adapter,
+                    change_gate_request,
+                )
+                if not gate_result.allowed:
+                    return None
+
+            # Structural invariant: never transition ready -> running while any
+            # parent is not yet 'done'. This is the single enforcement point
+            # regardless of which writer set status='ready'.
+            undone = conn.execute(
+                "SELECT 1 FROM task_links l "
+                "JOIN tasks p ON p.id = l.parent_id "
+                "WHERE l.child_id = ? "
+                "AND p.status NOT IN ('done', 'archived') LIMIT 1",
+                (task_id,),
+            ).fetchone()
+            if undone:
+                conn.execute(
+                    "UPDATE tasks SET status = 'todo' "
+                    "WHERE id = ? AND status = 'ready'",
+                    (task_id,),
+                )
+                _append_event(
+                    conn,
+                    task_id,
+                    "claim_rejected",
+                    {"reason": "parents_not_done"},
+                )
                 return None
 
-        # Structural invariant: never transition ready -> running while any
-        # parent is not yet 'done'. This is the single enforcement point
-        # regardless of which writer (create_task, link_tasks, unblock_task,
-        # release_stale_claims, manual SQL) set status='ready'. If a racy
-        # writer promoted a task with undone parents, demote it back to
-        # 'todo' here — recompute_ready will re-promote when the parents
-        # actually finish. See RCA at
-        # kanban/boards/cookai/workspaces/t_a6acd07d/root-cause.md.
-        undone = conn.execute(
-            "SELECT 1 FROM task_links l "
-            "JOIN tasks p ON p.id = l.parent_id "
-            "WHERE l.child_id = ? AND p.status NOT IN ('done', 'archived') LIMIT 1",
-            (task_id,),
-        ).fetchone()
-        if undone:
-            conn.execute(
-                "UPDATE tasks SET status = 'todo' "
+            # Defensive recovery for a leaked active run on a ready task.
+            stale = conn.execute(
+                "SELECT current_run_id FROM tasks "
                 "WHERE id = ? AND status = 'ready'",
                 (task_id,),
-            )
-            _append_event(
-                conn, task_id, "claim_rejected",
-                {"reason": "parents_not_done"},
-            )
-            return None
-        # Defensive: if a prior run somehow leaked (invariant violation from
-        # an unknown code path), close it as 'reclaimed' so we don't strand
-        # it when the CAS resets the pointer below. No-op when the invariant
-        # holds (the common case).
-        stale = conn.execute(
-            "SELECT current_run_id FROM tasks WHERE id = ? AND status = 'ready'",
-            (task_id,),
-        ).fetchone()
-        if stale and stale["current_run_id"]:
-            conn.execute(
+            ).fetchone()
+            if stale and stale["current_run_id"]:
+                conn.execute(
+                    """
+                    UPDATE task_runs
+                       SET status = 'reclaimed', outcome = 'reclaimed',
+                           summary = COALESCE(
+                               summary, 'invariant recovery on re-claim'
+                           ),
+                           ended_at = ?, claim_lock = NULL,
+                           claim_expires = NULL, worker_pid = NULL
+                     WHERE id = ? AND ended_at IS NULL
+                    """,
+                    (now, int(stale["current_run_id"])),
+                )
+            cur = conn.execute(
                 """
-                UPDATE task_runs
-                   SET status = 'reclaimed', outcome = 'reclaimed',
-                       summary = COALESCE(summary, 'invariant recovery on re-claim'),
-                       ended_at = ?,
-                       claim_lock = NULL, claim_expires = NULL, worker_pid = NULL
-                 WHERE id = ? AND ended_at IS NULL
+                UPDATE tasks
+                   SET status        = 'running',
+                       claim_lock    = ?,
+                       claim_expires = ?,
+                       started_at    = COALESCE(started_at, ?)
+                 WHERE id = ?
+                   AND status = 'ready'
+                   AND claim_lock IS NULL
                 """,
-                (now, int(stale["current_run_id"])),
+                (lock, expires, now, task_id),
             )
-        cur = conn.execute(
-            """
-            UPDATE tasks
-               SET status        = 'running',
-                   claim_lock    = ?,
-                   claim_expires = ?,
-                   started_at    = COALESCE(started_at, ?)
-             WHERE id = ?
-               AND status = 'ready'
-               AND claim_lock IS NULL
-            """,
-            (lock, expires, now, task_id),
-        )
-        if cur.rowcount != 1:
-            return None
-        # Look up the current task row so we can populate the run with
-        # its assignee / step / runtime cap.
-        trow = conn.execute(
-            "SELECT assignee, max_runtime_seconds, current_step_key "
-            "FROM tasks WHERE id = ?",
-            (task_id,),
-        ).fetchone()
-        run_cur = conn.execute(
-            """
-            INSERT INTO task_runs (
-                task_id, profile, step_key, status,
-                claim_lock, claim_expires, max_runtime_seconds,
-                started_at
-            ) VALUES (?, ?, ?, 'running', ?, ?, ?, ?)
-            """,
-            (
+            if cur.rowcount != 1:
+                return None
+            trow = conn.execute(
+                "SELECT assignee, max_runtime_seconds, current_step_key "
+                "FROM tasks WHERE id = ?",
+                (task_id,),
+            ).fetchone()
+            run_cur = conn.execute(
+                """
+                INSERT INTO task_runs (
+                    task_id, profile, step_key, status,
+                    claim_lock, claim_expires, max_runtime_seconds,
+                    started_at
+                ) VALUES (?, ?, ?, 'running', ?, ?, ?, ?)
+                """,
+                (
+                    task_id,
+                    trow["assignee"] if trow else None,
+                    trow["current_step_key"] if trow else None,
+                    lock,
+                    expires,
+                    trow["max_runtime_seconds"] if trow else None,
+                    now,
+                ),
+            )
+            run_id = run_cur.lastrowid
+            conn.execute(
+                "UPDATE tasks SET current_run_id = ? WHERE id = ?",
+                (run_id, task_id),
+            )
+            event_id = _append_event(
+                conn,
                 task_id,
-                trow["assignee"] if trow else None,
-                trow["current_step_key"] if trow else None,
-                lock,
-                expires,
-                trow["max_runtime_seconds"] if trow else None,
-                now,
-            ),
-        )
-        run_id = run_cur.lastrowid
-        conn.execute(
-            "UPDATE tasks SET current_run_id = ? WHERE id = ?",
-            (run_id, task_id),
-        )
-        _append_event(
-            conn, task_id, "claimed",
-            {"lock": lock, "expires": expires, "run_id": run_id},
-            run_id=run_id,
-        )
-        claimed = get_task(conn, task_id)
+                "claimed",
+                {"lock": lock, "expires": expires, "run_id": run_id},
+                run_id=run_id,
+            )
+            claimed = get_task(conn, task_id)
+            if (
+                runtime_evaluation is not None
+                and runtime_evaluation.applicable
+                and runtime_evaluation.release is not None
+                and not _mark_change_gate_release_consumed(
+                    conn,
+                    runtime_evaluation.release,
+                    run_id=int(run_id) if run_id is not None else None,
+                    event_id=event_id,
+                    from_status="ready",
+                    to_status="running",
+                    now_epoch=now,
+                )
+            ):
+                raise _ChangeGateAtomicAbort("change_gate_claim_consumption_lost")
+    except _ChangeGateAtomicAbort:
+        return None
     _fire_kanban_lifecycle_hook(
         "kanban_task_claimed",
         task_id,
@@ -4816,6 +5445,7 @@ def claim_review_task(
     *,
     ttl_seconds: Optional[int] = None,
     claimer: Optional[str] = None,
+    board: Optional[str] = None,
 ) -> Optional[Task]:
     """Atomically transition ``review -> running``.
 
@@ -4831,7 +5461,29 @@ def claim_review_task(
     now = int(time.time())
     lock = claimer or _claimer_id()
     expires = now + _resolve_claim_ttl_seconds(ttl_seconds)
+    from hermes_cli.change_gate_runtime import (
+        build_review_claim_payload,
+        evaluate_review_claim_runtime,
+        load_runtime_policy,
+    )
+
+    runtime_policy = load_runtime_policy()
     with write_txn(conn):
+        review_gate = None
+        review_binding = None
+        if runtime_policy.enabled is True:
+            review_gate = evaluate_review_claim_runtime(
+                conn,
+                task_id,
+                policy=runtime_policy,
+                attachment_root=task_attachments_dir(task_id, board=board),
+            )
+            if review_gate.applicable and not review_gate.allowed:
+                return None
+            if review_gate.applicable:
+                review_binding = build_review_claim_payload(review_gate)
+                if review_binding is None:
+                    return None
         if not _parents_satisfied(conn, task_id):
             demoted = conn.execute(
                 "UPDATE tasks SET status = 'todo' "
@@ -4892,10 +5544,19 @@ def claim_review_task(
             "UPDATE tasks SET current_run_id = ? WHERE id = ?",
             (run_id, task_id),
         )
+        claimed_payload: dict[str, object] = {
+            "lock": lock,
+            "expires": expires,
+            "run_id": run_id,
+            "source_status": "review",
+        }
+        if review_gate is not None and review_gate.applicable:
+            claimed_payload.update(review_binding or {})
         _append_event(
-            conn, task_id, "claimed",
-            {"lock": lock, "expires": expires, "run_id": run_id,
-             "source_status": "review"},
+            conn,
+            task_id,
+            "claimed",
+            claimed_payload,
             run_id=run_id,
         )
         return get_task(conn, task_id)
@@ -5423,7 +6084,7 @@ class ArtifactPreservationError(RuntimeError):
     """Raised when a declared scratch deliverable cannot be preserved."""
 
 
-def complete_task(
+def _complete_task_impl(
     conn: sqlite3.Connection,
     task_id: str,
     *,
@@ -5433,6 +6094,7 @@ def complete_task(
     created_cards: Optional[Iterable[str]] = None,
     expected_run_id: Optional[int] = None,
     fire_lifecycle_hook: bool = True,
+    board: Optional[str] = None,
 ) -> bool:
     """Transition ``running|ready|blocked|review -> done`` and record ``result``.
 
@@ -5467,6 +6129,21 @@ def complete_task(
     and never blocks.
     """
     now = int(time.time())
+    from hermes_cli.change_gate_runtime import load_runtime_policy
+
+    runtime_policy = load_runtime_policy()
+    if runtime_policy.enabled is True and runtime_policy.valid:
+        initialize_change_gate_runtime_schema(conn)
+    if runtime_policy.enabled is True:
+        preflight = evaluate_change_gate_g4_runtime(
+            conn,
+            task_id,
+            now_epoch=now,
+            policy=runtime_policy,
+            board=board,
+        )
+        if preflight.applicable and not preflight.result.allowed:
+            return False
     # Fail before validating cards or staging artifacts; re-check inside the
     # final write transaction below to close the parent-reopen race.
     if not _parents_satisfied(conn, task_id):
@@ -5503,6 +6180,18 @@ def complete_task(
         conn, task_id, metadata, summary=summary, result=result,
     )
     with write_txn(conn):
+        g4_evaluation = None
+        gate_now = int(time.time())
+        if runtime_policy.enabled is True:
+            g4_evaluation = evaluate_change_gate_g4_runtime(
+                conn,
+                task_id,
+                now_epoch=gate_now,
+                policy=runtime_policy,
+                board=board,
+            )
+            if g4_evaluation.applicable and not g4_evaluation.result.allowed:
+                return False
         # Parent completion is a hard invariant even for direct human review
         # approval. A parent may have been reopened after this task entered
         # ``review`` or ``running``.
@@ -5618,11 +6307,26 @@ def complete_task(
                 ]
                 if cleaned_artifacts:
                     completed_payload["artifacts"] = cleaned_artifacts
-        _append_event(
+        event_id = _append_event(
             conn, task_id, "completed",
             completed_payload,
             run_id=run_id,
         )
+        if (
+            g4_evaluation is not None
+            and g4_evaluation.applicable
+            and g4_evaluation.release is not None
+            and not _mark_change_gate_release_consumed(
+                conn,
+                g4_evaluation.release,
+                run_id=run_id,
+                event_id=event_id,
+                from_status=prior_status or "unknown",
+                to_status="done",
+                now_epoch=gate_now,
+            )
+        ):
+            raise _ChangeGateAtomicAbort("change_gate_g4_consumption_lost")
     # Prose-scan the summary + result for t_<hex> references that do
     # not resolve. Advisory — does not block the completion. Runs in
     # its own txn so the completion itself is already durable by the
@@ -5664,6 +6368,36 @@ def complete_task(
             summary=(summary if summary is not None else result),
         )
     return True
+
+
+def complete_task(
+    conn: sqlite3.Connection,
+    task_id: str,
+    *,
+    result: Optional[str] = None,
+    summary: Optional[str] = None,
+    metadata: Optional[dict] = None,
+    created_cards: Optional[Iterable[str]] = None,
+    expected_run_id: Optional[int] = None,
+    fire_lifecycle_hook: bool = True,
+    board: Optional[str] = None,
+) -> bool:
+    """Apply the upstream completion transition, including enabled G4."""
+
+    try:
+        return _complete_task_impl(
+            conn,
+            task_id,
+            result=result,
+            summary=summary,
+            metadata=metadata,
+            created_cards=created_cards,
+            expected_run_id=expected_run_id,
+            fire_lifecycle_hook=fire_lifecycle_hook,
+            board=board,
+        )
+    except _ChangeGateAtomicAbort:
+        return False
 
 
 # ---------------------------------------------------------------------------
@@ -6571,6 +7305,8 @@ def request_review(
     expected_run_id: Optional[int] = None,
     force: bool = False,
     with_reason: bool = False,
+    change_gate_review: Optional[dict] = None,
+    board: Optional[str] = None,
 ):
     """Transition implementation work into the first-class review phase.
 
@@ -6597,6 +7333,9 @@ def request_review(
 
     summary = redact_review_value(summary)
     metadata = redact_review_value(metadata)
+    from hermes_cli.change_gate_runtime import load_runtime_policy
+
+    runtime_policy = load_runtime_policy()
     with write_txn(conn):
         if not _parents_satisfied(conn, task_id):
             return _ret(False, "parent dependencies are not satisfied")
@@ -6620,7 +7359,138 @@ def request_review(
                 "(worker ownership) or force=True (explicit operator "
                 "override) instead of clearing the live run's claim",
             )
+        claimed_payload: dict[str, object] = {}
+        if trow["current_run_id"] is not None:
+            claimed_event = conn.execute(
+                "SELECT payload FROM task_events WHERE task_id = ? "
+                "AND run_id = ? AND kind = 'claimed' "
+                "ORDER BY id DESC LIMIT 1",
+                (task_id, int(trow["current_run_id"])),
+            ).fetchone()
+            try:
+                claimed_payload = (
+                    json.loads(claimed_event["payload"])
+                    if claimed_event is not None and claimed_event["payload"]
+                    else {}
+                )
+            except (TypeError, json.JSONDecodeError):
+                claimed_payload = {}
+            if not isinstance(claimed_payload, dict):
+                claimed_payload = {}
+        source_is_review = claimed_payload.get("source_status") == "review"
+
+        gate_next_selector = None
+        gate_review_result = None
+        gate_review_completed_at = None
+        if runtime_policy.enabled is True:
+            from hermes_cli.change_gate_runtime import (
+                REVIEW_METADATA_KEY,
+                build_current_review_result,
+                build_review_result_metadata,
+                load_task_gate_artifacts,
+                parse_review_submission,
+            )
+
+            gate_load = load_task_gate_artifacts(
+                conn,
+                task_id,
+                policy=runtime_policy,
+                attachment_root=task_attachments_dir(task_id, board=board),
+            )
+            if gate_load.applicable:
+                if not gate_load.ok or gate_load.artifacts is None:
+                    return _ret(False, gate_load.reason.value)
+                if metadata is not None and not isinstance(metadata, dict):
+                    return _ret(False, "change_gate_metadata_invalid")
+                if isinstance(metadata, dict) and REVIEW_METADATA_KEY in metadata:
+                    return _ret(False, "change_gate_review_metadata_reserved")
+                current_run_id = trow["current_run_id"]
+                if (
+                    current_run_id is None
+                    or expected_run_id is None
+                    or int(expected_run_id) != int(current_run_id)
+                ):
+                    return _ret(False, "change_gate_review_run_binding_required")
+
+                handoff = gate_load.artifacts.handoff
+                review_routes = handoff.route.reviews
+                if source_is_review:
+                    submission = parse_review_submission(
+                        change_gate_review,
+                        expected_verdict=ReviewVerdict.PASS,
+                    )
+                    if submission is None:
+                        return _ret(False, "change_gate_review_submission_invalid")
+                    gate_review_completed_at = int(time.time())
+                    gate_review_result = build_current_review_result(
+                        conn,
+                        task_id,
+                        handoff=handoff,
+                        submission=submission,
+                        completed_at_epoch=gate_review_completed_at,
+                    )
+                    if gate_review_result is None:
+                        return _ret(False, "change_gate_review_binding_invalid")
+                    current_indexes = tuple(
+                        index
+                        for index, route in enumerate(review_routes)
+                        if route.reviewer_class is submission.reviewer_class
+                    )
+                    if len(current_indexes) != 1:
+                        return _ret(False, "change_gate_review_slot_invalid")
+                    current_index = current_indexes[0]
+                    gate_next_selector = (
+                        review_routes[current_index + 1].selector
+                        if current_index + 1 < len(review_routes)
+                        else handoff.route.executor
+                    )
+                    metadata = dict(metadata or {})
+                    metadata.update(build_review_result_metadata(gate_review_result))
+                else:
+                    if change_gate_review is not None or not review_routes:
+                        return _ret(False, "change_gate_review_submission_unexpected")
+                    consumed_claim = conn.execute(
+                        "SELECT 1 FROM change_gate_releases WHERE task_id = ? "
+                        "AND purpose = 'CLAIM' AND state = 'CONSUMED' "
+                        "AND consumed_run_id = ? LIMIT 1",
+                        (task_id, int(current_run_id)),
+                    ).fetchone()
+                    if consumed_claim is None:
+                        return _ret(False, "change_gate_claim_proof_missing")
+                    gate_next_selector = review_routes[0].selector
+
+                expected_reviewer = gate_next_selector.assignee
+                if reviewer is not None:
+                    try:
+                        supplied_reviewer = _canonical_assignee(reviewer)
+                    except ValueError:
+                        return _ret(False, "change_gate_reviewer_invalid")
+                    if supplied_reviewer != expected_reviewer:
+                        return _ret(False, "change_gate_reviewer_route_mismatch")
+                reviewer = expected_reviewer
+
         implementer = trow["assignee"]
+        if source_is_review:
+            prior_handoff = conn.execute(
+                "SELECT payload FROM task_events WHERE task_id = ? "
+                "AND kind = 'review_requested' ORDER BY id DESC LIMIT 1",
+                (task_id,),
+            ).fetchone()
+            try:
+                prior_payload = (
+                    json.loads(prior_handoff["payload"])
+                    if prior_handoff is not None and prior_handoff["payload"]
+                    else {}
+                )
+            except (TypeError, json.JSONDecodeError):
+                prior_payload = {}
+            prior_implementer = (
+                prior_payload.get("implementer")
+                if isinstance(prior_payload, dict)
+                else None
+            )
+            if isinstance(prior_implementer, str) and prior_implementer.strip():
+                implementer = prior_implementer
         if reviewer is None:
             changes_run = conn.execute(
                 "SELECT id FROM task_runs "
@@ -6660,17 +7530,29 @@ def request_review(
                     )
                 reviewer = prior_reviewer
         reviewer = _canonical_assignee(reviewer) if reviewer is not None else None
-        assignee_sql = ", assignee = ?" if reviewer is not None else ""
+        if gate_next_selector is not None:
+            assignee_sql = (
+                ", assignee = ?, model_override = ?, provider_override = ?, "
+                "reasoning_effort = ?"
+            )
+            route_params: tuple[Any, ...] = (
+                gate_next_selector.assignee,
+                gate_next_selector.model_override,
+                gate_next_selector.provider_override,
+                gate_next_selector.reasoning_effort,
+            )
+        elif reviewer is not None:
+            assignee_sql = ", assignee = ?"
+            route_params = (reviewer,)
+        else:
+            assignee_sql = ""
+            route_params = ()
         params: tuple[Any, ...]
         if expected_run_id is None:
-            params = (reviewer, task_id) if reviewer is not None else (task_id,)
+            params = (*route_params, task_id)
             run_guard = ""
         else:
-            params = (
-                (reviewer, task_id, int(expected_run_id))
-                if reviewer is not None
-                else (task_id, int(expected_run_id))
-            )
+            params = (*route_params, task_id, int(expected_run_id))
             run_guard = " AND current_run_id = ?"
         cur = conn.execute(
             """
@@ -6698,6 +7580,7 @@ def request_review(
             status="review",
             summary=summary,
             metadata=metadata,
+            ended_at=gate_review_completed_at,
         )
         if run_id is None and (summary or metadata):
             run_id = _synthesize_ended_run(
@@ -6729,6 +7612,8 @@ def request_changes(
     *,
     reason: str,
     expected_run_id: Optional[int] = None,
+    change_gate_review: Optional[dict] = None,
+    board: Optional[str] = None,
 ) -> tuple[bool, Optional[str]]:
     """Finish an active review run and route the task back for rework.
 
@@ -6741,6 +7626,13 @@ def request_changes(
     reason = str(redact_review_value(reason or "")).strip()
     if not reason:
         return False, "reason is required"
+
+    from hermes_cli.change_gate_runtime import load_runtime_policy
+
+    runtime_policy = load_runtime_policy()
+    gate_review_verdict = None
+    gate_handoff_sha256 = None
+    gate_prior_corrections = 0
 
     with write_txn(conn):
         task_row = conn.execute(
@@ -6801,11 +7693,77 @@ def request_changes(
         else:
             reviewer = None
 
+        gate_review_metadata = None
+        gate_review_completed_at = None
+        gate_executor_selector = None
+        if runtime_policy.enabled is True:
+            from hermes_cli.change_gate_runtime import (
+                build_current_review_result,
+                build_review_result_metadata,
+                count_change_gate_corrections,
+                load_task_gate_artifacts,
+                parse_review_submission,
+            )
+
+            gate_load = load_task_gate_artifacts(
+                conn,
+                task_id,
+                policy=runtime_policy,
+                attachment_root=task_attachments_dir(task_id, board=board),
+            )
+            if gate_load.applicable:
+                if not gate_load.ok or gate_load.artifacts is None:
+                    return False, gate_load.reason.value
+                if expected_run_id is None or int(expected_run_id) != int(current_run_id):
+                    return False, "change_gate_review_run_binding_required"
+                submission = parse_review_submission(
+                    change_gate_review,
+                    expected_verdict=(
+                        ReviewVerdict.REQUEST_CHANGES,
+                        ReviewVerdict.REPLAN_REQUIRED,
+                    ),
+                )
+                if submission is None:
+                    return False, "change_gate_review_submission_invalid"
+                gate_review_completed_at = int(time.time())
+                review_result = build_current_review_result(
+                    conn,
+                    task_id,
+                    handoff=gate_load.artifacts.handoff,
+                    submission=submission,
+                    completed_at_epoch=gate_review_completed_at,
+                )
+                if review_result is None:
+                    return False, "change_gate_review_binding_invalid"
+                gate_review_metadata = build_review_result_metadata(review_result)
+                gate_executor_selector = gate_load.artifacts.handoff.route.executor
+                gate_review_verdict = review_result.verdict
+                gate_handoff_sha256 = gate_load.artifacts.handoff.digest()
+                prior_corrections = count_change_gate_corrections(conn, task_id)
+                if prior_corrections is None:
+                    return False, "change_gate_correction_history_malformed"
+                gate_prior_corrections = prior_corrections
+                if implementer != gate_executor_selector.assignee:
+                    return False, "change_gate_implementer_route_mismatch"
+
         new_status = _landing_status_after_parents(conn, task_id)
         # NOTE: consecutive_failures is deliberately PRESERVED (neither
         # reset nor incremented). Review transitions are not evidence the
         # pathology cleared — only complete_task's success path resets the
         # breaker counter (mirrors unblock_task, #35072).
+        if gate_executor_selector is None:
+            route_sql = ""
+            route_params: tuple[Any, ...] = ()
+        else:
+            route_sql = (
+                ", model_override = ?, provider_override = ?, "
+                "reasoning_effort = ?"
+            )
+            route_params = (
+                gate_executor_selector.model_override,
+                gate_executor_selector.provider_override,
+                gate_executor_selector.reasoning_effort,
+            )
         cur = conn.execute(
             """
             UPDATE tasks
@@ -6814,9 +7772,16 @@ def request_changes(
                    claim_lock = NULL,
                    claim_expires = NULL,
                    worker_pid = NULL
+            """ + route_sql + """
              WHERE id = ? AND status = 'running' AND current_run_id = ?
             """,
-            (new_status, implementer, task_id, int(current_run_id)),
+            (
+                new_status,
+                implementer,
+                *route_params,
+                task_id,
+                int(current_run_id),
+            ),
         )
         if cur.rowcount != 1:
             return False, "task changed during review handoff"
@@ -6826,6 +7791,8 @@ def request_changes(
             outcome="changes_requested",
             status=new_status,
             summary=reason,
+            metadata=gate_review_metadata,
+            ended_at=gate_review_completed_at,
         )
         _append_event(
             conn,
@@ -6839,6 +7806,40 @@ def request_changes(
             },
             run_id=run_id,
         )
+        if gate_handoff_sha256 is not None and gate_review_verdict is not None:
+            correction_limit_reached = (
+                gate_review_verdict is ReviewVerdict.REQUEST_CHANGES
+                and gate_prior_corrections + 1 > runtime_policy.max_corrections
+            )
+            if (
+                gate_review_verdict is ReviewVerdict.REPLAN_REQUIRED
+                or correction_limit_reached
+            ):
+                consequence = apply_change_gate_planner_consequence(
+                    conn,
+                    task_id,
+                    decision=GateDecision.REPLAN_REQUIRED,
+                    reason=(
+                        ChangeGateReason.CORRECTION_LIMIT_EXCEEDED
+                        if correction_limit_reached
+                        else ChangeGateReason.REVIEW_REPLAN_REQUIRED
+                    ),
+                    handoff_sha256=gate_handoff_sha256,
+                    planner_assignee=runtime_policy.planner_assignee,
+                    board=board,
+                    _allow_nested=True,
+                )
+                if not consequence.applied:
+                    raise _ChangeGateAtomicAbort(
+                        "change_gate_planner_consequence_failed"
+                    )
+            elif gate_review_verdict is ReviewVerdict.REQUEST_CHANGES:
+                revoke_change_gate_releases(
+                    conn,
+                    task_id,
+                    reason=ChangeGateReason.REVIEW_REQUEST_CHANGES,
+                    _allow_nested=True,
+                )
     return True, implementer
 
 
@@ -8138,6 +9139,13 @@ class DispatchResult:
     Reasons: ``"blocker_auth"`` (quota/auth error — also auto-blocked),
     ``"recent_success"`` (completed run within guard window),
     ``"active_pr"`` (GitHub PR URL in a recent comment)."""
+    change_gate_denied: list[tuple[str, str]] = field(default_factory=list)
+    """Gated ready tasks skipped before assignment, events, claim, or spawn.
+
+    Each pair contains only ``(task_id, bounded_reason)``. The denial is
+    deliberately non-durable; the immutable inputs and release row remain the
+    evidence, while a later valid release can make the same task eligible.
+    """
     rate_limited: list[str] = field(default_factory=list)
     """Task ids whose workers bailed on a provider rate-limit / quota wall
     (EX_TEMPFAIL sentinel exit) and were released back to ``ready`` WITHOUT
@@ -10045,6 +11053,18 @@ def _dispatch_once_locked(
     result.timed_out = enforce_max_runtime(conn)
     result.promoted = recompute_ready(conn, failure_limit=failure_limit)
 
+    # Loading the policy is read-only. The narrow release table is initialized
+    # only for an exact-True, fully valid runtime configuration; ordinary
+    # default-off dispatch never migrates the database.
+    from hermes_cli.change_gate_runtime import (
+        evaluate_review_claim_runtime,
+        load_runtime_policy,
+    )
+
+    change_gate_policy = load_runtime_policy()
+    if change_gate_policy.enabled is True and change_gate_policy.valid:
+        initialize_change_gate_runtime_schema(conn)
+
     # Count tasks already running so max_spawn enforces concurrency rather
     # than a per-tick spawn budget. See the docstring above for the full
     # rationale; the short version is that a 60-second tick interval with a
@@ -10188,6 +11208,37 @@ def _dispatch_once_locked(
     for row in ready_rows:
         if ready_budget is not None and spawned >= ready_budget:
             break
+        # Gate preflight deliberately precedes default assignment, profile
+        # lookup, respawn diagnostics, claim/run creation, and spawn. The
+        # central claim path repeats this check and consumes the release in the
+        # same transaction as ready->running, closing direct/manual bypasses.
+        if change_gate_policy.enabled is True:
+            gate_evaluation = evaluate_change_gate_claim_runtime(
+                conn,
+                row["id"],
+                policy=change_gate_policy,
+                board=board,
+            )
+            if gate_evaluation.applicable and not gate_evaluation.result.allowed:
+                result.change_gate_denied.append(
+                    (row["id"], gate_evaluation.result.reason.value)
+                )
+                if (
+                    not dry_run
+                    and gate_evaluation.artifacts is not None
+                    and gate_evaluation.result.decision
+                    in {GateDecision.SCOPE_DEVIATION, GateDecision.REPLAN_REQUIRED}
+                ):
+                    apply_change_gate_planner_consequence(
+                        conn,
+                        row["id"],
+                        decision=gate_evaluation.result.decision,
+                        reason=gate_evaluation.result.reason,
+                        handoff_sha256=gate_evaluation.artifacts.handoff.digest(),
+                        planner_assignee=change_gate_policy.planner_assignee,
+                        board=board,
+                    )
+                continue
         row_assignee = row["assignee"]
         if not row_assignee:
             # Honour kanban.default_assignee: when the dispatcher hits an
@@ -10301,7 +11352,12 @@ def _dispatch_once_locked(
                     _per_profile_running.get(row_assignee, 0) + 1
                 )
             continue
-        claimed = claim_task(conn, row["id"], ttl_seconds=ttl_seconds)
+        claimed = claim_task(
+            conn,
+            row["id"],
+            ttl_seconds=ttl_seconds,
+            board=board,
+        )
         if claimed is None:
             continue
         try:
@@ -10393,6 +11449,18 @@ def _dispatch_once_locked(
     for row in review_rows:
         if spawn_budget is not None and spawned >= spawn_budget:
             break
+        if change_gate_policy.enabled is True:
+            review_gate = evaluate_review_claim_runtime(
+                conn,
+                row["id"],
+                policy=change_gate_policy,
+                attachment_root=task_attachments_dir(row["id"], board=board),
+            )
+            if review_gate.applicable and not review_gate.allowed:
+                result.change_gate_denied.append(
+                    (row["id"], review_gate.reason.value)
+                )
+                continue
         if not row["assignee"]:
             result.skipped_unassigned.append(row["id"])
             continue
@@ -10428,7 +11496,12 @@ def _dispatch_once_locked(
                     _per_profile_running.get(row["assignee"], 0) + 1
                 )
             continue
-        claimed = claim_review_task(conn, row["id"], ttl_seconds=ttl_seconds)
+        claimed = claim_review_task(
+            conn,
+            row["id"],
+            ttl_seconds=ttl_seconds,
+            board=board,
+        )
         if claimed is None:
             continue
         try:

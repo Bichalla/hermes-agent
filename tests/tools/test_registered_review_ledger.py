@@ -8,6 +8,9 @@ import pytest
 
 from agent.workflow_action_policy import registered_capability_catalog
 from tools.registered_local_workflow import (
+    _COMPLETED,
+    _DISPATCH_LOCK,
+    _IN_FLIGHT,
     ExternalWorkflowOwner,
     WorkflowInvocation,
     scoped_external_workflow_owner,
@@ -62,6 +65,9 @@ def _enable_review_ledger(monkeypatch: pytest.MonkeyPatch) -> None:
         "tools.registered_review_ledger._feature_enabled",
         lambda _config_key="registered_workflow": True,
     )
+    with _DISPATCH_LOCK:
+        _COMPLETED.clear()
+        _IN_FLIGHT.clear()
 
 
 def test_review_ledger_tool_is_registered_and_default_off(
@@ -157,6 +163,42 @@ def test_all_five_review_ledger_actions_use_main_controller_owner_readback(
     assert result["readback"] == "passed"
     assert len(calls) == 1
     assert calls[0].action == workflow_request["action"]
+
+
+@pytest.mark.parametrize(
+    "workflow_request",
+    (
+        {"action": "status", "bundle_sha256": _DIGEST},
+        {
+            "action": "finalize",
+            "bundle_sha256": _DIGEST,
+            "current_bundle_sha256": _OTHER_DIGEST,
+        },
+    ),
+)
+def test_review_ledger_read_actions_invoke_owner_on_each_read_without_mutation_replay_cache(
+    workflow_request: dict[str, object],
+) -> None:
+    calls: list[WorkflowInvocation] = []
+    with (
+        scoped_external_workflow_owner(_owner(calls)),
+        _scoped_test_current_turn_user_authority(
+            f"Authorize review ledger {workflow_request['action']}",
+            session_id=f"session-review-read-{workflow_request['action']}",
+            turn_id=f"turn-review-read-{workflow_request['action']}",
+        ),
+    ):
+        first = registered_review_ledger(**workflow_request)
+        second = registered_review_ledger(**workflow_request)
+
+    assert first["decision"] == "allow"
+    assert first["idempotency_result"] == "read_only"
+    assert first["write_count"] == 0
+    assert second["decision"] == "allow"
+    assert second["idempotency_result"] == "read_only"
+    assert second["write_count"] == 0
+    assert len(calls) == 2
+    assert all(call.action == workflow_request["action"] for call in calls)
 
 
 def test_review_ledger_requires_independent_main_controller_binding(

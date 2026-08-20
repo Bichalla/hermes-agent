@@ -12,6 +12,7 @@ from agent.workflow_action_policy import registered_capability_catalog
 from tools.delegate_tool import DELEGATE_BLOCKED_TOOLS
 from tools.registered_local_workflow import (
     REGISTERED_LOCAL_WORKFLOW_SCHEMA,
+    _COMPLETED,
     ExternalWorkflowOwner,
     WorkflowInvocation,
     _DISPATCH_LOCK,
@@ -89,6 +90,9 @@ def _enable_synthetic_feature(monkeypatch: pytest.MonkeyPatch) -> None:
         "tools.registered_local_workflow._feature_enabled",
         lambda _config_key="registered_workflow": True,
     )
+    with _DISPATCH_LOCK:
+        _COMPLETED.clear()
+        _IN_FLIGHT.clear()
 
 
 def test_tool_is_registry_discovered_but_default_off_without_config(
@@ -222,6 +226,31 @@ def test_deterministic_idempotency_replays_without_second_owner_call() -> None:
     assert second["idempotency_result"] == "existing"
     assert second["write_count"] == 0
     assert len(calls) == 1
+
+
+def test_pending_read_invokes_owner_on_each_read_without_mutation_replay_cache() -> None:
+    calls: list[WorkflowInvocation] = []
+    owner = _owner("kanban-intake.pending-soft-delete.v1", "pending_read", calls=calls)
+    payload = {"pending_id": "kp_" + "a" * 16}
+    with (
+        scoped_external_workflow_owner(owner),
+        _scoped_test_current_turn_user_authority(
+            "Authorize pending_read",
+            session_id="session-pending-read",
+            turn_id="turn-pending-read",
+        ),
+    ):
+        first = registered_local_workflow("pending_read", **payload)
+        second = registered_local_workflow("pending_read", **payload)
+
+    assert first["decision"] == "allow"
+    assert first["idempotency_result"] == "read_only"
+    assert first["write_count"] == 0
+    assert second["decision"] == "allow"
+    assert second["idempotency_result"] == "read_only"
+    assert second["write_count"] == 0
+    assert len(calls) == 2
+    assert all(call.effect.name == "READ" for call in calls)
 
 
 def test_active_lease_returns_without_retrying_owner() -> None:

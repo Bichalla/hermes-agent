@@ -506,6 +506,45 @@ def _dispatch_registered_action(
         trusted_user_text=trusted_user_text,
         idempotency_key=idempotency_key,
     )
+    if effect is WorkflowEffect.READ:
+        try:
+            if owner.authorize(invocation) is not True:
+                return _result(CapabilityDecision.DENY_AUTHORITY_MISSING)
+        except Exception:
+            return _result(CapabilityDecision.DENY_AUTHORITY_MISSING)
+        try:
+            owner_result = owner.execute(invocation)
+        except Exception:
+            return _result(
+                "uncertain_outcome",
+                write_count=0,
+                uncertain_outcome=True,
+                idempotency_result="read_only",
+            )
+        try:
+            readback = _normalize_readback(
+                owner.readback(invocation, owner_result),
+                capability.result_schema_id,
+                action,
+            )
+        except Exception:
+            readback = None
+        if readback is None:
+            return _result(
+                "uncertain_outcome",
+                write_count=0,
+                uncertain_outcome=True,
+                idempotency_result="read_only",
+            )
+        return _result(
+            CapabilityDecision.ALLOW,
+            action=action,
+            result=readback,
+            readback="passed",
+            write_count=0,
+            idempotency_result="read_only",
+        )
+
     claim, replay = _claim_dispatch(idempotency_key)
     if claim == "replay":
         assert replay is not None

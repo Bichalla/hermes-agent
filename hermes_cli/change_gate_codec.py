@@ -58,6 +58,14 @@ _SUPPORTED_SCHEMAS: Final[set[str]] = {
     DURABLE_RELEASE_SCHEMA,
 }
 
+_ARTIFACT_SCHEMAS: Final[dict[type[object], str]] = {
+    EvidencePacket: EVIDENCE_PACKET_SCHEMA,
+    FrozenHandoff: FROZEN_HANDOFF_SCHEMA,
+    ArchitectureInventoryRecord: ARCHITECTURE_INVENTORY_SCHEMA,
+    ReviewResult: REVIEW_RESULT_SCHEMA,
+    DurableReleaseArtifact: DURABLE_RELEASE_SCHEMA,
+}
+
 
 class ArtifactCodecReason(StrEnum):
     OK = "ok"
@@ -101,9 +109,17 @@ class ArtifactCodecResult:
 def encode_artifact(artifact: ChangeGateArtifact) -> bytes:
     """Return canonical UTF-8 JSON bytes for one supported artifact."""
 
-    if not _supported_artifact(artifact):
+    expected_schema = _ARTIFACT_SCHEMAS.get(type(artifact))
+    if expected_schema is None:
         raise TypeError("unsupported_change_gate_artifact")
-    return canonical_json_bytes(artifact)
+    try:
+        encoded = canonical_json_bytes(artifact)
+    except (TypeError, ValueError) as exc:
+        raise ValueError("invalid_change_gate_artifact:value_invalid") from exc
+    decoded = decode_artifact(encoded, expected_schema=expected_schema)
+    if not decoded.ok:
+        raise ValueError(f"invalid_change_gate_artifact:{decoded.reason.value}")
+    return encoded
 
 
 def decode_artifact(
@@ -850,16 +866,6 @@ def _is_git_oid(value: object) -> bool:
         and len(value) in {40, 64}
         and all(char in "0123456789abcdef" for char in value)
     )
-
-
-def _supported_artifact(artifact: object) -> bool:
-    return type(artifact) in {
-        EvidencePacket,
-        FrozenHandoff,
-        ArchitectureInventoryRecord,
-        ReviewResult,
-        DurableReleaseArtifact,
-    }
 
 
 def encode_change_gate_artifact(artifact: ChangeGateArtifact) -> bytes:

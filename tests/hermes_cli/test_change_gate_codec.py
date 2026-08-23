@@ -4,6 +4,9 @@ from __future__ import annotations
 
 import hashlib
 import json
+from dataclasses import replace
+
+import pytest
 
 from hermes_cli.change_gate import (
     ARCHITECTURE_INVENTORY_SCHEMA,
@@ -29,6 +32,7 @@ from hermes_cli.change_gate import (
     SourceIdentity,
     UpstreamRouteSelector,
     WorkIdentity,
+    canonical_json_bytes,
     canonical_sha256,
     freeze_handoff,
 )
@@ -208,6 +212,113 @@ def test_supported_artifacts_roundtrip_with_digest() -> None:
         assert result.byte_count == len(data)
         assert result.value == artifact
         assert result.artifact == artifact
+        assert encode_artifact(result.value) == data
+
+
+def test_encoder_rejects_unsorted_inventory_blast_radius() -> None:
+    evidence = _evidence()
+    inventory = replace(
+        _inventory(evidence),
+        blast_radius=("default-off", "claim-only"),
+    )
+
+    with pytest.raises(
+        ValueError,
+        match=r"^invalid_change_gate_artifact:value_invalid$",
+    ):
+        encode_artifact(inventory)
+
+
+@pytest.mark.parametrize(
+    ("field", "values"),
+    (
+        ("consumers", ("z-consumer", "a-consumer")),
+        ("source_paths", ("z/source.py", "a/source.py")),
+        ("artifact_paths", ("z/artifact.json", "a/artifact.json")),
+    ),
+)
+def test_encoder_rejects_other_unsorted_inventory_tuples(
+    field: str,
+    values: tuple[str, ...],
+) -> None:
+    inventory = replace(_inventory(_evidence()), **{field: values})
+
+    with pytest.raises(
+        ValueError,
+        match=r"^invalid_change_gate_artifact:value_invalid$",
+    ):
+        encode_artifact(inventory)
+
+
+def test_encoder_rejects_unsorted_evidence_paths() -> None:
+    evidence = replace(
+        _evidence(),
+        allowed_paths=("z/source.py", "a/source.py"),
+    )
+
+    with pytest.raises(
+        ValueError,
+        match=r"^invalid_change_gate_artifact:value_invalid$",
+    ):
+        encode_artifact(evidence)
+
+
+def test_encoder_rejects_unsorted_handoff_scope() -> None:
+    evidence = _evidence()
+    handoff = replace(
+        _handoff(evidence, _inventory(evidence)),
+        scope=("Z_EFFECT", "A_EFFECT"),
+    )
+
+    with pytest.raises(
+        ValueError,
+        match=r"^invalid_change_gate_artifact:value_invalid$",
+    ):
+        encode_artifact(handoff)
+
+
+def test_encoder_rejects_unsorted_review_finding_codes() -> None:
+    evidence = _evidence()
+    handoff = _handoff(evidence, _inventory(evidence))
+    review = replace(
+        _review(handoff),
+        finding_codes=("z-finding", "a-finding"),
+    )
+
+    with pytest.raises(
+        ValueError,
+        match=r"^invalid_change_gate_artifact:value_invalid$",
+    ):
+        encode_artifact(review)
+
+
+def test_encoder_accepts_sorted_inventory_exact_roundtrip() -> None:
+    inventory = _inventory(_evidence())
+
+    data = encode_artifact(inventory)
+    decoded = decode_artifact(
+        data,
+        expected_schema=ARCHITECTURE_INVENTORY_SCHEMA,
+        expected_sha256=hashlib.sha256(data).hexdigest(),
+    )
+
+    assert decoded.ok
+    assert decoded.value == inventory
+    assert encode_artifact(decoded.value) == data
+
+
+def test_encoder_preserves_existing_valid_fixture_bytes_and_hashes() -> None:
+    for _, artifact in _artifacts():
+        expected = canonical_json_bytes(artifact)
+        encoded = encode_artifact(artifact)
+
+        assert encoded == expected
+        assert hashlib.sha256(encoded).digest() == hashlib.sha256(expected).digest()
+
+
+def test_encoder_rejects_unsupported_artifact() -> None:
+    with pytest.raises(TypeError, match=r"^unsupported_change_gate_artifact$"):
+        encode_artifact(object())  # type: ignore[arg-type]
 
 
 def test_rejects_duplicate_key() -> None:

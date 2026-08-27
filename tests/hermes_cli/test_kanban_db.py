@@ -432,6 +432,123 @@ def test_recompute_ready_honours_dispatcher_failure_limit(kanban_home):
 
 
 
+def test_initial_status_blocked_is_sticky_across_recompute_ready(kanban_home):
+    with kb.connect() as conn:
+        task_id = kb.create_task(
+            conn,
+            title="operator parked task",
+            assignee="worker",
+            initial_status="blocked",
+        )
+
+        assert kb.get_task(conn, task_id).status == "blocked"
+        assert kb.recompute_ready(conn) == 0
+        assert kb.recompute_ready(conn) == 0
+
+        assert kb.get_task(conn, task_id).status == "blocked"
+        assert conn.execute(
+            "SELECT COUNT(*) FROM task_events "
+            "WHERE task_id = ? AND kind = 'promoted'",
+            (task_id,),
+        ).fetchone()[0] == 0
+
+
+def test_initial_status_blocked_is_not_dispatched_before_promote(
+    kanban_home,
+    monkeypatch,
+):
+    import hermes_cli.profiles as profiles
+
+    monkeypatch.setattr(profiles, "profile_exists", lambda _name: True)
+    with kb.connect() as conn:
+        task_id = kb.create_task(
+            conn,
+            title="parked dispatch task",
+            assignee="worker",
+            initial_status="blocked",
+        )
+        spawns: list[str] = []
+
+        first = kb.dispatch_once(
+            conn,
+            spawn_fn=lambda task, *_args, **_kwargs: spawns.append(task.id),
+            reconcile_orphans=False,
+        )
+        second = kb.dispatch_once(
+            conn,
+            spawn_fn=lambda task, *_args, **_kwargs: spawns.append(task.id),
+            reconcile_orphans=False,
+        )
+
+        assert first.promoted == 0
+        assert second.promoted == 0
+        assert first.spawned == []
+        assert second.spawned == []
+        assert spawns == []
+        assert kb.get_task(conn, task_id).status == "blocked"
+        assert conn.execute(
+            "SELECT COUNT(*) FROM task_runs WHERE task_id = ?",
+            (task_id,),
+        ).fetchone()[0] == 0
+
+
+def test_manual_promote_clears_initial_block_sticky_state(kanban_home):
+    with kb.connect() as conn:
+        task_id = kb.create_task(
+            conn,
+            title="manual release",
+            assignee="worker",
+            initial_status="blocked",
+        )
+
+        ok, reason = kb.promote_task(conn, task_id, actor="operator")
+
+        assert (ok, reason) == (True, None)
+        assert kb.get_task(conn, task_id).status == "ready"
+        assert kb.recompute_ready(conn) == 0
+        assert kb.get_task(conn, task_id).status == "ready"
+
+
+def test_unblock_clears_initial_block_sticky_state(kanban_home):
+    with kb.connect() as conn:
+        task_id = kb.create_task(
+            conn,
+            title="operator unblocks parked task",
+            assignee="worker",
+            initial_status="blocked",
+        )
+
+        assert kb.unblock_task(conn, task_id) is True
+        assert kb.get_task(conn, task_id).status == "ready"
+        assert kb.recompute_ready(conn) == 0
+        assert kb.get_task(conn, task_id).status == "ready"
+
+
+def test_manual_promote_then_canonical_block_restores_sticky_state(kanban_home):
+    with kb.connect() as conn:
+        task_id = kb.create_task(
+            conn,
+            title="reblocked task",
+            assignee="worker",
+            initial_status="blocked",
+        )
+        assert kb.promote_task(conn, task_id, actor="operator")[0] is True
+
+        assert kb.block_task(conn, task_id, reason="still needs input")
+        assert kb.recompute_ready(conn) == 0
+
+        assert kb.get_task(conn, task_id).status == "blocked"
+
+
+def test_default_initial_task_ready_behavior_is_unchanged(kanban_home):
+    with kb.connect() as conn:
+        task_id = kb.create_task(conn, title="ordinary task", assignee="worker")
+
+        assert kb.get_task(conn, task_id).status == "ready"
+        assert kb.recompute_ready(conn) == 0
+        assert kb.get_task(conn, task_id).status == "ready"
+
+
 # ---------------------------------------------------------------------------
 # Parent-completion invariant at the claim gate (RCA t_a6acd07d)
 # ---------------------------------------------------------------------------

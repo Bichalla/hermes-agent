@@ -220,6 +220,7 @@ def _attach_runtime_artifacts(
     dirty_tracked: bool = False,
     tracked_outside: bool = False,
     extra_allowed_paths: tuple[str, ...] = (),
+    after_evidence=None,
 ) -> RuntimeFixture:
     repo, source, binding = _source_repo(
         tmp_path,
@@ -288,6 +289,8 @@ def _attach_runtime_artifacts(
         data=encode_artifact(evidence),
         content_type="application/json",
     )
+    if after_evidence is not None:
+        after_evidence()
     kb.store_attachment_bytes(
         conn,
         task_id,
@@ -574,6 +577,189 @@ def test_enabled_dispatcher_denial_has_no_claim_event_or_spawn(
             (task_id, ChangeGateReason.RELEASE_MISSING.value)
         ]
         assert _snapshot(conn, task_id) == before
+
+
+def test_initial_blocked_change_gate_task_does_not_dispatch_while_artifacts_attach(
+    tmp_path: Path,
+    isolated_home: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    with _connect(tmp_path / "kanban.db") as conn:
+        task_id = kb.create_task(
+            conn,
+            title="parked change gate task",
+            assignee="executor",
+            model_override="fixture-model",
+            provider_override="fixture-provider",
+            reasoning_effort="medium",
+            initial_status="blocked",
+        )
+        spawns: list[str] = []
+
+        _enable_runtime(monkeypatch, tmp_path / "inventory")
+
+        def assert_no_dispatch() -> None:
+            result = kb.dispatch_once(
+                conn,
+                spawn_fn=lambda task, *_args, **_kwargs: spawns.append(task.id),
+                reconcile_orphans=False,
+            )
+            assert result.promoted == 0
+            assert result.spawned == []
+            assert result.change_gate_denied == []
+            assert spawns == []
+            assert kb.get_task(conn, task_id).status == "blocked"
+            assert conn.execute(
+                "SELECT COUNT(*) FROM task_runs WHERE task_id = ?",
+                (task_id,),
+            ).fetchone()[0] == 0
+
+        before_artifacts = kb.dispatch_once(
+            conn,
+            spawn_fn=lambda task, *_args, **_kwargs: spawns.append(task.id),
+            reconcile_orphans=False,
+        )
+        assert before_artifacts.promoted == 0
+        assert before_artifacts.spawned == []
+        assert before_artifacts.change_gate_denied == []
+        assert spawns == []
+        assert kb.get_task(conn, task_id).status == "blocked"
+
+        _attach_runtime_artifacts(
+            conn,
+            tmp_path,
+            task_id,
+            after_evidence=assert_no_dispatch,
+        )
+
+        first = kb.dispatch_once(
+            conn,
+            spawn_fn=lambda task, *_args, **_kwargs: spawns.append(task.id),
+            reconcile_orphans=False,
+        )
+        second = kb.dispatch_once(
+            conn,
+            spawn_fn=lambda task, *_args, **_kwargs: spawns.append(task.id),
+            reconcile_orphans=False,
+        )
+
+        assert first.promoted == 0
+        assert second.promoted == 0
+        assert first.spawned == []
+        assert second.spawned == []
+        assert first.change_gate_denied == []
+        assert second.change_gate_denied == []
+        assert spawns == []
+        assert kb.get_task(conn, task_id).status == "blocked"
+        assert conn.execute(
+            "SELECT COUNT(*) FROM task_runs WHERE task_id = ?",
+            (task_id,),
+        ).fetchone()[0] == 0
+
+
+def test_initial_blocked_change_gate_task_denies_dispatch_after_promote_without_claim(
+    tmp_path: Path,
+    isolated_home: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    with _connect(tmp_path / "kanban.db") as conn:
+        task_id = kb.create_task(
+            conn,
+            title="parked change gate task",
+            assignee="executor",
+            model_override="fixture-model",
+            provider_override="fixture-provider",
+            reasoning_effort="medium",
+            initial_status="blocked",
+        )
+        _attach_runtime_artifacts(conn, tmp_path, task_id)
+        _enable_runtime(monkeypatch, tmp_path / "inventory")
+        assert kb.promote_task(conn, task_id, actor="operator")[0] is True
+        before = _snapshot(conn, task_id)
+        spawns: list[str] = []
+
+        result = kb.dispatch_once(
+            conn,
+            spawn_fn=lambda task, *_args, **_kwargs: spawns.append(task.id),
+            reconcile_orphans=False,
+        )
+
+        assert spawns == []
+        assert result.spawned == []
+        assert result.change_gate_denied == [
+            (task_id, ChangeGateReason.RELEASE_MISSING.value)
+        ]
+        assert _snapshot(conn, task_id) == before
+
+
+def test_initial_blocked_current_turn_claim_release_precedes_dispatch_provider(
+    tmp_path: Path,
+    isolated_home: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import hermes_cli.profiles as profiles
+
+    db_path = tmp_path / "kanban.db"
+    monkeypatch.setenv("HERMES_KANBAN_DB", str(db_path))
+    monkeypatch.setattr(profiles, "profile_exists", lambda _name: True)
+    with _connect(db_path) as conn:
+        task_id = kb.create_task(
+            conn,
+            title="parked change gate task",
+            assignee="executor",
+            model_override="fixture-model",
+            provider_override="fixture-provider",
+            reasoning_effort="medium",
+            initial_status="blocked",
+            session_id="initial-block-claim-session",
+        )
+        fixture = _attach_runtime_artifacts(conn, tmp_path, task_id)
+        _enable_runtime(monkeypatch, tmp_path / "inventory")
+        assert kb.promote_task(conn, task_id, actor="operator")[0] is True
+        statement = expected_release_statement(
+            purpose=ReleasePurpose.CLAIM,
+            handoff_sha256=fixture.handoff_sha256,
+        )
+
+        release = _issue_current_turn_claim(
+            statement=statement,
+            session_id="initial-block-claim-session",
+            turn_id="initial-block-claim-turn",
+        )
+
+        assert release.ok, release.reason
+        assert release.status == "issued"
+        assert release.release_id is not None
+        assert _current_turn_release_count(conn, task_id) == 1
+        assert conn.execute(
+            "SELECT COUNT(*) FROM task_runs WHERE task_id = ?",
+            (task_id,),
+        ).fetchone()[0] == 0
+        release_counts_seen_by_provider: list[int] = []
+
+        def spawn_after_release(task, *_args, **_kwargs):
+            release_counts_seen_by_provider.append(
+                _current_turn_release_count(conn, task.id)
+            )
+            return 4242
+
+        result = kb.dispatch_once(
+            conn,
+            spawn_fn=spawn_after_release,
+            reconcile_orphans=False,
+        )
+
+        assert release_counts_seen_by_provider == [1]
+        assert [item[0] for item in result.spawned] == [task_id]
+        assert result.change_gate_denied == []
+        assert conn.execute(
+            "SELECT COUNT(*) FROM task_runs WHERE task_id = ?",
+            (task_id,),
+        ).fetchone()[0] == 1
+        state = kb.change_gate_release_state(conn, release.release_id)
+        assert state is not None
+        assert state["state"] == "CONSUMED"
+        assert _current_turn_release_count(conn, task_id) == 1
 
 
 def test_detached_dispatcher_consumes_valid_release_and_spawns_once(

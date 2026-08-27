@@ -1745,6 +1745,162 @@ def _bind_workflow_authority_for_turn(
         return None
 
 
+def _invoke_current_turn_change_gate_release():
+    """Run the no-argument Change Gate host adapter at the authority seam."""
+
+    from hermes_cli.change_gate_release import (
+        issue_current_turn_change_gate_release,
+    )
+
+    return issue_current_turn_change_gate_release()
+
+
+def _change_gate_host_response_text(host_result: object) -> str:
+    """Return one bounded, provider-free response for an authoritative turn."""
+
+    status = str(getattr(host_result, "status", "owner_failure"))
+    task_id = str(getattr(host_result, "task_id", "") or "")
+    purpose = str(getattr(host_result, "purpose", "") or "")
+    if status == "issued":
+        return f"Change Gate {purpose} release issued for task {task_id}."
+    if status == "existing_idempotent":
+        return f"Change Gate {purpose} release already exists for task {task_id}."
+    if status == "zero_candidate":
+        return "Change Gate authorization matched no eligible task; no release was issued."
+    if status == "ambiguous":
+        return "Change Gate authorization matched multiple eligible tasks; no release was issued."
+    return "Change Gate authorization failed closed; no release was issued."
+
+
+def _finalize_change_gate_host_turn(
+    agent: Any,
+    *,
+    host_result: object,
+    messages: List[Dict[str, Any]],
+    conversation_history: List[Dict[str, Any]],
+) -> Dict[str, Any]:
+    """Close an authoritative Change Gate turn without provider or post-LLM surfaces.
+
+    The generic finalizer intentionally runs provider-adjacent lifecycle,
+    context-engine, external-memory, and background-review surfaces.  A host
+    authority transition must finish before those surfaces, so this bounded
+    terminal persists only the deterministic assistant acknowledgement and
+    returns the ordinary result envelope with zero API calls.
+    """
+
+    status = str(getattr(host_result, "status", "owner_failure"))
+    response = _change_gate_host_response_text(host_result)
+    cleanup_errors: list[str] = []
+
+    # The prologue may have composed an ``api_content`` sidecar for the model.
+    # This terminal never sends a provider request, so retaining those unsent
+    # bytes would make a later replay claim they had reached the provider.
+    # Remove only this turn's tail-user sidecar and clear its already-flushed
+    # DB value through the existing session owner.
+    current_user = messages[-1] if messages else None
+    if isinstance(current_user, dict) and current_user.get("role") == "user":
+        unsent_api_content = current_user.pop("api_content", None)
+        session_db = getattr(agent, "_session_db", None)
+        clear_sidecar = getattr(session_db, "set_latest_user_api_content", None)
+        if unsent_api_content is not None and callable(clear_sidecar):
+            try:
+                clear_sidecar(
+                    getattr(agent, "session_id", "") or "",
+                    current_user.get("content"),
+                    "",
+                )
+            except Exception as exc:
+                cleanup_errors.append(f"clear_api_content: {exc}")
+                logger.warning(
+                    "Change Gate host terminal api_content clear failed: %s",
+                    exc,
+                )
+    append_message(messages, {"role": "assistant", "content": response})
+
+    try:
+        apply_override = getattr(
+            agent, "_apply_persist_user_message_override", None
+        )
+        if callable(apply_override):
+            apply_override(messages)
+        agent._persist_session(messages, conversation_history)
+    except Exception as exc:
+        cleanup_errors.append(f"persist_session: {exc}")
+        logger.error(
+            "Change Gate host terminal persistence failed: %s",
+            exc,
+            exc_info=True,
+        )
+
+    try:
+        agent._session_messages = messages
+    except Exception:
+        pass
+
+    # Reset the same per-turn state that would otherwise be reset before the
+    # provider loop or by the generic finalizer.  No hook, memory, tool, MCP,
+    # middleware, retry, fallback-provider, or model surface is entered here.
+    agent._delivered_interim_texts = set()
+    agent._incremental_persistence_failed = False
+    agent._last_persistence_error_cause = None
+    agent._compression_adoption_failed = False
+    agent._last_turn_usage = None
+    agent._turn_preflight_display_snapshot = None
+    agent._turn_received_provider_response = False
+    agent._response_was_previewed = False
+    try:
+        agent.clear_interrupt()
+    except Exception:
+        pass
+    agent._stream_callback = None
+
+    request_overrides = getattr(agent, "request_overrides", {}) or {}
+    extra_body = request_overrides.get("extra_body") or {}
+    compressor = getattr(agent, "context_compressor", None)
+    failed = status == "owner_failure" or bool(cleanup_errors)
+    result: Dict[str, Any] = {
+        "final_response": response,
+        "last_reasoning": None,
+        "messages": messages,
+        "api_calls": 0,
+        "completed": not failed,
+        "turn_exit_reason": f"change_gate_host_adapter({status})",
+        "failed": failed,
+        "partial": False,
+        "interrupted": False,
+        "response_transformed": False,
+        "pre_transform_response": None,
+        "response_previewed": False,
+        "model": getattr(agent, "model", None),
+        "provider": getattr(agent, "provider", None),
+        "base_url": getattr(agent, "base_url", None),
+        "input_tokens": getattr(agent, "session_input_tokens", 0),
+        "output_tokens": getattr(agent, "session_output_tokens", 0),
+        "cache_read_tokens": getattr(agent, "session_cache_read_tokens", 0),
+        "cache_write_tokens": getattr(agent, "session_cache_write_tokens", 0),
+        "reasoning_tokens": getattr(agent, "session_reasoning_tokens", 0),
+        "prompt_tokens": getattr(agent, "session_prompt_tokens", 0),
+        "completion_tokens": getattr(agent, "session_completion_tokens", 0),
+        "total_tokens": getattr(agent, "session_total_tokens", 0),
+        "last_prompt_tokens": getattr(compressor, "last_prompt_tokens", 0) or 0,
+        "estimated_cost_usd": getattr(agent, "session_estimated_cost_usd", 0),
+        "cost_status": getattr(agent, "session_cost_status", None),
+        "cost_source": getattr(agent, "session_cost_source", None),
+        "service_tier": extra_body.get("service_tier"),
+        "session_id": getattr(agent, "session_id", None),
+        "change_gate_release": (
+            host_result.as_dict()
+            if callable(getattr(host_result, "as_dict", None))
+            else {"status": status}
+        ),
+    }
+    if cleanup_errors:
+        result["cleanup_errors"] = cleanup_errors
+    if status == "owner_failure":
+        result["error"] = response
+    return result
+
+
 def _run_conversation_inner(
     agent,
     user_message: Any,
@@ -1884,13 +2040,31 @@ def _run_conversation_inner(
     # Bind workflow authority only after the canonical current user turn has
     # been built. Synthetic timeline turns, cron, API, delegated children and
     # other non-foreground surfaces remain unbound/default-off.
-    _bind_workflow_authority_for_turn(
+    _workflow_authority = _bind_workflow_authority_for_turn(
         agent,
         original_user_message=original_user_message,
         turn_id=turn_id,
         current_turn_user_idx=current_turn_user_idx,
         persist_user_display_kind=persist_user_display_kind,
     )
+    if _workflow_authority is not None:
+        try:
+            _change_gate_host_result = _invoke_current_turn_change_gate_release()
+        except Exception:
+            logger.exception("Change Gate host adapter failed closed")
+            return _finalize_change_gate_host_turn(
+                agent,
+                host_result=None,
+                messages=messages,
+                conversation_history=conversation_history,
+            )
+        if getattr(_change_gate_host_result, "terminal", False) is True:
+            return _finalize_change_gate_host_turn(
+                agent,
+                host_result=_change_gate_host_result,
+                messages=messages,
+                conversation_history=conversation_history,
+            )
 
     # Commentary deduplication spans all provider continuations and tool calls
     # within one user turn, but must not suppress the same phrase next turn.

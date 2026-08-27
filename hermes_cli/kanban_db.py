@@ -104,12 +104,38 @@ from hermes_cli.change_gate import (
     TransitionAnchor,
     UpstreamRouteSelector,
     canonical_sha256,
+    expected_release_statement,
     validate_durable_release_artifact,
 )
 from hermes_cli.sqlite_util import add_column_if_missing as _add_column_if_missing
 from toolsets import get_toolset_names
 
 _log = logging.getLogger(__name__)
+
+_CHANGE_GATE_REISSUABLE_REASONS = frozenset(
+    {
+        ChangeGateReason.RELEASE_MISSING,
+        ChangeGateReason.RELEASE_PURPOSE_UNSUPPORTED,
+        ChangeGateReason.RELEASE_EXPIRED,
+        ChangeGateReason.RELEASE_REVOKED,
+        ChangeGateReason.RELEASE_REPLAY,
+        ChangeGateReason.RELEASE_TRANSITION_STALE,
+    }
+)
+
+
+@dataclass(frozen=True, slots=True)
+class ChangeGateAuthorityResolution:
+    status: str
+    task_id: str | None
+    purpose: ReleasePurpose | None
+    candidate_count: int
+
+
+@dataclass(frozen=True, slots=True)
+class ForegroundChangeGateReleasePersistence:
+    release: DurableReleaseArtifact
+    reused: bool
 
 
 # ---------------------------------------------------------------------------
@@ -4496,6 +4522,139 @@ def derive_change_gate_transition_anchor(
         return None
 
 
+def _canonical_change_gate_host_text(value: object) -> str | None:
+    return value if type(value) is str and value and "\0" not in value else None
+
+
+def _session_origin_matches_current_turn(
+    task_row: sqlite3.Row,
+    notify_rows: Iterable[sqlite3.Row],
+    *,
+    authority: object,
+) -> bool:
+    from gateway.session_context import get_session_env
+    from tools.workflow_authority import matches_active_workflow_turn
+
+    task_session_id = task_row["session_id"]
+    authority_session = getattr(authority, "session_scope", "")
+    authority_platform = getattr(authority, "platform_scope", "")
+    if type(authority_session) is not str or not authority_session:
+        return False
+    if type(task_session_id) is str and task_session_id.strip():
+        return matches_active_workflow_turn(authority, session_id=task_session_id)
+    if task_session_id is not None and type(task_session_id) is not str:
+        return False
+    current_platform = (
+        get_session_env("HERMES_SESSION_PLATFORM", "").strip().casefold()
+        or get_session_env("HERMES_SESSION_SOURCE", "").strip().casefold()
+        or authority_platform
+    )
+    current_chat = get_session_env("HERMES_SESSION_CHAT_ID", "").strip()
+    current_thread = get_session_env("HERMES_SESSION_THREAD_ID", "").strip()
+    if type(authority_platform) is not str or not authority_platform or not current_chat:
+        return False
+    for notify_row in notify_rows:
+        if (
+            type(notify_row["platform"]) is str
+            and notify_row["platform"].strip().casefold() == current_platform
+            and notify_row["platform"].strip().casefold() == authority_platform
+            and type(notify_row["chat_id"]) is str
+            and notify_row["chat_id"] == current_chat
+            and (notify_row["thread_id"] or "") == current_thread
+        ):
+            return True
+    return False
+
+
+def _change_gate_resolution_candidates(conn: sqlite3.Connection) -> list[sqlite3.Row]:
+    return list(
+        conn.execute(
+            """
+            SELECT id, status, session_id, current_run_id, claim_lock
+            FROM tasks
+            WHERE current_run_id IS NULL
+              AND (
+                (status = 'ready' AND claim_lock IS NULL)
+                OR status = 'review'
+              )
+            ORDER BY id
+            """
+        ).fetchall()
+    )
+
+
+def resolve_current_turn_change_gate_target(
+    conn: sqlite3.Connection,
+    *,
+    policy: object,
+    board: Optional[str] = None,
+) -> ChangeGateAuthorityResolution:
+    """Read-only owner resolution for one current-turn Change Gate target."""
+
+    from gateway.session_context import get_trusted_current_user_text
+    from hermes_cli.change_gate_runtime import load_task_gate_artifacts
+    from tools.workflow_authority import (
+        get_current_turn_user_authority,
+        matches_active_workflow_turn,
+        matches_current_workflow_session,
+    )
+
+    if getattr(policy, "enabled", None) is not True or getattr(policy, "valid", None) is not True:
+        return ChangeGateAuthorityResolution("zero_candidate", None, None, 0)
+    trusted_text = _canonical_change_gate_host_text(get_trusted_current_user_text())
+    authority = get_current_turn_user_authority()
+    if (
+        trusted_text is None
+        or authority is None
+        or not matches_active_workflow_turn(authority, user_message=trusted_text)
+        or not matches_current_workflow_session(authority)
+    ):
+        return ChangeGateAuthorityResolution("zero_candidate", None, None, 0)
+
+    matches: list[tuple[str, ReleasePurpose]] = []
+    for task_row in _change_gate_resolution_candidates(conn):
+        notify_rows = conn.execute(
+            """
+            SELECT platform, chat_id, thread_id
+            FROM kanban_notify_subs
+            WHERE task_id = ?
+            ORDER BY created_at DESC
+            """,
+            (task_row["id"],),
+        ).fetchall()
+        if not _session_origin_matches_current_turn(
+            task_row,
+            notify_rows,
+            authority=authority,
+        ):
+            continue
+        load = load_task_gate_artifacts(
+            conn,
+            task_row["id"],
+            policy=policy,
+            attachment_root=task_attachments_dir(task_row["id"], board=board),
+        )
+        if not load.ok or load.artifacts is None:
+            continue
+        purpose = ReleasePurpose.CLAIM if task_row["status"] == "ready" else ReleasePurpose.G4
+        try:
+            expected = expected_release_statement(
+                purpose=purpose,
+                handoff_sha256=load.artifacts.handoff.digest(),
+            )
+        except (TypeError, ValueError):
+            continue
+        if trusted_text == expected:
+            matches.append((task_row["id"], purpose))
+
+    if len(matches) == 1:
+        task_id, purpose = matches[0]
+        return ChangeGateAuthorityResolution("resolved", task_id, purpose, 1)
+    if matches:
+        return ChangeGateAuthorityResolution("ambiguous", None, None, len(matches))
+    return ChangeGateAuthorityResolution("zero_candidate", None, None, 0)
+
+
 def _store_change_gate_release(
     conn: sqlite3.Connection,
     release: DurableReleaseArtifact,
@@ -4560,6 +4719,39 @@ def persist_foreground_change_gate_release(
     board: Optional[str] = None,
     now_epoch: Optional[int] = None,
 ) -> str:
+    return persist_or_reuse_foreground_change_gate_release(
+        conn,
+        release,
+        board=board,
+        now_epoch=now_epoch,
+    ).release.release_id
+
+
+def _same_foreground_release_authority(
+    existing: DurableReleaseArtifact,
+    incoming: DurableReleaseArtifact,
+) -> bool:
+    return (
+        existing.purpose is incoming.purpose
+        and existing.task_id == incoming.task_id
+        and existing.work_id == incoming.work_id
+        and existing.handoff_sha256 == incoming.handoff_sha256
+        and existing.evidence_sha256 == incoming.evidence_sha256
+        and existing.inventory_sha256 == incoming.inventory_sha256
+        and existing.artifact_set_sha256 == incoming.artifact_set_sha256
+        and existing.route_sha256 == incoming.route_sha256
+        and existing.transition_anchor == incoming.transition_anchor
+        and existing.authority_receipt == incoming.authority_receipt
+    )
+
+
+def persist_or_reuse_foreground_change_gate_release(
+    conn: sqlite3.Connection,
+    release: DurableReleaseArtifact,
+    *,
+    board: Optional[str] = None,
+    now_epoch: Optional[int] = None,
+) -> ForegroundChangeGateReleasePersistence:
     """Persist only a current, task-derived foreground release.
 
     The production path derives the task artifacts again instead of trusting
@@ -4632,7 +4824,24 @@ def persist_foreground_change_gate_release(
             purpose=release.purpose,
         ):
             raise PermissionError("foreground_release_authority_required")
-        return _store_change_gate_release(conn, release, _allow_nested=True)
+        existing, reason = _change_gate_release_for_transition(
+            conn,
+            release.task_id,
+            purpose=release.purpose,
+            now_epoch=now,
+            expected_transition_anchor=transition_anchor,
+        )
+        if existing is not None and reason is ChangeGateReason.ALLOWED:
+            if _same_foreground_release_authority(existing, release):
+                return ForegroundChangeGateReleasePersistence(existing, True)
+            raise PermissionError("change_gate_live_release_authority_mismatch")
+        if reason not in _CHANGE_GATE_REISSUABLE_REASONS:
+            raise PermissionError("change_gate_existing_release_state_not_reissuable")
+        stored_release_id = _store_change_gate_release(conn, release, _allow_nested=True)
+        stored = _load_change_gate_release(conn, stored_release_id)
+        if stored is None:
+            raise RuntimeError("change_gate_release_store_readback_failed")
+        return ForegroundChangeGateReleasePersistence(stored, False)
 
 
 def _load_change_gate_release(

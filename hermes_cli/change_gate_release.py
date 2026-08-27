@@ -8,6 +8,7 @@ and persists it only when the enabled runtime contract validates.
 
 from __future__ import annotations
 
+import re
 import time
 from dataclasses import dataclass
 
@@ -17,6 +18,14 @@ from hermes_cli.change_gate import (
     ReleasePurpose,
     canonical_sha256,
     issue_durable_release_artifact,
+)
+
+_HOST_AUTHORITY_RE = re.compile(
+    r"^AUTHORIZE_HERMES_CHANGE_GATE_(CLAIM|G4) ([a-f0-9]{64})$"
+)
+_HOST_AUTHORITY_PREFIXES = (
+    "AUTHORIZE_HERMES_CHANGE_GATE_CLAIM ",
+    "AUTHORIZE_HERMES_CHANGE_GATE_G4 ",
 )
 
 
@@ -33,6 +42,7 @@ class ChangeGateReleaseIssueResult:
     review_count: int = 0
     issued_at_epoch: int | None = None
     expires_at_epoch: int | None = None
+    reused: bool = False
 
     def as_dict(self) -> dict[str, object]:
         result: dict[str, object] = {
@@ -43,6 +53,56 @@ class ChangeGateReleaseIssueResult:
             "purpose": self.purpose,
             "review_count": self.review_count,
         }
+        if self.release_id is not None:
+            result["release_id"] = self.release_id
+        if self.release_sha256 is not None:
+            result["release_sha256"] = self.release_sha256
+        if self.handoff_sha256 is not None:
+            result["handoff_sha256"] = self.handoff_sha256
+        if self.evidence_sha256 is not None:
+            result["evidence_sha256"] = self.evidence_sha256
+        if self.issued_at_epoch is not None:
+            result["issued_at_epoch"] = self.issued_at_epoch
+        if self.expires_at_epoch is not None:
+            result["expires_at_epoch"] = self.expires_at_epoch
+        result["reused"] = self.reused
+        return result
+
+
+@dataclass(frozen=True, slots=True)
+class ChangeGateHostAdapterResult:
+    ok: bool
+    status: str
+    reason: str
+    task_id: str | None = None
+    purpose: str | None = None
+    release_id: str | None = None
+    release_sha256: str | None = None
+    handoff_sha256: str | None = None
+    evidence_sha256: str | None = None
+    review_count: int = 0
+    candidate_count: int = 0
+    issued_at_epoch: int | None = None
+    expires_at_epoch: int | None = None
+
+    @property
+    def terminal(self) -> bool:
+        return self.status != "ineligible"
+
+    def as_dict(self) -> dict[str, object]:
+        result: dict[str, object] = {
+            "schema": "change-gate-host-adapter-result/v1",
+            "ok": self.ok,
+            "status": self.status,
+            "reason": self.reason,
+            "terminal": self.terminal,
+            "candidate_count": self.candidate_count,
+            "review_count": self.review_count,
+        }
+        if self.task_id is not None:
+            result["task_id"] = self.task_id
+        if self.purpose is not None:
+            result["purpose"] = self.purpose
         if self.release_id is not None:
             result["release_id"] = self.release_id
         if self.release_sha256 is not None:
@@ -163,7 +223,7 @@ def issue_change_gate_release(
         if evaluation.result.decision is not GateDecision.ALLOW:
             return _deny(task_id, parsed_purpose.value, evaluation.result.reason)
 
-        stored_release_id = kb.persist_foreground_change_gate_release(
+        stored = kb.persist_or_reuse_foreground_change_gate_release(
             conn,
             release,
             board=board,
@@ -174,17 +234,153 @@ def issue_change_gate_release(
             ChangeGateReason.ALLOWED.value,
             task_id,
             parsed_purpose.value,
-            release_id=stored_release_id,
-            release_sha256=canonical_sha256(release),
-            handoff_sha256=release.handoff_sha256,
-            evidence_sha256=release.evidence_sha256,
+            release_id=stored.release.release_id,
+            release_sha256=canonical_sha256(stored.release),
+            handoff_sha256=stored.release.handoff_sha256,
+            evidence_sha256=stored.release.evidence_sha256,
             review_count=len(reviews),
-            issued_at_epoch=release.issued_at_epoch,
-            expires_at_epoch=release.expires_at_epoch,
+            issued_at_epoch=stored.release.issued_at_epoch,
+            expires_at_epoch=stored.release.expires_at_epoch,
+            reused=stored.reused,
         )
 
 
+def _host_ineligible(reason: str) -> ChangeGateHostAdapterResult:
+    return ChangeGateHostAdapterResult(False, "ineligible", reason)
+
+
+def issue_current_turn_change_gate_release() -> ChangeGateHostAdapterResult:
+    """Issue a Change Gate release from the exact current foreground turn."""
+
+    from gateway.session_context import (
+        get_session_controller_role,
+        get_trusted_current_user_text,
+    )
+    from tools.workflow_authority import (
+        get_current_turn_user_authority,
+        matches_active_workflow_turn,
+        matches_current_workflow_session,
+    )
+
+    trusted_text = get_trusted_current_user_text()
+    match = _HOST_AUTHORITY_RE.fullmatch(trusted_text or "")
+    if match is None:
+        if type(trusted_text) is str and trusted_text.startswith(_HOST_AUTHORITY_PREFIXES):
+            return ChangeGateHostAdapterResult(
+                False,
+                "zero_candidate",
+                "change_gate_authority_statement_not_exact",
+            )
+        return _host_ineligible("current_turn_authority_statement_missing")
+
+    authority = get_current_turn_user_authority()
+    if (
+        authority is None
+        or get_session_controller_role() != "main_controller"
+        or not matches_active_workflow_turn(authority, user_message=trusted_text)
+        or not matches_current_workflow_session(authority)
+    ):
+        return _host_ineligible("current_turn_authority_invalid")
+
+    from hermes_cli import kanban_db as kb
+    from hermes_cli.change_gate_runtime import load_runtime_policy
+
+    policy = load_runtime_policy()
+    if policy.enabled is not True:
+        return _host_ineligible(ChangeGateReason.DISABLED.value)
+    if policy.valid is not True:
+        return _host_ineligible(ChangeGateReason.RUNTIME_CONFIG_INVALID.value)
+
+    board = kb.get_current_board()
+    try:
+        with kb.connect_closing(board=board) as conn:
+            target = kb.resolve_current_turn_change_gate_target(
+                conn,
+                policy=policy,
+                board=board,
+            )
+    except Exception:
+        return ChangeGateHostAdapterResult(
+            False,
+            "owner_failure",
+            "change_gate_owner_failure",
+        )
+
+    if target.status == "zero_candidate":
+        return ChangeGateHostAdapterResult(
+            False,
+            "zero_candidate",
+            "change_gate_target_not_found",
+            candidate_count=target.candidate_count,
+        )
+    if target.status == "ambiguous":
+        return ChangeGateHostAdapterResult(
+            False,
+            "ambiguous",
+            "change_gate_target_ambiguous",
+            candidate_count=target.candidate_count,
+        )
+    if target.status != "resolved" or target.task_id is None or target.purpose is None:
+        return ChangeGateHostAdapterResult(
+            False,
+            "owner_failure",
+            "change_gate_owner_failure",
+            candidate_count=target.candidate_count,
+        )
+
+    try:
+        issued = issue_change_gate_release(
+            task_id=target.task_id,
+            purpose=target.purpose.value,
+        )
+    except Exception:
+        return ChangeGateHostAdapterResult(
+            False,
+            "owner_failure",
+            "change_gate_owner_failure",
+            task_id=target.task_id,
+            purpose=target.purpose.value,
+            candidate_count=target.candidate_count,
+        )
+    if type(issued) is not ChangeGateReleaseIssueResult:
+        return ChangeGateHostAdapterResult(
+            False,
+            "owner_failure",
+            "change_gate_owner_failure",
+            task_id=target.task_id,
+            purpose=target.purpose.value,
+            candidate_count=target.candidate_count,
+        )
+    if not issued.ok:
+        return ChangeGateHostAdapterResult(
+            False,
+            "owner_failure",
+            "change_gate_owner_failure",
+            task_id=target.task_id,
+            purpose=target.purpose.value,
+            candidate_count=target.candidate_count,
+            review_count=issued.review_count,
+        )
+    return ChangeGateHostAdapterResult(
+        True,
+        "existing_idempotent" if issued.reused else "issued",
+        issued.reason,
+        task_id=target.task_id,
+        purpose=target.purpose.value,
+        release_id=issued.release_id,
+        release_sha256=issued.release_sha256,
+        handoff_sha256=issued.handoff_sha256,
+        evidence_sha256=issued.evidence_sha256,
+        review_count=issued.review_count,
+        candidate_count=target.candidate_count,
+        issued_at_epoch=issued.issued_at_epoch,
+        expires_at_epoch=issued.expires_at_epoch,
+    )
+
+
 __all__ = [
+    "ChangeGateHostAdapterResult",
     "ChangeGateReleaseIssueResult",
+    "issue_current_turn_change_gate_release",
     "issue_change_gate_release",
 ]

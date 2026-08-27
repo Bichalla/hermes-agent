@@ -42,7 +42,10 @@ from hermes_cli.change_gate import (
     freeze_handoff,
 )
 from hermes_cli.change_gate_codec import encode_artifact
-from hermes_cli.change_gate_release import issue_change_gate_release
+from hermes_cli.change_gate_release import (
+    issue_change_gate_release,
+    issue_current_turn_change_gate_release,
+)
 from hermes_cli.change_gate_runtime import (
     ChangeGateRuntimePolicy,
     REVIEW_METADATA_KEY,
@@ -55,6 +58,7 @@ from tools.workflow_authority import (
     _scoped_test_current_turn_user_authority,
     fingerprint_user_action,
 )
+from gateway.session_context import clear_session_vars, set_session_vars
 
 
 @dataclass(frozen=True, slots=True)
@@ -235,7 +239,7 @@ def _attach_runtime_artifacts(
         ),
         risk=risk,
         route=route,
-        allowed_paths=("gate-artifact.txt",) + extra_allowed_paths,
+        allowed_paths=tuple(sorted(("gate-artifact.txt",) + extra_allowed_paths)),
         required_inputs=(),
         produced_artifacts=(binding,),
         inventory_id=f"inventory-{task_id}",
@@ -1792,3 +1796,359 @@ def test_scope_deviation_consequence_is_idempotent_and_cannot_widen_scope(
         assert release is not None
         assert release["state"] == "REVOKED"
         assert release["revoked_reason"] == ChangeGateReason.SCOPE_DEVIATION.value
+
+
+def test_current_turn_host_adapter_claim_resolves_session_and_reuses_release(
+    tmp_path: Path,
+    isolated_home: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    db_path = tmp_path / "kanban.db"
+    monkeypatch.setenv("HERMES_KANBAN_DB", str(db_path))
+    with _connect(db_path) as conn:
+        task_id = _create_ready_task(conn)
+        fixture = _attach_runtime_artifacts(conn, tmp_path, task_id)
+        conn.execute(
+            "UPDATE tasks SET session_id = ? WHERE id = ?",
+            ("session-claim", task_id),
+        )
+        _enable_runtime(monkeypatch, tmp_path / "inventory")
+        statement = expected_release_statement(
+            purpose=ReleasePurpose.CLAIM,
+            handoff_sha256=fixture.handoff_sha256,
+        )
+
+        tokens = set_session_vars(platform="manual", session_id="session-claim")
+        try:
+            with _scoped_test_current_turn_user_authority(
+                statement,
+                session_id="session-claim",
+                turn_id="host-claim-turn",
+                platform_scope="manual",
+            ):
+                first = issue_current_turn_change_gate_release()
+                second = issue_current_turn_change_gate_release()
+        finally:
+            clear_session_vars(tokens)
+
+        assert first.ok
+        assert first.status == "issued"
+        assert first.task_id == task_id
+        assert first.purpose == ReleasePurpose.CLAIM.value
+        assert first.release_id is not None
+        assert second.ok
+        assert second.status == "existing_idempotent"
+        assert second.release_id == first.release_id
+        assert conn.execute(
+            "SELECT COUNT(*) FROM change_gate_releases WHERE task_id = ?",
+            (task_id,),
+        ).fetchone()[0] == 1
+
+
+def test_current_turn_resolver_notify_fallback_never_overrides_task_session(
+    tmp_path: Path,
+    isolated_home: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    db_path = tmp_path / "kanban.db"
+    monkeypatch.setenv("HERMES_KANBAN_DB", str(db_path))
+    with _connect(db_path) as conn:
+        task_id = _create_ready_task(conn)
+        fixture = _attach_runtime_artifacts(conn, tmp_path, task_id)
+        conn.execute("UPDATE tasks SET session_id = '' WHERE id = ?", (task_id,))
+        conn.execute(
+            "INSERT INTO kanban_notify_subs("
+            "task_id, platform, chat_id, thread_id, created_at, last_event_id"
+            ") VALUES (?, ?, ?, ?, ?, 0)",
+            (task_id, "discord", "wrong-chat", "", 20),
+        )
+        conn.execute(
+            "INSERT INTO kanban_notify_subs("
+            "task_id, platform, chat_id, thread_id, created_at, last_event_id"
+            ") VALUES (?, ?, ?, ?, ?, 0)",
+            (task_id, "discord", "chat-a", "thread-a", 10),
+        )
+        _enable_runtime(monkeypatch, tmp_path / "inventory")
+        statement = expected_release_statement(
+            purpose=ReleasePurpose.CLAIM,
+            handoff_sha256=fixture.handoff_sha256,
+        )
+
+        tokens = set_session_vars(
+            platform="discord",
+            chat_id="chat-a",
+            thread_id="thread-a",
+            session_id="origin-session",
+        )
+        try:
+            with _scoped_test_current_turn_user_authority(
+                statement,
+                session_id="origin-session",
+                turn_id="notify-fallback-turn",
+                platform_scope="discord",
+            ):
+                fallback = issue_current_turn_change_gate_release()
+        finally:
+            clear_session_vars(tokens)
+
+        assert fallback.ok
+        assert fallback.status == "issued"
+        assert fallback.task_id == task_id
+
+        task_id_mismatch = _create_ready_task(conn)
+        mismatch_root = tmp_path / "mismatch"
+        mismatch_root.mkdir()
+        fixture_mismatch = _attach_runtime_artifacts(
+            conn,
+            mismatch_root,
+            task_id_mismatch,
+        )
+        for inventory_file in (mismatch_root / "inventory").iterdir():
+            (tmp_path / "inventory" / inventory_file.name).write_bytes(
+                inventory_file.read_bytes()
+            )
+        conn.execute(
+            "UPDATE tasks SET session_id = ? WHERE id = ?",
+            ("different-session", task_id_mismatch),
+        )
+        conn.execute(
+            "INSERT INTO kanban_notify_subs("
+            "task_id, platform, chat_id, thread_id, created_at, last_event_id"
+            ") VALUES (?, ?, ?, ?, ?, 0)",
+            (task_id_mismatch, "discord", "chat-a", "thread-a", 30),
+        )
+        mismatch_statement = expected_release_statement(
+            purpose=ReleasePurpose.CLAIM,
+            handoff_sha256=fixture_mismatch.handoff_sha256,
+        )
+        tokens = set_session_vars(
+            platform="discord",
+            chat_id="chat-a",
+            thread_id="thread-a",
+            session_id="origin-session",
+        )
+        try:
+            with _scoped_test_current_turn_user_authority(
+                mismatch_statement,
+                session_id="origin-session",
+                turn_id="notify-mismatch-turn",
+                platform_scope="discord",
+            ):
+                mismatch = issue_current_turn_change_gate_release()
+        finally:
+            clear_session_vars(tokens)
+
+        assert not mismatch.ok
+        assert mismatch.status == "zero_candidate"
+        assert conn.execute(
+            "SELECT COUNT(*) FROM change_gate_releases WHERE task_id = ?",
+            (task_id_mismatch,),
+        ).fetchone()[0] == 0
+
+
+def test_current_turn_malformed_authority_fails_closed_without_schema(
+    tmp_path: Path,
+    isolated_home: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    db_path = tmp_path / "kanban.db"
+    monkeypatch.setenv("HERMES_KANBAN_DB", str(db_path))
+    with _connect(db_path) as conn:
+        task_id = _create_ready_task(conn)
+        fixture = _attach_runtime_artifacts(conn, tmp_path, task_id)
+        conn.execute(
+            "UPDATE tasks SET session_id = ? WHERE id = ?",
+            ("session-malformed", task_id),
+        )
+        _enable_runtime(monkeypatch, tmp_path / "inventory")
+        statement = expected_release_statement(
+            purpose=ReleasePurpose.CLAIM,
+            handoff_sha256=fixture.handoff_sha256,
+        )
+
+        tokens = set_session_vars(platform="manual", session_id="session-malformed")
+        try:
+            with _scoped_test_current_turn_user_authority(
+                statement + " trailing",
+                session_id="session-malformed",
+                turn_id="malformed-turn",
+                platform_scope="manual",
+            ):
+                result = issue_current_turn_change_gate_release()
+        finally:
+            clear_session_vars(tokens)
+
+        assert not result.ok
+        assert result.status == "zero_candidate"
+        assert result.terminal
+        assert not kb.change_gate_runtime_schema_exists(conn)
+
+
+def test_current_turn_default_off_authority_fails_open_to_provider_without_schema(
+    tmp_path: Path,
+    isolated_home: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    db_path = tmp_path / "kanban.db"
+    monkeypatch.setenv("HERMES_KANBAN_DB", str(db_path))
+    with _connect(db_path) as conn:
+        statement = "AUTHORIZE_HERMES_CHANGE_GATE_CLAIM " + "0" * 64
+        with _scoped_test_current_turn_user_authority(
+            statement,
+            session_id="session-default-off",
+            turn_id="default-off-turn",
+            platform_scope="manual",
+        ):
+            result = issue_current_turn_change_gate_release()
+
+        assert not result.ok
+        assert result.status == "ineligible"
+        assert result.reason == ChangeGateReason.DISABLED.value
+        assert not result.terminal
+        assert not kb.change_gate_runtime_schema_exists(conn)
+
+
+def test_current_turn_ambiguous_authority_fails_closed_without_release_schema(
+    tmp_path: Path,
+    isolated_home: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    db_path = tmp_path / "kanban.db"
+    monkeypatch.setenv("HERMES_KANBAN_DB", str(db_path))
+    with _connect(db_path) as conn:
+        first_task = _create_ready_task(conn)
+        fixture = _attach_runtime_artifacts(conn, tmp_path, first_task)
+        second_task = _create_ready_task(conn)
+        conn.execute(
+            "UPDATE tasks SET session_id = ? WHERE id IN (?, ?)",
+            ("session-ambiguous", first_task, second_task),
+        )
+        rows = conn.execute(
+            "SELECT filename, stored_path, content_type FROM task_attachments "
+            "WHERE task_id = ?",
+            (first_task,),
+        ).fetchall()
+        for row in rows:
+            kb.store_attachment_bytes(
+                conn,
+                second_task,
+                filename=row["filename"],
+                data=Path(row["stored_path"]).read_bytes(),
+                content_type=row["content_type"],
+            )
+        source = conn.execute(
+            "SELECT workspace_path FROM tasks WHERE id = ?",
+            (first_task,),
+        ).fetchone()["workspace_path"]
+        conn.execute(
+            "UPDATE tasks SET workspace_path = ?, assignee = ?, model_override = ?, "
+            "provider_override = ?, reasoning_effort = ? WHERE id = ?",
+            (
+                source,
+                "executor",
+                "fixture-model",
+                "fixture-provider",
+                "medium",
+                second_task,
+            ),
+        )
+        _enable_runtime(monkeypatch, tmp_path / "inventory")
+        statement = expected_release_statement(
+            purpose=ReleasePurpose.CLAIM,
+            handoff_sha256=fixture.handoff_sha256,
+        )
+
+        with _scoped_test_current_turn_user_authority(
+            statement,
+            session_id="session-ambiguous",
+            turn_id="ambiguous-turn",
+            platform_scope="manual",
+        ):
+            result = issue_current_turn_change_gate_release()
+
+        assert not result.ok
+        assert result.status == "ambiguous"
+        assert result.candidate_count == 2
+        assert result.terminal
+        assert not kb.change_gate_runtime_schema_exists(conn)
+
+
+def test_current_turn_host_adapter_g4_resolves_review_task(
+    tmp_path: Path,
+    isolated_home: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    db_path = tmp_path / "kanban.db"
+    monkeypatch.setenv("HERMES_KANBAN_DB", str(db_path))
+    with _connect(db_path) as conn:
+        task_id = _create_ready_task(conn)
+        fixture = _attach_runtime_artifacts(conn, tmp_path, task_id)
+        conn.execute(
+            "UPDATE tasks SET session_id = ? WHERE id = ?",
+            ("session-g4", task_id),
+        )
+        _enable_runtime(monkeypatch, tmp_path / "inventory")
+        claim_statement = expected_release_statement(
+            purpose=ReleasePurpose.CLAIM,
+            handoff_sha256=fixture.handoff_sha256,
+        )
+        tokens = set_session_vars(platform="manual", session_id="session-g4")
+        try:
+            with _scoped_test_current_turn_user_authority(
+                claim_statement,
+                session_id="session-g4",
+                turn_id="host-g4-claim-turn",
+                platform_scope="manual",
+            ):
+                claim_release = issue_current_turn_change_gate_release()
+        finally:
+            clear_session_vars(tokens)
+        assert claim_release.ok
+
+        claimed = kb.claim_task(conn, task_id)
+        assert claimed is not None
+        assert claimed.current_run_id is not None
+        assert kb.request_review(conn, task_id, expected_run_id=int(claimed.current_run_id))
+        reviewer = kb.claim_review_task(conn, task_id)
+        assert reviewer is not None
+        assert reviewer.current_run_id is not None
+        assert kb.request_review(
+            conn,
+            task_id,
+            expected_run_id=int(reviewer.current_run_id),
+            change_gate_review={
+                "reviewer_class": ReviewerClass.REVIEWER.value,
+                "verdict": ReviewVerdict.PASS.value,
+                "finding_codes": [],
+            },
+        )
+        ready_for_g4 = kb.get_task(conn, task_id)
+        assert ready_for_g4 is not None
+        assert ready_for_g4.status == "review"
+        assert ready_for_g4.current_run_id is None
+
+        g4_statement = expected_release_statement(
+            purpose=ReleasePurpose.G4,
+            handoff_sha256=fixture.handoff_sha256,
+        )
+        tokens = set_session_vars(platform="manual", session_id="session-g4")
+        try:
+            with _scoped_test_current_turn_user_authority(
+                g4_statement,
+                session_id="session-g4",
+                turn_id="host-g4-turn",
+                platform_scope="manual",
+            ):
+                g4_release = issue_current_turn_change_gate_release()
+        finally:
+            clear_session_vars(tokens)
+
+        assert g4_release.ok
+        assert g4_release.status == "issued"
+        assert g4_release.task_id == task_id
+        assert g4_release.purpose == ReleasePurpose.G4.value
+        assert conn.execute(
+            "SELECT COUNT(*) FROM change_gate_releases "
+            "WHERE task_id = ? AND purpose = 'G4'",
+            (task_id,),
+        ).fetchone()[0] == 1

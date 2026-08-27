@@ -405,6 +405,60 @@ def _store_release(
     return kb._store_change_gate_release(conn, release)
 
 
+def _current_turn_claim_fixture(
+    conn: sqlite3.Connection,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    *,
+    db_path: Path,
+    session_id: str,
+) -> tuple[str, RuntimeFixture, str]:
+    monkeypatch.setenv("HERMES_KANBAN_DB", str(db_path))
+    task_id = _create_ready_task(conn)
+    fixture = _attach_runtime_artifacts(conn, tmp_path, task_id)
+    conn.execute(
+        "UPDATE tasks SET session_id = ? WHERE id = ?",
+        (session_id, task_id),
+    )
+    _enable_runtime(monkeypatch, tmp_path / "inventory")
+    return (
+        task_id,
+        fixture,
+        expected_release_statement(
+            purpose=ReleasePurpose.CLAIM,
+            handoff_sha256=fixture.handoff_sha256,
+        ),
+    )
+
+
+def _current_turn_release_count(conn: sqlite3.Connection, task_id: str) -> int:
+    return int(
+        conn.execute(
+            "SELECT COUNT(*) FROM change_gate_releases WHERE task_id = ?",
+            (task_id,),
+        ).fetchone()[0]
+    )
+
+
+def _issue_current_turn_claim(
+    *,
+    statement: str,
+    session_id: str,
+    turn_id: str,
+):
+    tokens = set_session_vars(platform="manual", session_id=session_id)
+    try:
+        with _scoped_test_current_turn_user_authority(
+            statement,
+            session_id=session_id,
+            turn_id=turn_id,
+            platform_scope="manual",
+        ):
+            return issue_current_turn_change_gate_release()
+    finally:
+        clear_session_vars(tokens)
+
+
 def _claim_and_converge_normal_review(
     conn: sqlite3.Connection,
     fixture: RuntimeFixture,
@@ -1843,6 +1897,317 @@ def test_current_turn_host_adapter_claim_resolves_session_and_reuses_release(
             "SELECT COUNT(*) FROM change_gate_releases WHERE task_id = ?",
             (task_id,),
         ).fetchone()[0] == 1
+
+
+def test_current_turn_same_authority_revoked_release_does_not_reissue(
+    tmp_path: Path,
+    isolated_home: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    db_path = tmp_path / "kanban.db"
+    with _connect(db_path) as conn:
+        task_id, _fixture, statement = _current_turn_claim_fixture(
+            conn,
+            tmp_path,
+            monkeypatch,
+            db_path=db_path,
+            session_id="session-revoked-same",
+        )
+
+        tokens = set_session_vars(platform="manual", session_id="session-revoked-same")
+        try:
+            with _scoped_test_current_turn_user_authority(
+                statement,
+                session_id="session-revoked-same",
+                turn_id="same-revoked-turn",
+                platform_scope="manual",
+            ):
+                first = issue_current_turn_change_gate_release()
+                assert first.ok
+                assert first.release_id is not None
+                assert kb.revoke_change_gate_releases(
+                    conn,
+                    task_id,
+                    reason=ChangeGateReason.RELEASE_REVOKED,
+                ) == 1
+                second = issue_current_turn_change_gate_release()
+        finally:
+            clear_session_vars(tokens)
+
+        assert not second.ok
+        assert second.status == "owner_failure"
+        assert _current_turn_release_count(conn, task_id) == 1
+        state = kb.change_gate_release_state(conn, first.release_id)
+        assert state is not None
+        assert state["state"] == "REVOKED"
+
+
+def test_current_turn_same_authority_expired_release_does_not_reissue(
+    tmp_path: Path,
+    isolated_home: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    db_path = tmp_path / "kanban.db"
+    with _connect(db_path) as conn:
+        task_id, _fixture, statement = _current_turn_claim_fixture(
+            conn,
+            tmp_path,
+            monkeypatch,
+            db_path=db_path,
+            session_id="session-expired-same",
+        )
+        first = _issue_current_turn_claim(
+            statement=statement,
+            session_id="session-expired-same",
+            turn_id="same-expired-turn",
+        )
+        assert first.ok
+        assert first.issued_at_epoch is not None
+        monkeypatch.setattr(time, "time", lambda: first.issued_at_epoch + 301)
+
+        second = _issue_current_turn_claim(
+            statement=statement,
+            session_id="session-expired-same",
+            turn_id="same-expired-turn",
+        )
+
+        assert not second.ok
+        assert second.status == "owner_failure"
+        assert _current_turn_release_count(conn, task_id) == 1
+
+
+def test_current_turn_same_authority_consumed_release_does_not_reissue(
+    tmp_path: Path,
+    isolated_home: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    db_path = tmp_path / "kanban.db"
+    with _connect(db_path) as conn:
+        task_id, _fixture, statement = _current_turn_claim_fixture(
+            conn,
+            tmp_path,
+            monkeypatch,
+            db_path=db_path,
+            session_id="session-consumed-same",
+        )
+        first = _issue_current_turn_claim(
+            statement=statement,
+            session_id="session-consumed-same",
+            turn_id="same-consumed-turn",
+        )
+        assert first.ok
+        assert first.release_id is not None
+        assert first.issued_at_epoch is not None
+        release = kb._load_change_gate_release(conn, first.release_id)
+        assert release is not None
+        assert kb._mark_change_gate_release_consumed(
+            conn,
+            release,
+            run_id=101,
+            event_id=202,
+            from_status="ready",
+            to_status="running",
+            now_epoch=first.issued_at_epoch + 1,
+        )
+
+        second = _issue_current_turn_claim(
+            statement=statement,
+            session_id="session-consumed-same",
+            turn_id="same-consumed-turn",
+        )
+
+        assert not second.ok
+        assert second.status == "owner_failure"
+        assert _current_turn_release_count(conn, task_id) == 1
+        state = kb.change_gate_release_state(conn, first.release_id)
+        assert state is not None
+        assert state["state"] == "CONSUMED"
+
+
+def test_current_turn_same_authority_stale_transition_does_not_reissue(
+    tmp_path: Path,
+    isolated_home: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    db_path = tmp_path / "kanban.db"
+    with _connect(db_path) as conn:
+        task_id, _fixture, statement = _current_turn_claim_fixture(
+            conn,
+            tmp_path,
+            monkeypatch,
+            db_path=db_path,
+            session_id="session-stale-same",
+        )
+        first = _issue_current_turn_claim(
+            statement=statement,
+            session_id="session-stale-same",
+            turn_id="same-stale-turn",
+        )
+        assert first.ok
+        kb._append_event(
+            conn,
+            task_id,
+            "synthetic-transition-drift",
+            {"reason": "same authority must not reissue stale transition"},
+        )
+
+        second = _issue_current_turn_claim(
+            statement=statement,
+            session_id="session-stale-same",
+            turn_id="same-stale-turn",
+        )
+
+        assert not second.ok
+        assert second.status == "owner_failure"
+        assert _current_turn_release_count(conn, task_id) == 1
+
+
+def test_current_turn_same_authority_malformed_release_does_not_reissue(
+    tmp_path: Path,
+    isolated_home: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    db_path = tmp_path / "kanban.db"
+    with _connect(db_path) as conn:
+        task_id, _fixture, statement = _current_turn_claim_fixture(
+            conn,
+            tmp_path,
+            monkeypatch,
+            db_path=db_path,
+            session_id="session-malformed-same",
+        )
+        first = _issue_current_turn_claim(
+            statement=statement,
+            session_id="session-malformed-same",
+            turn_id="same-malformed-turn",
+        )
+        assert first.ok
+        assert first.release_id is not None
+        conn.execute(
+            "UPDATE change_gate_releases SET artifact_schema = ? WHERE release_id = ?",
+            ("malformed-release/v0", first.release_id),
+        )
+
+        second = _issue_current_turn_claim(
+            statement=statement,
+            session_id="session-malformed-same",
+            turn_id="same-malformed-turn",
+        )
+
+        assert not second.ok
+        assert second.status == "owner_failure"
+        assert _current_turn_release_count(conn, task_id) == 1
+
+
+def test_current_turn_fresh_authority_after_revoked_release_can_reauthorize(
+    tmp_path: Path,
+    isolated_home: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    db_path = tmp_path / "kanban.db"
+    with _connect(db_path) as conn:
+        task_id, _fixture, statement = _current_turn_claim_fixture(
+            conn,
+            tmp_path,
+            monkeypatch,
+            db_path=db_path,
+            session_id="session-revoked-fresh",
+        )
+        first = _issue_current_turn_claim(
+            statement=statement,
+            session_id="session-revoked-fresh",
+            turn_id="revoked-old-turn",
+        )
+        assert first.ok
+        assert first.release_id is not None
+        assert kb.revoke_change_gate_releases(
+            conn,
+            task_id,
+            reason=ChangeGateReason.RELEASE_REVOKED,
+        ) == 1
+
+        second = _issue_current_turn_claim(
+            statement=statement,
+            session_id="session-revoked-fresh",
+            turn_id="revoked-fresh-turn",
+        )
+
+        assert second.ok
+        assert second.status == "issued"
+        assert second.release_id is not None
+        assert second.release_id != first.release_id
+        assert _current_turn_release_count(conn, task_id) == 2
+
+
+def test_current_turn_fresh_authority_cannot_replace_live_release(
+    tmp_path: Path,
+    isolated_home: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    db_path = tmp_path / "kanban.db"
+    with _connect(db_path) as conn:
+        task_id, _fixture, statement = _current_turn_claim_fixture(
+            conn,
+            tmp_path,
+            monkeypatch,
+            db_path=db_path,
+            session_id="session-live-fresh",
+        )
+        first = _issue_current_turn_claim(
+            statement=statement,
+            session_id="session-live-fresh",
+            turn_id="live-old-turn",
+        )
+        assert first.ok
+
+        second = _issue_current_turn_claim(
+            statement=statement,
+            session_id="session-live-fresh",
+            turn_id="live-fresh-turn",
+        )
+
+        assert not second.ok
+        assert second.status == "owner_failure"
+        assert _current_turn_release_count(conn, task_id) == 1
+
+
+def test_current_turn_host_then_model_tool_same_authority_reuses_release(
+    tmp_path: Path,
+    isolated_home: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    db_path = tmp_path / "kanban.db"
+    with _connect(db_path) as conn:
+        task_id, _fixture, statement = _current_turn_claim_fixture(
+            conn,
+            tmp_path,
+            monkeypatch,
+            db_path=db_path,
+            session_id="session-host-model",
+        )
+
+        tokens = set_session_vars(platform="manual", session_id="session-host-model")
+        try:
+            with _scoped_test_current_turn_user_authority(
+                statement,
+                session_id="session-host-model",
+                turn_id="host-model-same-turn",
+                platform_scope="manual",
+            ):
+                host = issue_current_turn_change_gate_release()
+                model_tool = issue_change_gate_release(
+                    task_id=task_id,
+                    purpose=ReleasePurpose.CLAIM.value,
+                )
+        finally:
+            clear_session_vars(tokens)
+
+        assert host.ok
+        assert host.release_id is not None
+        assert model_tool.ok
+        assert model_tool.reused
+        assert model_tool.release_id == host.release_id
+        assert _current_turn_release_count(conn, task_id) == 1
 
 
 def test_current_turn_resolver_notify_fallback_never_overrides_task_session(

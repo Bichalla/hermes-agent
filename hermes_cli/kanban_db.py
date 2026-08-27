@@ -4745,6 +4745,32 @@ def _same_foreground_release_authority(
     )
 
 
+def _change_gate_release_authority_receipt_already_persisted(
+    conn: sqlite3.Connection,
+    release: DurableReleaseArtifact,
+) -> bool:
+    if not change_gate_runtime_schema_exists(conn):
+        return False
+    rows = conn.execute(
+        "SELECT release_id FROM change_gate_releases "
+        "WHERE task_id = ? AND purpose = ? AND authority_receipt_sha256 = ? "
+        "ORDER BY issued_at DESC, rowid DESC",
+        (
+            release.task_id,
+            release.purpose.value,
+            canonical_sha256(release.authority_receipt),
+        ),
+    ).fetchall()
+    for row in rows:
+        persisted = _load_change_gate_release(conn, row["release_id"])
+        if persisted is None or persisted.authority_receipt != release.authority_receipt:
+            raise PermissionError("change_gate_persisted_authority_receipt_invalid")
+        if not _same_foreground_release_authority(persisted, release):
+            raise PermissionError("change_gate_persisted_authority_binding_mismatch")
+        return True
+    return False
+
+
 def persist_or_reuse_foreground_change_gate_release(
     conn: sqlite3.Connection,
     release: DurableReleaseArtifact,
@@ -4835,6 +4861,8 @@ def persist_or_reuse_foreground_change_gate_release(
             if _same_foreground_release_authority(existing, release):
                 return ForegroundChangeGateReleasePersistence(existing, True)
             raise PermissionError("change_gate_live_release_authority_mismatch")
+        if _change_gate_release_authority_receipt_already_persisted(conn, release):
+            raise PermissionError("change_gate_terminal_release_authority_reuse")
         if reason not in _CHANGE_GATE_REISSUABLE_REASONS:
             raise PermissionError("change_gate_existing_release_state_not_reissuable")
         stored_release_id = _store_change_gate_release(conn, release, _allow_nested=True)

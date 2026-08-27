@@ -2099,6 +2099,174 @@ def test_current_turn_same_authority_malformed_release_does_not_reissue(
         assert _current_turn_release_count(conn, task_id) == 1
 
 
+def test_current_turn_same_authority_live_corrupted_receipt_hash_fails_closed(
+    tmp_path: Path,
+    isolated_home: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    db_path = tmp_path / "kanban.db"
+    with _connect(db_path) as conn:
+        task_id, _fixture, statement = _current_turn_claim_fixture(
+            conn,
+            tmp_path,
+            monkeypatch,
+            db_path=db_path,
+            session_id="session-live-corrupt-hash-same",
+        )
+        first = _issue_current_turn_claim(
+            statement=statement,
+            session_id="session-live-corrupt-hash-same",
+            turn_id="live-corrupt-hash-same-turn",
+        )
+        assert first.ok
+        assert first.release_id is not None
+        conn.execute(
+            "UPDATE change_gate_releases "
+            "SET authority_receipt_sha256 = ? WHERE release_id = ?",
+            ("0" * 64, first.release_id),
+        )
+
+        second = _issue_current_turn_claim(
+            statement=statement,
+            session_id="session-live-corrupt-hash-same",
+            turn_id="live-corrupt-hash-same-turn",
+        )
+
+        assert not second.ok
+        assert second.status == "owner_failure"
+        assert _current_turn_release_count(conn, task_id) == 1
+        state = kb.change_gate_release_state(conn, first.release_id)
+        assert state is not None
+        assert state["state"] == "ISSUED"
+
+
+def test_current_turn_fresh_authority_live_corrupted_receipt_hash_fails_closed(
+    tmp_path: Path,
+    isolated_home: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    db_path = tmp_path / "kanban.db"
+    with _connect(db_path) as conn:
+        task_id, _fixture, statement = _current_turn_claim_fixture(
+            conn,
+            tmp_path,
+            monkeypatch,
+            db_path=db_path,
+            session_id="session-live-corrupt-hash-fresh",
+        )
+        first = _issue_current_turn_claim(
+            statement=statement,
+            session_id="session-live-corrupt-hash-fresh",
+            turn_id="live-corrupt-hash-old-turn",
+        )
+        assert first.ok
+        assert first.release_id is not None
+        conn.execute(
+            "UPDATE change_gate_releases "
+            "SET authority_receipt_sha256 = ? WHERE release_id = ?",
+            ("f" * 64, first.release_id),
+        )
+
+        second = _issue_current_turn_claim(
+            statement=statement,
+            session_id="session-live-corrupt-hash-fresh",
+            turn_id="live-corrupt-hash-fresh-turn",
+        )
+
+        assert not second.ok
+        assert second.status == "owner_failure"
+        assert _current_turn_release_count(conn, task_id) == 1
+
+
+def test_current_turn_same_authority_revoked_corrupted_receipt_hash_fails_closed(
+    tmp_path: Path,
+    isolated_home: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    db_path = tmp_path / "kanban.db"
+    with _connect(db_path) as conn:
+        task_id, _fixture, statement = _current_turn_claim_fixture(
+            conn,
+            tmp_path,
+            monkeypatch,
+            db_path=db_path,
+            session_id="session-revoked-corrupt-hash-same",
+        )
+        first = _issue_current_turn_claim(
+            statement=statement,
+            session_id="session-revoked-corrupt-hash-same",
+            turn_id="revoked-corrupt-hash-same-turn",
+        )
+        assert first.ok
+        assert first.release_id is not None
+        assert kb.revoke_change_gate_releases(
+            conn,
+            task_id,
+            reason=ChangeGateReason.RELEASE_REVOKED,
+        ) == 1
+        conn.execute(
+            "UPDATE change_gate_releases "
+            "SET authority_receipt_sha256 = ? WHERE release_id = ?",
+            ("0" * 64, first.release_id),
+        )
+
+        second = _issue_current_turn_claim(
+            statement=statement,
+            session_id="session-revoked-corrupt-hash-same",
+            turn_id="revoked-corrupt-hash-same-turn",
+        )
+
+        assert not second.ok
+        assert second.status == "owner_failure"
+        assert _current_turn_release_count(conn, task_id) == 1
+        state = kb.change_gate_release_state(conn, first.release_id)
+        assert state is not None
+        assert state["state"] == "REVOKED"
+
+
+def test_current_turn_fresh_authority_revoked_corrupted_receipt_hash_fails_closed(
+    tmp_path: Path,
+    isolated_home: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    db_path = tmp_path / "kanban.db"
+    with _connect(db_path) as conn:
+        task_id, _fixture, statement = _current_turn_claim_fixture(
+            conn,
+            tmp_path,
+            monkeypatch,
+            db_path=db_path,
+            session_id="session-revoked-corrupt-hash-fresh",
+        )
+        first = _issue_current_turn_claim(
+            statement=statement,
+            session_id="session-revoked-corrupt-hash-fresh",
+            turn_id="revoked-corrupt-hash-old-turn",
+        )
+        assert first.ok
+        assert first.release_id is not None
+        assert kb.revoke_change_gate_releases(
+            conn,
+            task_id,
+            reason=ChangeGateReason.RELEASE_REVOKED,
+        ) == 1
+        conn.execute(
+            "UPDATE change_gate_releases "
+            "SET authority_receipt_sha256 = ? WHERE release_id = ?",
+            ("f" * 64, first.release_id),
+        )
+
+        second = _issue_current_turn_claim(
+            statement=statement,
+            session_id="session-revoked-corrupt-hash-fresh",
+            turn_id="revoked-corrupt-hash-fresh-turn",
+        )
+
+        assert not second.ok
+        assert second.status == "owner_failure"
+        assert _current_turn_release_count(conn, task_id) == 1
+
+
 def test_current_turn_fresh_authority_after_revoked_release_can_reauthorize(
     tmp_path: Path,
     isolated_home: Path,

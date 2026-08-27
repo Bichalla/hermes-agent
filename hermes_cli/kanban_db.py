@@ -4751,19 +4751,24 @@ def _change_gate_release_authority_receipt_already_persisted(
 ) -> bool:
     if not change_gate_runtime_schema_exists(conn):
         return False
+    incoming_receipt_sha256 = canonical_sha256(release.authority_receipt)
     rows = conn.execute(
         "SELECT release_id FROM change_gate_releases "
-        "WHERE task_id = ? AND purpose = ? AND authority_receipt_sha256 = ? "
+        "WHERE task_id = ? AND purpose = ? "
         "ORDER BY issued_at DESC, rowid DESC",
         (
             release.task_id,
             release.purpose.value,
-            canonical_sha256(release.authority_receipt),
         ),
     ).fetchall()
     for row in rows:
         persisted = _load_change_gate_release(conn, row["release_id"])
-        if persisted is None or persisted.authority_receipt != release.authority_receipt:
+        if persisted is None:
+            raise PermissionError("change_gate_persisted_authority_receipt_invalid")
+        persisted_receipt_sha256 = canonical_sha256(persisted.authority_receipt)
+        if persisted_receipt_sha256 != incoming_receipt_sha256:
+            continue
+        if persisted.authority_receipt != release.authority_receipt:
             raise PermissionError("change_gate_persisted_authority_receipt_invalid")
         if not _same_foreground_release_authority(persisted, release):
             raise PermissionError("change_gate_persisted_authority_binding_mismatch")
@@ -4881,8 +4886,8 @@ def _load_change_gate_release(
     row = conn.execute(
         "SELECT artifact_json, artifact_sha256, artifact_schema, "
         "transition_anchor_sha256, task_id, work_id, purpose, handoff_sha256, "
-        "evidence_sha256, inventory_sha256, artifact_set_sha256, route_sha256 "
-        "FROM change_gate_releases WHERE release_id = ?",
+        "evidence_sha256, inventory_sha256, artifact_set_sha256, route_sha256, "
+        "authority_receipt_sha256 FROM change_gate_releases WHERE release_id = ?",
         (release_id,),
     ).fetchone()
     if row is None or type(row["artifact_json"]) is not str:
@@ -4908,6 +4913,8 @@ def _load_change_gate_release(
         or decoded.value.inventory_sha256 != row["inventory_sha256"]
         or decoded.value.artifact_set_sha256 != row["artifact_set_sha256"]
         or decoded.value.route_sha256 != row["route_sha256"]
+        or canonical_sha256(decoded.value.authority_receipt)
+        != row["authority_receipt_sha256"]
     ):
         return None
     return decoded.value

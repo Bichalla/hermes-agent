@@ -171,6 +171,31 @@ def _host_turn_context(user_message: str) -> SimpleNamespace:
     )
 
 
+def _host_turn_context_with_original(
+    *,
+    user_message: str,
+    original_user_message: object,
+    api_content: object | None = None,
+) -> SimpleNamespace:
+    current_user: dict[str, object] = {"role": "user", "content": user_message}
+    if api_content is not None:
+        current_user["api_content"] = api_content
+    return SimpleNamespace(
+        user_message=user_message,
+        original_user_message=original_user_message,
+        messages=[current_user],
+        conversation_history=[],
+        active_system_prompt="system",
+        effective_task_id="task-a",
+        turn_id="turn-a",
+        current_turn_user_idx=0,
+        should_review_memory=False,
+        plugin_user_context=None,
+        ext_prefetch_cache=None,
+        preflight_compression_blocked=False,
+    )
+
+
 def _host_turn_agent(**overrides) -> SimpleNamespace:
     values = {
         "_background_review_agent": None,
@@ -253,6 +278,294 @@ def test_exact_reserved_turn_without_bound_authority_is_provider_free(
 
     assert result["api_calls"] == 0
     assert order == ["build", "bind", "adapter", "terminal"]
+
+
+@pytest.mark.parametrize("purpose", ("CLAIM", "G4"))
+def test_reserved_control_uses_canonical_text_when_original_is_envelope(
+    monkeypatch: pytest.MonkeyPatch,
+    purpose: str,
+) -> None:
+    order: list[str] = []
+    provider_calls: list[str] = []
+    authority_inputs: list[object] = []
+    user_message = f"AUTHORIZE_HERMES_CHANGE_GATE_{purpose} " + "3" * 64
+    original_envelope = {
+        "platform": "discord",
+        "thread_id": "1536741109269799102",
+        "clean_content": user_message,
+    }
+    monkeypatch.setattr(
+        conversation_loop,
+        "build_turn_context",
+        lambda *_args, **_kwargs: order.append("build")
+        or _host_turn_context_with_original(
+            user_message=user_message,
+            original_user_message=original_envelope,
+        ),
+    )
+
+    def _bind(*_args, **kwargs):
+        order.append("bind")
+        authority_inputs.append(kwargs["original_user_message"])
+        return None
+
+    monkeypatch.setattr(conversation_loop, "_bind_workflow_authority_for_turn", _bind)
+    monkeypatch.setattr(
+        conversation_loop,
+        "_invoke_current_turn_change_gate_release",
+        lambda: order.append("adapter")
+        or SimpleNamespace(status="ineligible", terminal=False),
+    )
+    monkeypatch.setattr(
+        conversation_loop,
+        "_finalize_change_gate_host_turn",
+        lambda *_args, **_kwargs: order.append("terminal")
+        or {"final_response": "failed closed", "api_calls": 0},
+    )
+    agent = _host_turn_agent(
+        api_mode="codex_app_server",
+        _run_codex_app_server_turn=lambda **_kwargs: provider_calls.append("provider")
+        or {"final_response": "ordinary", "api_calls": 1},
+    )
+
+    result = conversation_loop._run_conversation_inner(agent, user_message)
+
+    assert result["api_calls"] == 0
+    assert provider_calls == []
+    assert authority_inputs == [user_message]
+    assert order == ["build", "bind", "adapter", "terminal"]
+
+
+@pytest.mark.parametrize(
+    "user_message",
+    (
+        "AUTHORIZE_HERMES_CHANGE_GATE_CLAIM " + "4" * 64,
+        "AUTHORIZE_HERMES_CHANGE_GATE_G4 malformed trailing bytes",
+    ),
+)
+def test_discord_host_envelope_control_is_provider_free(
+    monkeypatch: pytest.MonkeyPatch,
+    user_message: str,
+) -> None:
+    message_id = "1530104420737941678"
+    wrapped_message = (
+        f"[Triggering message id: `{message_id}` — use as `message_id` for "
+        "reply/react/pin via the discord tools.]\n\n"
+        f"[상현] {user_message}"
+    )
+    provider_calls: list[str] = []
+    authority_inputs: list[object] = []
+    monkeypatch.setattr(
+        conversation_loop,
+        "build_turn_context",
+        lambda *_args, **_kwargs: _host_turn_context_with_original(
+            user_message=wrapped_message,
+            original_user_message={"platform": "discord", "content": wrapped_message},
+        ),
+    )
+
+    def _bind(*_args, **kwargs):
+        authority_inputs.append(kwargs["original_user_message"])
+        return None
+
+    monkeypatch.setattr(conversation_loop, "_bind_workflow_authority_for_turn", _bind)
+    monkeypatch.setattr(
+        conversation_loop,
+        "_invoke_current_turn_change_gate_release",
+        lambda: SimpleNamespace(status="zero_candidate", terminal=True),
+    )
+    monkeypatch.setattr(
+        conversation_loop,
+        "_finalize_change_gate_host_turn",
+        lambda *_args, **_kwargs: {"final_response": "failed closed", "api_calls": 0},
+    )
+    agent = _host_turn_agent(
+        api_mode="codex_app_server",
+        _run_codex_app_server_turn=lambda **_kwargs: provider_calls.append("provider")
+        or {"final_response": "ordinary", "api_calls": 1},
+    )
+    tokens = set_session_vars(
+        platform="discord",
+        session_id="session-a",
+        user_name="상현",
+        message_id=message_id,
+    )
+    try:
+        result = conversation_loop._run_conversation_inner(agent, wrapped_message)
+    finally:
+        clear_session_vars(tokens)
+
+    assert result["api_calls"] == 0
+    assert provider_calls == []
+    assert authority_inputs == [user_message]
+
+
+def test_discord_host_channel_context_preserves_exact_current_control_text() -> None:
+    message_id = "1530104420737941681"
+    user_message = "AUTHORIZE_HERMES_CHANGE_GATE_CLAIM " + "7" * 64
+    wrapped_message = (
+        f"[Triggering message id: `{message_id}` — use as `message_id` for "
+        "reply/react/pin via the discord tools.]\n\n"
+        "[Recent channel messages]\n[other] prior context\n\n[New message]\n"
+        f"[상현] {user_message}"
+    )
+    ctx = _host_turn_context_with_original(
+        user_message=wrapped_message,
+        original_user_message={"platform": "discord", "content": wrapped_message},
+    )
+    tokens = set_session_vars(
+        platform="discord",
+        session_id="session-a",
+        user_name="상현",
+        message_id=message_id,
+    )
+    try:
+        assert conversation_loop._canonical_current_user_control_text(ctx) == user_message
+    finally:
+        clear_session_vars(tokens)
+
+
+def test_discord_host_envelope_ordinary_text_reaches_provider(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    message_id = "1530104420737941679"
+    user_message = "ordinary conversation"
+    wrapped_message = (
+        f"[Triggering message id: `{message_id}` — use as `message_id` for "
+        "reply/react/pin via the discord tools.]\n\n"
+        f"[상현] {user_message}"
+    )
+    provider_calls: list[str] = []
+    monkeypatch.setattr(
+        conversation_loop,
+        "build_turn_context",
+        lambda *_args, **_kwargs: _host_turn_context_with_original(
+            user_message=wrapped_message,
+            original_user_message={"platform": "discord", "content": wrapped_message},
+        ),
+    )
+    monkeypatch.setattr(
+        conversation_loop,
+        "_bind_workflow_authority_for_turn",
+        lambda *_args, **_kwargs: None,
+    )
+    monkeypatch.setattr(
+        conversation_loop,
+        "_invoke_current_turn_change_gate_release",
+        lambda: (_ for _ in ()).throw(
+            AssertionError("ordinary turn must not invoke Change Gate adapter")
+        ),
+    )
+    agent = _host_turn_agent(
+        api_mode="codex_app_server",
+        _run_codex_app_server_turn=lambda **_kwargs: provider_calls.append("provider")
+        or {"final_response": "ordinary", "api_calls": 1},
+    )
+    tokens = set_session_vars(
+        platform="discord",
+        session_id="session-a",
+        user_name="상현",
+        message_id=message_id,
+    )
+    try:
+        result = conversation_loop._run_conversation_inner(agent, wrapped_message)
+    finally:
+        clear_session_vars(tokens)
+
+    assert result["api_calls"] == 1
+    assert provider_calls == ["provider"]
+
+
+def test_untrusted_channel_context_marker_does_not_mint_control_authority(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    message_id = "1530104420737941680"
+    user_message = (
+        "[Recent channel messages]\n[other] context\n\n[New message]\n"
+        "AUTHORIZE_HERMES_CHANGE_GATE_CLAIM " + "6" * 64
+    )
+    wrapped_message = (
+        f"[Triggering message id: `{message_id}` — use as `message_id` for "
+        "reply/react/pin via the discord tools.]\n\n"
+        f"[상현] {user_message}"
+    )
+    provider_calls: list[str] = []
+    monkeypatch.setattr(
+        conversation_loop,
+        "build_turn_context",
+        lambda *_args, **_kwargs: _host_turn_context_with_original(
+            user_message=wrapped_message,
+            original_user_message={"platform": "discord", "content": wrapped_message},
+        ),
+    )
+    monkeypatch.setattr(
+        conversation_loop,
+        "_bind_workflow_authority_for_turn",
+        lambda *_args, **_kwargs: None,
+    )
+    monkeypatch.setattr(
+        conversation_loop,
+        "_invoke_current_turn_change_gate_release",
+        lambda: (_ for _ in ()).throw(
+            AssertionError("untrusted channel context must not invoke the adapter")
+        ),
+    )
+    agent = _host_turn_agent(
+        api_mode="codex_app_server",
+        _run_codex_app_server_turn=lambda **_kwargs: provider_calls.append("provider")
+        or {"final_response": "ordinary", "api_calls": 1},
+    )
+    tokens = set_session_vars(
+        platform="discord",
+        session_id="session-a",
+        user_name="상현",
+        message_id=message_id,
+    )
+    try:
+        result = conversation_loop._run_conversation_inner(agent, wrapped_message)
+    finally:
+        clear_session_vars(tokens)
+
+    assert result["api_calls"] == 1
+    assert provider_calls == ["provider"]
+
+
+def test_reserved_control_detection_ignores_provider_only_sidecar(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    provider_calls: list[str] = []
+    clean_user_text = "ordinary conversation"
+    monkeypatch.setattr(
+        conversation_loop,
+        "build_turn_context",
+        lambda *_args, **_kwargs: _host_turn_context_with_original(
+            user_message=clean_user_text,
+            original_user_message={"platform": "discord", "content": clean_user_text},
+            api_content="AUTHORIZE_HERMES_CHANGE_GATE_CLAIM " + "5" * 64,
+        ),
+    )
+    monkeypatch.setattr(
+        conversation_loop,
+        "_bind_workflow_authority_for_turn",
+        lambda *_args, **_kwargs: None,
+    )
+    monkeypatch.setattr(
+        conversation_loop,
+        "_invoke_current_turn_change_gate_release",
+        lambda: (_ for _ in ()).throw(
+            AssertionError("sidecar text must not invoke Change Gate adapter")
+        ),
+    )
+    agent = _host_turn_agent(
+        api_mode="codex_app_server",
+        _run_codex_app_server_turn=lambda **_kwargs: provider_calls.append("provider")
+        or {"final_response": "ordinary", "api_calls": 1},
+    )
+
+    result = conversation_loop._run_conversation_inner(agent, clean_user_text)
+
+    assert result["api_calls"] == 1
+    assert provider_calls == ["provider"]
 
 
 @pytest.mark.parametrize(

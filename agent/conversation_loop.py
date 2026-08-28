@@ -1763,6 +1763,67 @@ def _is_change_gate_host_control_text(value: object) -> bool:
     return is_change_gate_host_control_text(value)
 
 
+def _canonical_current_user_control_text(ctx: object) -> Optional[str]:
+    """Return reserved control text from the current user turn, if present.
+
+    Turn persistence may keep a structured ``original_user_message`` while the
+    current user content is plain text.  Conversely, messaging gateways may
+    decorate that plain text with host-owned routing metadata before building
+    the turn.  Classification therefore reads only the current message content
+    and removes exact Discord decorations bound in the host session context.
+    Provider-only ``api_content`` sidecars are deliberately never inspected.
+    """
+
+    messages = getattr(ctx, "messages", None)
+    user_idx = getattr(ctx, "current_turn_user_idx", -1)
+    if not (
+        isinstance(messages, list)
+        and type(user_idx) is int
+        and 0 <= user_idx < len(messages)
+    ):
+        return None
+    current_user = messages[user_idx]
+    if not isinstance(current_user, dict) or current_user.get("role") != "user":
+        return None
+    value = current_user.get("content")
+    if type(value) is not str:
+        return None
+
+    from gateway.session_context import get_session_env
+
+    surface = (
+        get_session_env("HERMES_SESSION_PLATFORM", "").strip().casefold()
+        or get_session_env("HERMES_SESSION_SOURCE", "").strip().casefold()
+    )
+    if surface == "discord":
+        message_id = get_session_env("HERMES_SESSION_MESSAGE_ID", "")
+        if message_id:
+            trigger_prefix = (
+                f"[Triggering message id: `{message_id}` — use as "
+                "`message_id` for reply/react/pin via the discord tools.]\n\n"
+            )
+            if value.startswith(trigger_prefix):
+                value = value[len(trigger_prefix) :]
+
+        user_name = get_session_env("HERMES_SESSION_USER_NAME", "")
+        if user_name:
+            from gateway.session import neutralize_untrusted_inline_text
+
+            sender_prefix = f"[{neutralize_untrusted_inline_text(user_name)}] "
+            channel_separator = "\n\n[New message]\n"
+            if (
+                value.startswith("[Recent channel messages]\n")
+                and value.count(channel_separator) == 1
+            ):
+                current_message = value.split(channel_separator, 1)[1]
+                if current_message.startswith(sender_prefix):
+                    value = current_message
+            if value.startswith(sender_prefix):
+                value = value[len(sender_prefix) :]
+
+    return value if _is_change_gate_host_control_text(value) else None
+
+
 def _change_gate_host_response_text(host_result: object) -> str:
     """Return one bounded, provider-free response for an authoritative turn."""
 
@@ -2048,16 +2109,19 @@ def _run_conversation_inner(
     # Bind workflow authority only after the canonical current user turn has
     # been built. Synthetic timeline turns, cron, API, delegated children and
     # other non-foreground surfaces remain unbound/default-off.
+    _canonical_change_gate_control = _canonical_current_user_control_text(_ctx)
     _workflow_authority = _bind_workflow_authority_for_turn(
         agent,
-        original_user_message=original_user_message,
+        original_user_message=(
+            _canonical_change_gate_control
+            if _canonical_change_gate_control is not None
+            else original_user_message
+        ),
         turn_id=turn_id,
         current_turn_user_idx=current_turn_user_idx,
         persist_user_display_kind=persist_user_display_kind,
     )
-    _reserved_change_gate_control = _is_change_gate_host_control_text(
-        original_user_message
-    )
+    _reserved_change_gate_control = _canonical_change_gate_control is not None
     if _workflow_authority is not None or _reserved_change_gate_control:
         try:
             _change_gate_host_result = _invoke_current_turn_change_gate_release()

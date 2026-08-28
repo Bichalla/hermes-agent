@@ -24,8 +24,8 @@ _HOST_AUTHORITY_RE = re.compile(
     r"^AUTHORIZE_HERMES_CHANGE_GATE_(CLAIM|G4) ([a-f0-9]{64})$"
 )
 _HOST_AUTHORITY_PREFIXES = (
-    "AUTHORIZE_HERMES_CHANGE_GATE_CLAIM ",
-    "AUTHORIZE_HERMES_CHANGE_GATE_G4 ",
+    "AUTHORIZE_HERMES_CHANGE_GATE_CLAIM",
+    "AUTHORIZE_HERMES_CHANGE_GATE_G4",
 )
 
 
@@ -129,6 +129,16 @@ def _parse_purpose(value: object) -> ReleasePurpose | None:
     if value == ReleasePurpose.G4.value:
         return ReleasePurpose.G4
     return None
+
+
+def is_change_gate_host_control_text(value: object) -> bool:
+    """Identify the reserved foreground CLAIM/G4 control namespace.
+
+    Exact statements and malformed variants that begin with a reserved prefix
+    are host-control turns.  They must never fall through to a provider.
+    """
+
+    return type(value) is str and value.startswith(_HOST_AUTHORITY_PREFIXES)
 
 
 def issue_change_gate_release(
@@ -265,7 +275,7 @@ def issue_current_turn_change_gate_release() -> ChangeGateHostAdapterResult:
     trusted_text = get_trusted_current_user_text()
     match = _HOST_AUTHORITY_RE.fullmatch(trusted_text or "")
     if match is None:
-        if type(trusted_text) is str and trusted_text.startswith(_HOST_AUTHORITY_PREFIXES):
+        if is_change_gate_host_control_text(trusted_text):
             return ChangeGateHostAdapterResult(
                 False,
                 "zero_candidate",
@@ -381,6 +391,7 @@ def issue_current_turn_change_gate_release() -> ChangeGateHostAdapterResult:
 __all__ = [
     "ChangeGateHostAdapterResult",
     "ChangeGateReleaseIssueResult",
+    "is_change_gate_host_control_text",
     "issue_current_turn_change_gate_release",
     "issue_change_gate_release",
 ]

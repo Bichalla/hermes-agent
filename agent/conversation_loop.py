@@ -1755,6 +1755,14 @@ def _invoke_current_turn_change_gate_release():
     return issue_current_turn_change_gate_release()
 
 
+def _is_change_gate_host_control_text(value: object) -> bool:
+    """Delegate reserved-control classification to the release owner."""
+
+    from hermes_cli.change_gate_release import is_change_gate_host_control_text
+
+    return is_change_gate_host_control_text(value)
+
+
 def _change_gate_host_response_text(host_result: object) -> str:
     """Return one bounded, provider-free response for an authoritative turn."""
 
@@ -2047,7 +2055,10 @@ def _run_conversation_inner(
         current_turn_user_idx=current_turn_user_idx,
         persist_user_display_kind=persist_user_display_kind,
     )
-    if _workflow_authority is not None:
+    _reserved_change_gate_control = _is_change_gate_host_control_text(
+        original_user_message
+    )
+    if _workflow_authority is not None or _reserved_change_gate_control:
         try:
             _change_gate_host_result = _invoke_current_turn_change_gate_release()
         except Exception:
@@ -2058,7 +2069,10 @@ def _run_conversation_inner(
                 messages=messages,
                 conversation_history=conversation_history,
             )
-        if getattr(_change_gate_host_result, "terminal", False) is True:
+        if (
+            _reserved_change_gate_control
+            or getattr(_change_gate_host_result, "terminal", False) is True
+        ):
             return _finalize_change_gate_host_turn(
                 agent,
                 host_result=_change_gate_host_result,

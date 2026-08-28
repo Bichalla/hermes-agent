@@ -13,6 +13,7 @@ from gateway.session_context import (
     get_trusted_current_user_text,
     set_session_vars,
 )
+from hermes_cli.change_gate_release import is_change_gate_host_control_text
 from tools.workflow_authority import (
     _bind_host_current_turn_user_authority,
     get_current_turn_user_authority,
@@ -182,6 +183,258 @@ def _host_turn_agent(**overrides) -> SimpleNamespace:
     }
     values.update(overrides)
     return SimpleNamespace(**values)
+
+
+@pytest.mark.parametrize(
+    "user_message",
+    (
+        "AUTHORIZE_HERMES_CHANGE_GATE_CLAIM " + "a" * 64,
+        "AUTHORIZE_HERMES_CHANGE_GATE_G4 " + "b" * 64,
+        "AUTHORIZE_HERMES_CHANGE_GATE_CLAIM",
+        "AUTHORIZE_HERMES_CHANGE_GATE_G4 malformed",
+        "AUTHORIZE_HERMES_CHANGE_GATE_CLAIM " + "c" * 64 + " trailing",
+    ),
+)
+def test_reserved_change_gate_control_namespace_is_classified(
+    user_message: str,
+) -> None:
+    assert is_change_gate_host_control_text(user_message) is True
+
+
+@pytest.mark.parametrize(
+    "value",
+    (
+        "ordinary conversation",
+        "Please AUTHORIZE_HERMES_CHANGE_GATE_CLAIM later",
+        b"AUTHORIZE_HERMES_CHANGE_GATE_CLAIM",
+        None,
+    ),
+)
+def test_ordinary_or_non_string_text_is_not_reserved(value: object) -> None:
+    assert is_change_gate_host_control_text(value) is False
+
+
+@pytest.mark.parametrize("purpose", ("CLAIM", "G4"))
+def test_exact_reserved_turn_without_bound_authority_is_provider_free(
+    monkeypatch: pytest.MonkeyPatch,
+    purpose: str,
+) -> None:
+    order: list[str] = []
+    user_message = f"AUTHORIZE_HERMES_CHANGE_GATE_{purpose} " + "d" * 64
+
+    monkeypatch.setattr(
+        conversation_loop,
+        "build_turn_context",
+        lambda *_args, **_kwargs: order.append("build")
+        or _host_turn_context(user_message),
+    )
+    monkeypatch.setattr(
+        conversation_loop,
+        "_bind_workflow_authority_for_turn",
+        lambda *_args, **_kwargs: order.append("bind") or None,
+    )
+    monkeypatch.setattr(
+        conversation_loop,
+        "_invoke_current_turn_change_gate_release",
+        lambda: order.append("adapter")
+        or SimpleNamespace(status="ineligible", terminal=False),
+    )
+    monkeypatch.setattr(
+        conversation_loop,
+        "_finalize_change_gate_host_turn",
+        lambda *_args, **_kwargs: order.append("terminal")
+        or {"final_response": "failed closed", "api_calls": 0},
+    )
+
+    result = conversation_loop._run_conversation_inner(
+        _host_turn_agent(),
+        user_message,
+    )
+
+    assert result["api_calls"] == 0
+    assert order == ["build", "bind", "adapter", "terminal"]
+
+
+@pytest.mark.parametrize(
+    "user_message",
+    (
+        "AUTHORIZE_HERMES_CHANGE_GATE_CLAIM " + "e" * 63,
+        "AUTHORIZE_HERMES_CHANGE_GATE_G4 " + "f" * 64 + " trailing",
+    ),
+)
+def test_malformed_reserved_turn_is_provider_free(
+    monkeypatch: pytest.MonkeyPatch,
+    user_message: str,
+) -> None:
+    order: list[str] = []
+    monkeypatch.setattr(
+        conversation_loop,
+        "build_turn_context",
+        lambda *_args, **_kwargs: _host_turn_context(user_message),
+    )
+    monkeypatch.setattr(
+        conversation_loop,
+        "_bind_workflow_authority_for_turn",
+        lambda *_args, **_kwargs: None,
+    )
+    monkeypatch.setattr(
+        conversation_loop,
+        "_invoke_current_turn_change_gate_release",
+        lambda: order.append("adapter")
+        or SimpleNamespace(status="zero_candidate", terminal=True),
+    )
+    monkeypatch.setattr(
+        conversation_loop,
+        "_finalize_change_gate_host_turn",
+        lambda *_args, **_kwargs: order.append("terminal")
+        or {"final_response": "failed closed", "api_calls": 0},
+    )
+
+    result = conversation_loop._run_conversation_inner(
+        _host_turn_agent(),
+        user_message,
+    )
+
+    assert result["api_calls"] == 0
+    assert order == ["adapter", "terminal"]
+
+
+@pytest.mark.parametrize(
+    ("status", "terminal"),
+    (
+        ("ineligible", False),
+        ("zero_candidate", True),
+        ("ambiguous", True),
+        ("owner_failure", True),
+    ),
+)
+def test_reserved_turn_finalizes_for_every_host_adapter_outcome(
+    monkeypatch: pytest.MonkeyPatch,
+    status: str,
+    terminal: bool,
+) -> None:
+    user_message = "AUTHORIZE_HERMES_CHANGE_GATE_CLAIM " + "1" * 64
+    order: list[str] = []
+    monkeypatch.setattr(
+        conversation_loop,
+        "build_turn_context",
+        lambda *_args, **_kwargs: _host_turn_context(user_message),
+    )
+    monkeypatch.setattr(
+        conversation_loop,
+        "_bind_workflow_authority_for_turn",
+        lambda *_args, **_kwargs: object(),
+    )
+    monkeypatch.setattr(
+        conversation_loop,
+        "_invoke_current_turn_change_gate_release",
+        lambda: order.append("adapter")
+        or SimpleNamespace(status=status, terminal=terminal),
+    )
+    monkeypatch.setattr(
+        conversation_loop,
+        "_finalize_change_gate_host_turn",
+        lambda *_args, **_kwargs: order.append("terminal")
+        or {"final_response": "bounded", "api_calls": 0},
+    )
+
+    result = conversation_loop._run_conversation_inner(
+        _host_turn_agent(),
+        user_message,
+    )
+
+    assert result["api_calls"] == 0
+    assert order == ["adapter", "terminal"]
+
+
+def test_ordinary_turn_without_authority_reaches_ordinary_provider_path(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    user_message = "ordinary conversation"
+    provider_calls: list[str] = []
+    monkeypatch.setattr(
+        conversation_loop,
+        "build_turn_context",
+        lambda *_args, **_kwargs: _host_turn_context(user_message),
+    )
+    monkeypatch.setattr(
+        conversation_loop,
+        "_bind_workflow_authority_for_turn",
+        lambda *_args, **_kwargs: None,
+    )
+    monkeypatch.setattr(
+        conversation_loop,
+        "_invoke_current_turn_change_gate_release",
+        lambda: (_ for _ in ()).throw(
+            AssertionError("ordinary turn must not invoke Change Gate adapter")
+        ),
+    )
+    agent = _host_turn_agent(
+        api_mode="codex_app_server",
+        _run_codex_app_server_turn=lambda **_kwargs: provider_calls.append("provider")
+        or {"final_response": "ordinary", "api_calls": 1},
+    )
+
+    result = conversation_loop._run_conversation_inner(agent, user_message)
+
+    assert result["api_calls"] == 1
+    assert provider_calls == ["provider"]
+
+
+def test_wrong_origin_terminal_does_not_disclose_candidate_task_id() -> None:
+    candidate_task_id = "t_other_origin"
+    response = conversation_loop._change_gate_host_response_text(
+        SimpleNamespace(status="owner_failure", task_id=candidate_task_id)
+    )
+    assert candidate_task_id not in response
+
+
+@pytest.mark.parametrize(
+    ("status", "terminal"),
+    (
+        ("ineligible", False),
+        ("zero_candidate", True),
+        ("ambiguous", True),
+        ("owner_failure", True),
+    ),
+)
+def test_reserved_terminal_revokes_bound_authority_and_raw_context(
+    monkeypatch: pytest.MonkeyPatch,
+    status: str,
+    terminal: bool,
+) -> None:
+    user_message = "AUTHORIZE_HERMES_CHANGE_GATE_G4 " + "2" * 64
+    monkeypatch.setattr(
+        "agent.delegation_context.is_delegated_child_context",
+        lambda: False,
+    )
+    monkeypatch.setattr(
+        conversation_loop,
+        "build_turn_context",
+        lambda *_args, **_kwargs: _host_turn_context(user_message),
+    )
+    monkeypatch.setattr(
+        conversation_loop,
+        "_invoke_current_turn_change_gate_release",
+        lambda: SimpleNamespace(status=status, terminal=terminal),
+    )
+    monkeypatch.setattr(
+        conversation_loop,
+        "_finalize_change_gate_host_turn",
+        lambda *_args, **_kwargs: {"final_response": "bounded", "api_calls": 0},
+    )
+    tokens = set_session_vars(platform="discord", session_id="session-a")
+    try:
+        result = conversation_loop.run_conversation(
+            _host_turn_agent(),
+            user_message,
+        )
+        assert result["api_calls"] == 0
+        assert get_current_turn_user_authority() is None
+        assert get_trusted_current_user_text() is None
+        assert get_session_controller_role() == ""
+    finally:
+        clear_session_vars(tokens)
 
 
 def test_host_adapter_runs_once_post_bind_and_returns_before_provider_loop(

@@ -209,6 +209,15 @@ class RouteProjection:
 
 
 @dataclass(frozen=True, slots=True)
+class PreFreezeRouteRule:
+    """One ordered policy rule that emits the existing route projection."""
+
+    rule_id: str
+    metadata_equals: tuple[tuple[str, str], ...]
+    route: RouteProjection
+
+
+@dataclass(frozen=True, slots=True)
 class ArchitectureInventoryRecord:
     schema: str
     inventory_id: str
@@ -638,6 +647,87 @@ def project_route(
             ReviewRoute(route.reviewer_class, route.selector.normalized()) for route in reviews
         ),
     )
+
+
+def resolve_route_before_freeze(
+    explicit_route: RouteProjection | None,
+    *,
+    risk: RiskLevel,
+    automatic: bool,
+    metadata: Mapping[str, str],
+    ordered_rules: Sequence[PreFreezeRouteRule],
+) -> tuple[RouteProjection, str]:
+    """Resolve one route before Evidence and Frozen Handoff bind its bytes.
+
+    Explicit routes retain precedence. Automatic routing is opt-in and uses
+    only exact, ordered metadata matches supplied by the existing policy owner.
+    The returned string is the selected rule id for existing artifact/event
+    metadata; this function does not create a second route contract or store.
+    """
+
+    if type(risk) is not RiskLevel:
+        raise ValueError("route_risk_invalid")
+    if explicit_route is not None:
+        if type(explicit_route) is not RouteProjection or explicit_route.risk is not risk:
+            raise ValueError("explicit_route_invalid")
+        return (
+            project_route(risk, explicit_route.executor, explicit_route.reviews),
+            "explicit_route",
+        )
+    if type(automatic) is not bool:
+        raise ValueError("automatic_route_flag_invalid")
+    if not automatic:
+        raise ValueError("route_required_while_automatic_routing_disabled")
+    if not isinstance(metadata, Mapping):
+        raise ValueError("route_metadata_invalid")
+    if type(ordered_rules) not in {tuple, list}:
+        raise ValueError("route_rules_invalid")
+
+    normalized_metadata: dict[str, str] = {}
+    for key, value in metadata.items():
+        normalized_key = _required_text(key, "route_metadata_key")
+        normalized_value = _required_text(value, "route_metadata_value")
+        if normalized_key in normalized_metadata:
+            raise ValueError("route_metadata_key_duplicate")
+        normalized_metadata[normalized_key] = normalized_value
+
+    normalized_rules: list[tuple[str, dict[str, str], RouteProjection]] = []
+    rule_ids: set[str] = set()
+    for rule in ordered_rules:
+        if type(rule) is not PreFreezeRouteRule:
+            raise ValueError("route_rule_invalid")
+        rule_id = _required_text(rule.rule_id, "route_rule_id")
+        if rule_id in rule_ids:
+            raise ValueError("route_rule_id_duplicate")
+        rule_ids.add(rule_id)
+        if type(rule.metadata_equals) is not tuple:
+            raise ValueError("route_rule_metadata_invalid")
+        if not rule.metadata_equals:
+            raise ValueError("route_rule_metadata_empty")
+        conditions: dict[str, str] = {}
+        for condition in rule.metadata_equals:
+            if type(condition) is not tuple or len(condition) != 2:
+                raise ValueError("route_rule_condition_invalid")
+            key = _required_text(condition[0], "route_rule_metadata_key")
+            value = _required_text(condition[1], "route_rule_metadata_value")
+            if key in conditions:
+                raise ValueError("route_rule_metadata_key_duplicate")
+            conditions[key] = value
+        if type(rule.route) is not RouteProjection:
+            raise ValueError("route_rule_projection_invalid")
+        normalized_route = project_route(
+            rule.route.risk,
+            rule.route.executor,
+            rule.route.reviews,
+        )
+        normalized_rules.append((rule_id, conditions, normalized_route))
+
+    for rule_id, conditions, route in normalized_rules:
+        if route.risk is risk and all(
+            normalized_metadata.get(key) == value for key, value in conditions.items()
+        ):
+            return route, rule_id
+    raise ValueError("automatic_route_unresolved")
 
 
 def freeze_handoff(
@@ -1587,6 +1677,7 @@ __all__ = [
     "FROZEN_HANDOFF_SCHEMA",
     "LEGACY_DURABLE_RELEASE_SCHEMA",
     "MAX_RUNTIME_ARTIFACT_BYTES",
+    "PreFreezeRouteRule",
     "REVIEW_RESULT_SCHEMA",
     "TRANSITION_ANCHOR_SCHEMA",
     "ArchitectureInventoryReader",
@@ -1622,6 +1713,7 @@ __all__ = [
     "freeze_handoff",
     "issue_durable_release_artifact",
     "issue_current_turn_release_receipt",
+    "resolve_route_before_freeze",
     "request_from_durable_release",
     "validate_durable_release_artifact",
     "project_route",

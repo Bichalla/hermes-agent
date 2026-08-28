@@ -25,6 +25,7 @@ from hermes_cli.change_gate import (
     FrozenHandoff,
     GateDecision,
     HumanReleaseReceipt,
+    PreFreezeRouteRule,
     ReleasePurpose,
     ReviewResult,
     ReviewRoute,
@@ -40,6 +41,7 @@ from hermes_cli.change_gate import (
     evaluate_reviews,
     expected_release_statement,
     freeze_handoff,
+    resolve_route_before_freeze,
 )
 from hermes_cli.change_gate_codec import encode_artifact
 from hermes_cli.change_gate_release import (
@@ -217,6 +219,7 @@ def _attach_runtime_artifacts(
     task_id: str,
     *,
     risk: RiskLevel = RiskLevel.NORMAL,
+    route: RouteProjection | None = None,
     dirty_tracked: bool = False,
     tracked_outside: bool = False,
     extra_allowed_paths: tuple[str, ...] = (),
@@ -228,7 +231,7 @@ def _attach_runtime_artifacts(
         tracked_outside=tracked_outside,
     )
     now = int(time.time())
-    route = _route(risk)
+    selected_route = route if route is not None else _route(risk)
     evidence = EvidencePacket(
         source=source,
         work=WorkIdentity(
@@ -239,7 +242,7 @@ def _attach_runtime_artifacts(
             effect="SOURCE_CHANGE",
         ),
         risk=risk,
-        route=route,
+        route=selected_route,
         allowed_paths=tuple(sorted(("gate-artifact.txt",) + extra_allowed_paths)),
         required_inputs=(),
         produced_artifacts=(binding,),
@@ -272,10 +275,10 @@ def _attach_runtime_artifacts(
         "provider_override = ?, reasoning_effort = ? WHERE id = ?",
         (
             str(repo),
-            route.executor.assignee,
-            route.executor.model_override,
-            route.executor.provider_override,
-            route.executor.reasoning_effort,
+            selected_route.executor.assignee,
+            selected_route.executor.model_override,
+            selected_route.executor.provider_override,
+            selected_route.executor.reasoning_effort,
             task_id,
         ),
     )
@@ -821,6 +824,131 @@ def test_detached_dispatcher_consumes_valid_release_and_spawns_once(
         assert state is not None
         assert state["state"] == "CONSUMED"
         assert state["consumed_run_id"] == task.current_run_id
+
+
+def test_pre_freeze_route_resolver_populates_and_dispatches_frozen_selector(
+    tmp_path: Path,
+    isolated_home: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import hermes_cli.profiles as profiles
+
+    def provider_free_selector(assignee: str) -> UpstreamRouteSelector:
+        return UpstreamRouteSelector(
+            assignee=assignee,
+            model_override="fixture-model",
+            provider_override=None,
+            reasoning_effort="medium",
+        )
+
+    monkeypatch.setattr(profiles, "profile_exists", lambda _name: True)
+    with _connect(tmp_path / "kanban.db") as conn:
+        task_id = kb.create_task(
+            conn,
+            title="automatic source change route",
+            body="provider-free route fixture",
+            priority=7,
+        )
+        task = kb.get_task(conn, task_id)
+        assert task is not None
+        assert task.assignee is None
+        metadata = {"effect": "SOURCE_CHANGE", "priority": str(task.priority)}
+        selected_route = RouteProjection(
+            risk=RiskLevel.NORMAL,
+            executor=provider_free_selector("auto-executor"),
+            reviews=(
+                ReviewRoute(
+                    ReviewerClass.REVIEWER,
+                    provider_free_selector("auto-reviewer"),
+                ),
+            ),
+        )
+        rules = (
+            PreFreezeRouteRule(
+                rule_id="source-change-high",
+                metadata_equals=(("effect", "SOURCE_CHANGE"), ("priority", "7")),
+                route=selected_route,
+            ),
+            PreFreezeRouteRule(
+                rule_id="later-source-change-high",
+                metadata_equals=(("effect", "SOURCE_CHANGE"), ("priority", "7")),
+                route=_route(RiskLevel.NORMAL),
+            ),
+        )
+
+        explicit_route = _route(RiskLevel.NORMAL)
+        for automatic in (False, True):
+            explicit, explicit_reason = resolve_route_before_freeze(
+                explicit_route,
+                risk=RiskLevel.NORMAL,
+                automatic=automatic,
+                metadata=metadata,
+                ordered_rules=rules,
+            )
+            assert (explicit, explicit_reason) == (explicit_route, "explicit_route")
+
+        route, rule_id = resolve_route_before_freeze(
+            None,
+            risk=RiskLevel.NORMAL,
+            automatic=True,
+            metadata=metadata,
+            ordered_rules=rules,
+        )
+        assert rule_id == "source-change-high"
+        assert route == selected_route
+        with pytest.raises(ValueError, match="automatic_route_unresolved"):
+            resolve_route_before_freeze(
+                None,
+                risk=RiskLevel.NORMAL,
+                automatic=True,
+                metadata={"effect": "UNMAPPED"},
+                ordered_rules=rules,
+            )
+
+        fixture = _attach_runtime_artifacts(
+            conn,
+            tmp_path,
+            task_id,
+            route=route,
+        )
+        frozen = _handoff(fixture)
+        assert frozen.route == route
+        _enable_runtime(monkeypatch, tmp_path / "inventory")
+        _store_release(conn, fixture, ReleasePurpose.CLAIM, "d")
+        assert kb.evaluate_change_gate_claim_runtime(conn, task_id).result.allowed
+
+        conn.execute(
+            "UPDATE tasks SET assignee = ? WHERE id = ?",
+            ("post-freeze-drift", task_id),
+        )
+        drift = kb.evaluate_change_gate_claim_runtime(conn, task_id)
+        assert drift.result.reason is ChangeGateReason.RELEASE_TRANSITION_STALE
+        assert _handoff(fixture).route == frozen.route
+        conn.execute(
+            "UPDATE tasks SET assignee = ? WHERE id = ?",
+            (route.executor.assignee, task_id),
+        )
+
+        seen: list[tuple[str | None, str | None, str | None, str | None]] = []
+        result = kb.dispatch_once(
+            conn,
+            spawn_fn=lambda claimed, *_args, **_kwargs: (
+                seen.append(
+                    (
+                        claimed.assignee,
+                        claimed.model_override,
+                        claimed.provider_override,
+                        claimed.reasoning_effort,
+                    )
+                )
+                or 4242
+            ),
+            reconcile_orphans=False,
+        )
+
+        assert result.change_gate_denied == []
+        assert [row[0] for row in result.spawned] == [task_id]
+        assert seen == [("auto-executor", "fixture-model", None, "medium")]
 
 
 def test_enabled_ungated_historical_task_uses_explicit_passthrough_policy(

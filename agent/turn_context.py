@@ -28,7 +28,7 @@ import logging
 import threading
 import time
 import uuid
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any, Dict, List, Mapping, Optional
 
 from agent.conversation_compression import (
@@ -418,6 +418,9 @@ class TurnContext:
     turn_id: str
     # Index of the current user turn within ``messages``.
     current_turn_user_idx: int
+    # Exact current-user text supplied by a trusted foreground host.  Kept
+    # separate from provider and persistence representations.
+    host_raw_user_text: Optional[str] = field(default=None, repr=False)
     # Whether the post-turn memory review should fire.
     should_review_memory: bool = False
     # Context contributed by ``pre_llm_call`` plugins (appended to user message).
@@ -447,6 +450,7 @@ def build_turn_context(
     set_session_context,
     set_current_write_origin,
     ra,
+    host_raw_user_text: Optional[str] = None,
     moa_active: bool = False,
 ) -> TurnContext:
     """Run the once-per-turn setup and return the loop's input context.
@@ -1401,6 +1405,9 @@ def build_turn_context(
         effective_task_id=effective_task_id,
         turn_id=turn_id,
         current_turn_user_idx=current_turn_user_idx,
+        host_raw_user_text=(
+            host_raw_user_text if type(host_raw_user_text) is str else None
+        ),
         should_review_memory=should_review_memory,
         plugin_user_context=plugin_user_context,
         ext_prefetch_cache=ext_prefetch_cache,

@@ -123,6 +123,58 @@ def auth_adapter():
 
 class TestStartRun:
     @pytest.mark.asyncio
+    @pytest.mark.parametrize("purpose", ("CLAIM", "G4"))
+    async def test_reserved_change_gate_run_completes_without_agent_or_release(
+        self,
+        adapter,
+        purpose,
+    ):
+        app = _create_runs_app(adapter)
+        user_message = (
+            f"AUTHORIZE_HERMES_CHANGE_GATE_{purpose} " + "b" * 64
+        )
+
+        async with TestClient(TestServer(app)) as cli:
+            with (
+                patch.object(
+                    adapter,
+                    "_create_agent",
+                    side_effect=AssertionError(
+                        "reserved API run must not construct a provider agent"
+                    ),
+                ) as mock_create_agent,
+                patch(
+                    "hermes_cli.change_gate_release.issue_current_turn_change_gate_release",
+                    side_effect=AssertionError(
+                        "non-authoritative API run must not issue a release"
+                    ),
+                ) as mock_issue_release,
+            ):
+                response = await cli.post(
+                    "/v1/runs",
+                    json={"input": user_message},
+                )
+                assert response.status == 202
+                run_id = (await response.json())["run_id"]
+
+                for _ in range(20):
+                    status_response = await cli.get(f"/v1/runs/{run_id}")
+                    status = await status_response.json()
+                    if status["status"] == "completed":
+                        break
+                    await asyncio.sleep(0.05)
+
+        assert status["status"] == "completed"
+        assert status["usage"] == {
+            "input_tokens": 0,
+            "output_tokens": 0,
+            "total_tokens": 0,
+        }
+        assert "authorization was not issued" in status["output"]
+        mock_create_agent.assert_not_called()
+        mock_issue_release.assert_not_called()
+
+    @pytest.mark.asyncio
     async def test_start_returns_202(self, adapter):
         app = _create_runs_app(adapter)
         async with TestClient(TestServer(app)) as cli:

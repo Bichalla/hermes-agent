@@ -159,6 +159,36 @@ RESPONSES_AUTO_TRUNCATION_HISTORY_LIMIT = 100
 _COMPRESSED_SUMMARY_METADATA_KEY = "_compressed_summary"
 
 
+def _reserved_change_gate_api_result(
+    user_message: object,
+) -> Optional[tuple[Dict[str, Any], Dict[str, int]]]:
+    """Fail reserved Change Gate text closed on the non-authoritative API."""
+
+    from hermes_cli.change_gate_release import is_change_gate_host_control_text
+
+    control_text = _normalize_chat_content(user_message)
+    if not is_change_gate_host_control_text(control_text):
+        return None
+    response = (
+        "Change Gate authorization was not issued — the API server cannot "
+        "own the requested transition."
+    )
+    return (
+        {
+            "final_response": response,
+            "messages": [
+                {"role": "user", "content": control_text},
+                {"role": "assistant", "content": response},
+            ],
+            "api_calls": 0,
+            "tools": [],
+            "completed": True,
+            "turn_exit_reason": "change_gate_host_adapter(untrusted_surface)",
+        },
+        {"input_tokens": 0, "output_tokens": 0, "total_tokens": 0},
+    )
+
+
 class ThreadSafeAsyncQueue(asyncio.Queue):
     """An ``asyncio.Queue`` that a non-loop thread can push into safely.
 
@@ -6360,6 +6390,10 @@ class APIServerAdapter(BasePlatformAdapter):
         ``_active_run_agents`` while the turn is running so API clients can
         call run-scoped control endpoints such as ``/v1/runs/{run_id}/steer``.
         """
+        reserved_result = _reserved_change_gate_api_result(user_message)
+        if reserved_result is not None:
+            return reserved_result
+
         loop = asyncio.get_running_loop()
         # Capture before hopping to the executor — ContextVars do not follow
         # run_in_executor threads, so the profile scope must be re-entered
@@ -6821,6 +6855,25 @@ class APIServerAdapter(BasePlatformAdapter):
                         run_id,
                         "cancelled",
                         last_event="run.cancelled",
+                    )
+                    return
+                reserved_result = _reserved_change_gate_api_result(user_message)
+                if reserved_result is not None:
+                    result, usage = reserved_result
+                    final_response = result["final_response"]
+                    _put_event_if_active({
+                        "event": "run.completed",
+                        "run_id": run_id,
+                        "timestamp": time.time(),
+                        "output": final_response,
+                        "usage": usage,
+                    })
+                    self._set_run_status(
+                        run_id,
+                        "completed",
+                        output=final_response,
+                        usage=usage,
+                        last_event="run.completed",
                     )
                     return
                 with self._profile_scope(request_profile):

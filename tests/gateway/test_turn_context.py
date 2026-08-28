@@ -40,6 +40,16 @@ class TestTurnContext:
         assert b.repeat_count == [0]
         assert b._cleanup_msg_ids == []
 
+    def test_host_raw_user_text_is_separate_and_hidden_from_repr(self):
+        ctx = TurnContext(
+            message="[상현] provider-decorated text",
+            host_raw_user_text="exact current user text",
+        )
+
+        assert ctx.message == "[상현] provider-decorated text"
+        assert ctx.host_raw_user_text == "exact current user text"
+        assert "exact current user text" not in repr(ctx)
+
     def test_shared_containers_visible_to_outer_scope(self):
         # The outer body and the runner share the SAME list objects, so
         # mutation through the ctx is visible to locals captured elsewhere.
@@ -72,6 +82,8 @@ class TestTurnRunner:
     def test_normal_response_preserves_compression_exhausted(self):
         """A non-empty exhaustion response must still reach auto-reset consumers."""
 
+        observed_kwargs = {}
+
         class _ExhaustedAgent:
             def __init__(self, **kwargs):
                 self.model = kwargs["model"]
@@ -85,6 +97,7 @@ class TestTurnRunner:
                 self.session_completion_tokens = 0
 
             def run_conversation(self, _message, **_kwargs):
+                observed_kwargs.update(_kwargs)
                 return {
                     "final_response": "Context length exceeded. Cannot compress further.",
                     "failed": True,
@@ -127,6 +140,7 @@ class TestTurnRunner:
         ctx = TurnContext(
             source=source,
             message="continue",
+            host_raw_user_text="exact current user text",
             history=[],
             session_id="test-session",
             session_key="test-session-key",
@@ -145,3 +159,4 @@ class TestTurnRunner:
             "Context length exceeded. Cannot compress further."
         )
         assert result["compression_exhausted"] is True
+        assert observed_kwargs["host_raw_user_text"] == "exact current user text"

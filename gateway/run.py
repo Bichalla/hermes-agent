@@ -517,6 +517,30 @@ def _gateway_platform_value(platform: Any) -> str:
     return str(getattr(platform, "value", platform) or "").strip().lower()
 
 
+def _trusted_host_raw_user_text_for_event(event: Any, source: Any) -> Optional[str]:
+    """Return exact foreground user text before gateway prompt decoration."""
+
+    event_source = getattr(event, "source", None)
+    owner_source = event_source if event_source is not None else source
+    if (
+        bool(getattr(event, "internal", False))
+        or not bool(getattr(event, "allow_gateway_control", True))
+        or _gateway_platform_value(getattr(owner_source, "platform", None))
+        in {"api_server", "msgraph_webhook", "webhook"}
+    ):
+        return None
+    value = getattr(event, "text", None)
+    return value if type(value) is str else None
+
+
+def _is_reserved_change_gate_event_text(event: Any) -> bool:
+    """Shield the reserved namespace without minting host authority."""
+
+    from hermes_cli.change_gate_release import is_change_gate_host_control_text
+
+    return is_change_gate_host_control_text(getattr(event, "text", None))
+
+
 def _non_conversational_metadata(
     metadata: Optional[Dict[str, Any]] = None,
     *,
@@ -6244,6 +6268,8 @@ class TurnRunner:
                 _conversation_kwargs["moa_config"] = ctx.moa_config
             if _persist_user_timestamp_override is not None:
                 _conversation_kwargs["persist_user_timestamp"] = _persist_user_timestamp_override
+            if ctx.host_raw_user_text is not None:
+                _conversation_kwargs["host_raw_user_text"] = ctx.host_raw_user_text
             result = agent.run_conversation(_api_run_message, **_conversation_kwargs)
         finally:
             unregister_gateway_notify(_approval_session_key)
@@ -18549,6 +18575,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
     async def _handle_message_with_agent(self, event, source, _quick_key: str, run_generation: int):
         """Inner handler that runs under the _running_agents sentinel guard."""
         _msg_start_time = time.time()
+        host_raw_user_text = _trusted_host_raw_user_text_for_event(event, source)
+        host_reserved_control_attempt = _is_reserved_change_gate_event_text(event)
         _platform_name = source.platform.value if hasattr(source.platform, "value") else str(source.platform)
         _msg_preview = (event.text or "")[:80].replace("\n", " ")
         _reply_id = getattr(event, "reply_to_message_id", None)
@@ -19923,6 +19951,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 persist_user_timestamp=persist_user_timestamp,
                 persist_user_display_kind=persist_user_display_kind,
                 message_type=event.message_type,
+                host_raw_user_text=host_raw_user_text,
+                host_reserved_control_attempt=host_reserved_control_attempt,
             )
             _turn_seconds = time.monotonic() - _turn_started_monotonic
 
@@ -27530,6 +27560,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         persist_user_timestamp: Optional[float] = None,
         persist_user_display_kind: Optional[str] = None,
         message_type: Optional[str] = None,
+        host_raw_user_text: Optional[str] = None,
+        host_reserved_control_attempt: bool = False,
     ) -> Dict[str, Any]:
         """Profile-scoping wrapper around the agent run.
 
@@ -27550,6 +27582,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 persist_user_timestamp=persist_user_timestamp,
                 persist_user_display_kind=persist_user_display_kind,
                 message_type=message_type,
+                host_raw_user_text=host_raw_user_text,
+                host_reserved_control_attempt=host_reserved_control_attempt,
             )
 
         profile_home = self._resolve_profile_home_for_source(source)
@@ -27563,6 +27597,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 persist_user_timestamp=persist_user_timestamp,
                 persist_user_display_kind=persist_user_display_kind,
                 message_type=message_type,
+                host_raw_user_text=host_raw_user_text,
+                host_reserved_control_attempt=host_reserved_control_attempt,
             )
 
     def _profile_name_for_source(self, source: SessionSource) -> Optional[str]:
@@ -27706,6 +27742,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         persist_user_timestamp: Optional[float] = None,
         persist_user_display_kind: Optional[str] = None,
         message_type: Optional[str] = None,
+        host_raw_user_text: Optional[str] = None,
+        host_reserved_control_attempt: bool = False,
     ) -> Dict[str, Any]:
         """
         Run the agent with the given message and context.
@@ -27719,8 +27757,53 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         This is run in a thread pool to not block the event loop.
         Supports interruption via new messages.
         """
+        # Reserved namespace shielding is distinct from authority.  An
+        # excluded event surface carries no trusted text, but still cannot
+        # forward CLAIM/G4-like current input to any provider.  Proxy mode is
+        # likewise not an authority owner, even for a trusted local event.
+        if not host_reserved_control_attempt:
+            from hermes_cli.change_gate_release import (
+                is_change_gate_host_control_text,
+            )
+
+            host_reserved_control_attempt = is_change_gate_host_control_text(
+                host_raw_user_text
+            )
+            if host_raw_user_text is None and not host_reserved_control_attempt:
+                # Some legacy queue/direct callers have no MessageEvent to
+                # classify.  Their undecorated reserved prefix can still be
+                # shielded, but it never becomes trusted authority text.
+                host_reserved_control_attempt = is_change_gate_host_control_text(
+                    message
+                )
+        proxy_url = self._get_proxy_url()
+        if host_reserved_control_attempt and (
+            host_raw_user_text is None or proxy_url
+        ):
+            reason = (
+                "proxy_surface_invalid" if proxy_url else "untrusted_surface"
+            )
+            response = (
+                "Change Gate authorization was not issued — this host "
+                "surface cannot own the requested transition."
+            )
+            return {
+                "final_response": response,
+                "messages": [
+                    {"role": "user", "content": message},
+                    {"role": "assistant", "content": response},
+                ],
+                "api_calls": 0,
+                "tools": [],
+                "history_offset": len(history),
+                "session_id": session_id,
+                "response_previewed": False,
+                "completed": True,
+                "turn_exit_reason": f"change_gate_host_adapter({reason})",
+            }
+
         # ---- Proxy mode: delegate to remote API server ----
-        if self._get_proxy_url():
+        if proxy_url:
             return await self._run_agent_via_proxy(
                 message=message,
                 context_prompt=context_prompt,
@@ -28015,6 +28098,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             persist_user_message=persist_user_message,
             persist_user_timestamp=persist_user_timestamp,
             persist_user_display_kind=persist_user_display_kind,
+            host_raw_user_text=host_raw_user_text,
         )
         turn_runner = TurnRunner(self, turn_ctx)
         # Callback invoked by agent on tool lifecycle events — extracted to
@@ -29154,12 +29238,21 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 next_message_id = None
                 next_channel_prompt = None
                 next_session_key = session_key
+                next_host_raw_user_text = None
+                next_host_reserved_control_attempt = False
                 # #60671 — carry the pending event's message_type into the
                 # recursive call so queued voice turns can stream TTS and
                 # re-mark the generation for the final delivered turn.
                 next_message_type = None
                 if pending_event is not None:
                     next_source = getattr(pending_event, "source", None) or source
+                    next_host_raw_user_text = _trusted_host_raw_user_text_for_event(
+                        pending_event,
+                        next_source,
+                    )
+                    next_host_reserved_control_attempt = (
+                        _is_reserved_change_gate_event_text(pending_event)
+                    )
                     if self._is_goal_continuation_event(pending_event) and not self._goal_still_active_for_session(session_id):
                         logger.info(
                             "Discarding stale goal continuation for session %s — goal is no longer active",
@@ -29245,6 +29338,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     event_message_id=next_message_id,
                     channel_prompt=next_channel_prompt,
                     message_type=next_message_type,
+                    host_raw_user_text=next_host_raw_user_text,
+                    host_reserved_control_attempt=next_host_reserved_control_attempt,
                 )
                 return _preserve_queued_followup_history_offset(result, followup_result)
         finally:

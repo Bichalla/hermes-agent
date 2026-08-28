@@ -210,6 +210,26 @@ def test_returns_turn_context_with_user_message_appended():
     assert ctx.active_system_prompt == "SYSTEM"
 
 
+def test_host_raw_user_text_stays_separate_from_provider_and_persistence_values():
+    agent = _FakeAgent()
+    persistence_envelope = {"platform": "discord", "content": "structured"}
+
+    ctx = _build(
+        agent,
+        user_message="[상현] provider-decorated text",
+        persist_user_message=persistence_envelope,
+        host_raw_user_text="AUTHORIZE_HERMES_CHANGE_GATE_CLAIM " + "a" * 64,
+    )
+
+    assert ctx.host_raw_user_text == (
+        "AUTHORIZE_HERMES_CHANGE_GATE_CLAIM " + "a" * 64
+    )
+    assert ctx.user_message == "[상현] provider-decorated text"
+    assert ctx.original_user_message is persistence_envelope
+    assert ctx.messages[-1]["content"] == "[상현] provider-decorated text"
+    assert "AUTHORIZE_HERMES_CHANGE_GATE_CLAIM" not in repr(ctx)
+
+
 def test_user_message_preserves_platform_event_timestamp():
     agent = _FakeAgent()
 

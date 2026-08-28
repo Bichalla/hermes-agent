@@ -76,6 +76,10 @@ class TurnContext:
 
     # --- the ex-``nonlocal`` turn message (rebindable) --------------------
     message: Optional[str] = None
+    # Exact current-user text accepted by a trusted foreground host before
+    # sender/reply/context/provider decoration.  Representation-only: never
+    # persisted and never sent to the provider.
+    host_raw_user_text: Optional[str] = field(default=None, repr=False)
 
     # --- turn parameters / config snapshots (read-only in run_sync) -------
     history: Any = None

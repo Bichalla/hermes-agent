@@ -8165,6 +8165,113 @@ class AIAgent:
         self._set_tool_guardrail_halt(decision)
         return toolguard_synthetic_result(decision)
 
+    @staticmethod
+    def _dispatcher_worker_terminal_outcomes(tool_call) -> frozenset[str]:
+        """Return trusted registry outcomes for one lifecycle tool call."""
+        try:
+            from tools.registry import registry
+
+            entry = registry.get_entry(tool_call.function.name)
+            if entry is None:
+                return frozenset()
+            outcomes = entry.dispatcher_worker_terminal_outcomes
+            return outcomes if isinstance(outcomes, frozenset) else frozenset()
+        except Exception:
+            return frozenset()
+
+    def _finalize_dispatcher_worker_tool_batch(
+        self,
+        messages: list,
+        effective_task_id: str,
+        tool_count: int,
+    ) -> None:
+        """Apply the ordinary whole-batch budget and steer finalizers once."""
+        if tool_count <= 0:
+            return
+        from agent.tool_executor import _budget_for_agent
+        from tools.tool_result_storage import enforce_turn_budget
+
+        enforce_turn_budget(
+            messages[-tool_count:],
+            env=get_active_env(effective_task_id),
+            config=_budget_for_agent(self),
+        )
+        self._apply_pending_steer_to_tool_results(messages, tool_count)
+
+    def _execute_dispatcher_worker_terminal_batch(
+        self,
+        assistant_message,
+        messages: list,
+        effective_task_id: str,
+        api_call_count: int,
+        worker_identity,
+    ) -> None:
+        """Execute an owned-worker batch one call at a time until its run ends.
+
+        The registry metadata selects this narrow path, while the canonical
+        exact run row decides whether execution stops. Remaining calls receive
+        provider-valid, persisted synthetic results without entering hooks,
+        middleware, or a tool handler.
+        """
+        from agent.tool_dispatch_helpers import make_tool_result_message
+        from agent.tool_executor import (
+            _flush_session_db_after_tool_progress,
+            execute_tool_calls_sequential,
+        )
+        from tools.kanban_tools import dispatcher_worker_run_terminal_outcome
+
+        tool_calls = list(assistant_message.tool_calls)
+        for index, tool_call in enumerate(tool_calls):
+            single_call_message = SimpleNamespace(tool_calls=[tool_call])
+            execute_tool_calls_sequential(
+                self,
+                single_call_message,
+                messages,
+                effective_task_id,
+                api_call_count,
+                finalize=False,
+            )
+            if getattr(self, "_incremental_persistence_failed", False):
+                return
+
+            outcome = dispatcher_worker_run_terminal_outcome(worker_identity)
+            if outcome is None:
+                continue
+
+            remaining = tool_calls[index + 1:]
+            for skipped_call in remaining:
+                skipped_name = skipped_call.function.name
+                messages.append(
+                    make_tool_result_message(
+                        skipped_name,
+                        (
+                            "Tool skipped: the dispatcher-owned Kanban worker "
+                            "run already ended."
+                        ),
+                        skipped_call.id,
+                        effect_disposition="none",
+                    )
+                )
+            if remaining and not _flush_session_db_after_tool_progress(
+                self,
+                messages,
+                stage="post-terminal skipped tool results",
+            ):
+                return
+
+            self._dispatcher_worker_terminal_exit = {
+                "task_id": worker_identity.task_id,
+                "run_id": worker_identity.run_id,
+                "outcome": outcome,
+            }
+            break
+
+        self._finalize_dispatcher_worker_tool_batch(
+            messages,
+            effective_task_id,
+            len(tool_calls),
+        )
+
     def _execute_tool_calls(self, assistant_message, messages: list, effective_task_id: str, api_call_count: int = 0) -> None:
         """Execute tool calls from the assistant message and append results to messages.
 
@@ -8177,10 +8284,31 @@ class AIAgent:
         while side-effect ordering is preserved.
         """
         tool_calls = assistant_message.tool_calls
+        self._dispatcher_worker_terminal_exit = None
 
         # Allow _vprint during tool execution even with stream consumers
         self._executing_tools = True
         try:
+            terminal_outcomes = [
+                self._dispatcher_worker_terminal_outcomes(tool_call)
+                for tool_call in tool_calls
+            ]
+            if any(terminal_outcomes):
+                try:
+                    from tools.kanban_tools import snapshot_dispatcher_worker_run
+
+                    worker_identity = snapshot_dispatcher_worker_run()
+                except Exception:
+                    worker_identity = None
+                if worker_identity is not None:
+                    return self._execute_dispatcher_worker_terminal_batch(
+                        assistant_message,
+                        messages,
+                        effective_task_id,
+                        api_call_count,
+                        worker_identity,
+                    )
+
             if len(tool_calls) <= 1:
                 return self._execute_tool_calls_sequential(
                     assistant_message, messages, effective_task_id, api_call_count

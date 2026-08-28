@@ -7472,6 +7472,31 @@ def _run_conversation_inner(
                     failed = True
                     break
 
+                if getattr(agent, "_dispatcher_worker_terminal_exit", None):
+                    # The registered lifecycle metadata selected a sequential
+                    # boundary and the exact dispatcher-owned task/run/claim
+                    # row is now durably terminal. End locally before another
+                    # provider request. The bounded host response carries no
+                    # authority text or task identity; normal turn finalizers
+                    # still persist the closing assistant row and clean up.
+                    _turn_exit_reason = "dispatcher_worker_run_terminal"
+                    final_response = (
+                        "Kanban worker run ended after its terminal lifecycle "
+                        "transition."
+                    )
+                    # This dispatcher worker is finished, so turn-finalizer
+                    # maintenance must not open an auxiliary model request.
+                    # Background review has a public agent flag; the optional
+                    # micro-compactor owns its own enable flag.
+                    agent.skip_background_review = True
+                    _compressor = getattr(agent, "context_compressor", None)
+                    if _compressor is not None and hasattr(
+                        _compressor, "_micro_compact_enabled"
+                    ):
+                        _compressor._micro_compact_enabled = False
+                    agent._emit_status("Kanban worker run completed its handoff")
+                    break
+
                 if agent._tool_guardrail_halt_decision is not None:
                     decision = agent._tool_guardrail_halt_decision
                     _turn_exit_reason = "guardrail_halt"

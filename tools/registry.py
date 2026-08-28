@@ -208,11 +208,13 @@ class ToolEntry:
         "name", "toolset", "schema", "handler", "check_fn",
         "requires_env", "is_async", "description", "emoji",
         "max_result_size_chars", "dynamic_schema_overrides",
+        "dispatcher_worker_terminal_outcomes",
     )
 
     def __init__(self, name, toolset, schema, handler, check_fn,
                  requires_env, is_async, description, emoji,
-                 max_result_size_chars=None, dynamic_schema_overrides=None):
+                 max_result_size_chars=None, dynamic_schema_overrides=None,
+                 dispatcher_worker_terminal_outcomes=None):
         self.name = name
         self.toolset = toolset
         self.schema = schema
@@ -231,6 +233,14 @@ class ToolEntry:
         # on every get_definitions() call; results are merged shallow on top
         # of the base schema before the {"type": "function", ...} wrap.
         self.dynamic_schema_overrides = dynamic_schema_overrides
+        # Trusted, model-invisible lifecycle metadata. A dispatcher-owned
+        # Kanban worker may use this only together with an exact canonical
+        # task/run/claim transition check; the metadata alone never ends a
+        # conversation. Keeping the semantic run outcomes on the registry
+        # entry avoids tool-name branches or parsing model-visible JSON.
+        self.dispatcher_worker_terminal_outcomes = frozenset(
+            dispatcher_worker_terminal_outcomes or ()
+        )
 
 
 class _PluginOverridePolicy:
@@ -749,6 +759,7 @@ class ToolRegistry:
         dynamic_schema_overrides: Callable = None,
         override: bool = False,
         scope: Optional[str] = None,
+        dispatcher_worker_terminal_outcomes: tuple[str, ...] | frozenset[str] | None = None,
     ):
         """Register a tool.  Called at module-import time by each tool file.
 
@@ -844,6 +855,9 @@ class ToolRegistry:
                 emoji=emoji,
                 max_result_size_chars=max_result_size_chars,
                 dynamic_schema_overrides=dynamic_schema_overrides,
+                dispatcher_worker_terminal_outcomes=(
+                    dispatcher_worker_terminal_outcomes
+                ),
             )
             # Availability is now derived per-tool (_toolset_has_exposable_tools),
             # so this map no longer gates a toolset. It is still consumed by

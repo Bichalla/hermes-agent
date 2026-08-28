@@ -31,6 +31,7 @@ from __future__ import annotations
 import json
 import logging
 import os
+from dataclasses import dataclass
 from typing import Any, Optional
 
 from agent.redact import redact_sensitive_text
@@ -225,6 +226,112 @@ def _connect(board: Optional[str] = None):
     """
     from hermes_cli import kanban_db as kb
     return kb, kb.connect(board=board)
+
+
+@dataclass(frozen=True)
+class DispatcherWorkerRunIdentity:
+    """Canonical identity of one currently-active dispatcher worker run."""
+
+    task_id: str
+    run_id: int
+    claim_lock: str
+
+
+def snapshot_dispatcher_worker_run() -> Optional[DispatcherWorkerRunIdentity]:
+    """Return the exact active run owned by this dispatcher worker.
+
+    The environment values are only selectors. The task row and run row must
+    independently agree on task, run, claim, and active state before the
+    identity can drive a terminal-loop decision. Orchestrators, delegated
+    children, malformed environments, and stale workers return ``None``.
+    """
+    if not _is_dispatcher_owned_worker():
+        return None
+    task_id = (os.environ.get("HERMES_KANBAN_TASK") or "").strip()
+    run_id_raw = (os.environ.get("HERMES_KANBAN_RUN_ID") or "").strip()
+    claim_lock = (os.environ.get("HERMES_KANBAN_CLAIM_LOCK") or "").strip()
+    if not task_id or not run_id_raw or not claim_lock:
+        return None
+    try:
+        run_id = int(run_id_raw)
+    except (TypeError, ValueError):
+        return None
+    if run_id <= 0:
+        return None
+
+    try:
+        _kb, conn = _connect()
+        try:
+            row = conn.execute(
+                "SELECT t.status, t.current_run_id, t.claim_lock, "
+                "r.ended_at, r.outcome, r.claim_lock AS run_claim_lock "
+                "FROM tasks t JOIN task_runs r "
+                "ON r.id = t.current_run_id AND r.task_id = t.id "
+                "WHERE t.id = ? AND r.id = ?",
+                (task_id, run_id),
+            ).fetchone()
+        finally:
+            conn.close()
+    except Exception:
+        logger.debug("dispatcher worker run snapshot unavailable", exc_info=True)
+        return None
+
+    if (
+        row is None
+        or row["status"] != "running"
+        or row["current_run_id"] != run_id
+        or row["claim_lock"] != claim_lock
+        or row["run_claim_lock"] != claim_lock
+        or row["ended_at"] is not None
+        or row["outcome"] is not None
+    ):
+        return None
+    return DispatcherWorkerRunIdentity(task_id, run_id, claim_lock)
+
+
+def dispatcher_worker_run_terminal_outcome(
+    identity: DispatcherWorkerRunIdentity,
+) -> Optional[str]:
+    """Return the durable outcome once *identity* has ended, else ``None``.
+
+    The caller must hold a snapshot from :func:`snapshot_dispatcher_worker_run`.
+    Re-checking the environment prevents an in-process context switch from
+    applying one worker's exit to another. The exact historical run row remains
+    authoritative even if the dispatcher has already claimed a successor.
+    """
+    if not isinstance(identity, DispatcherWorkerRunIdentity):
+        return None
+    if not _is_dispatcher_owned_worker():
+        return None
+    try:
+        current_run_id = int(os.environ.get("HERMES_KANBAN_RUN_ID") or "")
+    except (TypeError, ValueError):
+        return None
+    if (
+        os.environ.get("HERMES_KANBAN_TASK") != identity.task_id
+        or current_run_id != identity.run_id
+        or os.environ.get("HERMES_KANBAN_CLAIM_LOCK") != identity.claim_lock
+    ):
+        return None
+
+    try:
+        _kb, conn = _connect()
+        try:
+            row = conn.execute(
+                "SELECT outcome, ended_at FROM task_runs "
+                "WHERE id = ? AND task_id = ? AND claim_lock IS NULL",
+                (identity.run_id, identity.task_id),
+            ).fetchone()
+        finally:
+            conn.close()
+    except Exception:
+        logger.debug(
+            "dispatcher worker terminal outcome read unavailable", exc_info=True
+        )
+        return None
+    if row is None or row["ended_at"] is None or not row["outcome"]:
+        return None
+    return str(row["outcome"])
 
 
 _GOAL_MODE_BLOCK_ALLOWED_KINDS = frozenset({"dependency", "needs_input"})
@@ -2426,6 +2533,7 @@ registry.register(
     handler=_handle_complete,
     check_fn=_check_kanban_mode,
     emoji="✔",
+    dispatcher_worker_terminal_outcomes=("completed",),
 )
 
 registry.register(
@@ -2435,6 +2543,7 @@ registry.register(
     handler=_handle_block,
     check_fn=_check_kanban_mode,
     emoji="⏸",
+    dispatcher_worker_terminal_outcomes=("blocked",),
 )
 
 registry.register(
@@ -2444,6 +2553,7 @@ registry.register(
     handler=_handle_request_review,
     check_fn=_check_kanban_mode,
     emoji="👀",
+    dispatcher_worker_terminal_outcomes=("review_requested",),
 )
 
 registry.register(
@@ -2453,6 +2563,7 @@ registry.register(
     handler=_handle_request_changes,
     check_fn=_check_kanban_mode,
     emoji="↩",
+    dispatcher_worker_terminal_outcomes=("changes_requested",),
 )
 
 registry.register(

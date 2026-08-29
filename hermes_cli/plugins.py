@@ -153,6 +153,40 @@ _install_plugin_debug_handler()
 # Constants
 # ---------------------------------------------------------------------------
 
+_TERMINAL_OUTPUT_GUARD_TIMEOUT_SECONDS = 1.5
+_TERMINAL_OUTPUT_GUARD_SLOTS = threading.BoundedSemaphore(4)
+_TERMINAL_OUTPUT_GUARD_INPUT_KEYS = frozenset(
+    {
+        "guard_id",
+        "requirement",
+        "requirement_sha256",
+        "response_text",
+        "session_id",
+        "turn_id",
+        "platform",
+        "model",
+    }
+)
+_TERMINAL_OUTPUT_GUARD_RESULT_KEYS = frozenset(
+    {"schema", "guard_id", "decision", "reason_code"}
+)
+_TERMINAL_OUTPUT_GUARD_RESULT_SCHEMA = "terminal-output-guard-result/v1"
+_TERMINAL_OUTPUT_GUARD_ALLOW_REASONS = frozenset({"receipt_exact"})
+_TERMINAL_OUTPUT_GUARD_VETO_REASONS = frozenset(
+    {"receipt_missing", "receipt_mismatch", "receipt_query_failed"}
+)
+
+
+def _terminal_output_guard_veto(guard_id: Any, reason_code: str) -> Dict[str, str]:
+    """Return a closed host-owned veto without plugin/private details."""
+    return {
+        "schema": _TERMINAL_OUTPUT_GUARD_RESULT_SCHEMA,
+        "guard_id": guard_id if type(guard_id) is str else "invalid",
+        "decision": "veto",
+        "reason_code": reason_code,
+    }
+
+
 VALID_HOOKS: Set[str] = {
     "pre_tool_call",
     "post_tool_call",
@@ -3131,6 +3165,64 @@ class PluginContext:
         logger.debug("Plugin %s registered hook: %s", self.manifest.name, hook_name)
         return handle
 
+    @_serialized_replacement
+    def register_terminal_output_guard(
+        self, guard_id: str, callback: Callable
+    ) -> PluginRegistration:
+        """Register one strict terminal-output callback under host ownership.
+
+        IDs are exact and unique. A duplicate is recorded as an owned conflict
+        before the call fails, so evaluation closes while the conflicting
+        plugin is live. The existing registration ledger removes both guards
+        and conflict markers during unload or a partially failed load.
+        """
+        if (
+            type(guard_id) is not str
+            or not guard_id
+            or guard_id != guard_id.strip()
+            or len(guard_id) > 128
+            or not callable(callback)
+        ):
+            raise ValueError("terminal output guard requires an exact ID and callable")
+        if (
+            guard_id in self._manager._terminal_output_guards
+            or guard_id in self._manager._terminal_output_guard_conflicts
+        ):
+            conflicts = self._manager._terminal_output_guard_conflicts
+            conflicts[guard_id] = conflicts.get(guard_id, 0) + 1
+            self._track(
+                "terminal_output_guard_conflict",
+                guard_id,
+                lambda: self._manager._release_terminal_output_guard_conflict(
+                    guard_id
+                ),
+            )
+            raise ValueError(
+                f"terminal output guard {guard_id!r} is already registered"
+            )
+
+        previous = self._manager._terminal_output_guards.get(guard_id)
+        self._manager._terminal_output_guards[guard_id] = callback
+        handle = self._track_replacement(
+            "terminal_output_guard",
+            guard_id,
+            slot=("manager_mapping", id(self._manager._terminal_output_guards), guard_id),
+            current=callback,
+            previous=previous,
+            restore=lambda replacement: self._manager._restore_mapping(
+                self._manager._terminal_output_guards,
+                guard_id,
+                callback,
+                replacement,
+            ),
+        )
+        logger.debug(
+            "Plugin %s registered terminal output guard: %s",
+            self.manifest.name,
+            guard_id,
+        )
+        return handle
+
     def register_system_prompt_section(
         self,
         id: str,
@@ -3398,6 +3490,8 @@ class PluginManager:
         self._plugins: Dict[str, LoadedPlugin] = {}
         self._hooks: Dict[str, List[Callable]] = {}
         self._middleware: Dict[str, List[Callable]] = {}
+        self._terminal_output_guards: Dict[str, Callable] = {}
+        self._terminal_output_guard_conflicts: Dict[str, int] = {}
         self._plugin_tool_names: Set[str] = set()
         self._plugin_platform_names: Set[str] = set()
         self._cli_commands: Dict[str, dict] = {}
@@ -3526,6 +3620,14 @@ class PluginManager:
         else:
             mapping[key] = previous
         return True
+
+    def _release_terminal_output_guard_conflict(self, guard_id: str) -> None:
+        """Release one ledger-owned duplicate marker without hiding others."""
+        remaining = self._terminal_output_guard_conflicts.get(guard_id, 0) - 1
+        if remaining > 0:
+            self._terminal_output_guard_conflicts[guard_id] = remaining
+        else:
+            self._terminal_output_guard_conflicts.pop(guard_id, None)
 
     def _restore_value(
         self,
@@ -3715,6 +3817,8 @@ class PluginManager:
             self._plugins.clear()
             self._hooks.clear()
             self._middleware.clear()
+            self._terminal_output_guards.clear()
+            self._terminal_output_guard_conflicts.clear()
             self._plugin_tool_names.clear()
             self._plugin_platform_names.clear()
             self._cli_commands.clear()
@@ -5411,6 +5515,103 @@ class PluginManager:
     def has_middleware(self, kind: str) -> bool:
         """Return True when at least one callback is registered for middleware."""
         return bool(self._middleware.get(kind))
+
+    def invoke_terminal_output_guard_strict(self, **kwargs: Any) -> Dict[str, str]:
+        """Invoke one guard under the closed, bounded host contract.
+
+        A four-slot semaphore bounds abandoned workers across managers. Each
+        accepted call gets one daemon thread and at most 1500 ms; a timed-out
+        worker retains its slot until its own ``finally`` runs. Input and
+        result schemas are exact, and every host or plugin error vetoes.
+        """
+        requested_guard_id = kwargs.get("guard_id")
+        if frozenset(kwargs) != _TERMINAL_OUTPUT_GUARD_INPUT_KEYS:
+            return _terminal_output_guard_veto(
+                requested_guard_id, "guard_input_invalid"
+            )
+        if any(
+            type(kwargs[key]) is not str
+            for key in _TERMINAL_OUTPUT_GUARD_INPUT_KEYS - {"requirement"}
+        ) or type(kwargs.get("requirement")) is not dict:
+            return _terminal_output_guard_veto(
+                requested_guard_id, "guard_input_invalid"
+            )
+        guard_id: str = kwargs["guard_id"]
+
+        try:
+            canonical = json.dumps(
+                kwargs["requirement"],
+                ensure_ascii=False,
+                allow_nan=False,
+                sort_keys=True,
+                separators=(",", ":"),
+            ).encode("utf-8")
+            requirement_copy = json.loads(canonical.decode("utf-8"))
+        except (TypeError, ValueError, UnicodeError):
+            return _terminal_output_guard_veto(guard_id, "guard_input_invalid")
+        if (
+            type(requirement_copy) is not dict
+            or len(kwargs["requirement_sha256"]) != 64
+            or hashlib.sha256(canonical).hexdigest()
+            != kwargs["requirement_sha256"]
+        ):
+            return _terminal_output_guard_veto(guard_id, "guard_input_invalid")
+
+        if guard_id in self._terminal_output_guard_conflicts:
+            return _terminal_output_guard_veto(guard_id, "guard_callback_duplicate")
+        callback = self._terminal_output_guards.get(guard_id)
+        if callback is None:
+            return _terminal_output_guard_veto(guard_id, "guard_callback_missing")
+        if not _TERMINAL_OUTPUT_GUARD_SLOTS.acquire(blocking=False):
+            return _terminal_output_guard_veto(guard_id, "guard_capacity_exhausted")
+
+        outcome: queue.Queue[tuple[str, Any]] = queue.Queue(maxsize=1)
+        callback_kwargs = dict(kwargs)
+        callback_kwargs["requirement"] = requirement_copy
+
+        def _worker() -> None:
+            try:
+                try:
+                    value = callback(**callback_kwargs)
+                except BaseException:
+                    outcome.put_nowait(("exception", None))
+                else:
+                    outcome.put_nowait(("result", value))
+            finally:
+                _TERMINAL_OUTPUT_GUARD_SLOTS.release()
+
+        worker = threading.Thread(
+            target=_worker,
+            name="terminal-output-guard",
+            daemon=True,
+        )
+        worker.start()
+        worker.join(_TERMINAL_OUTPUT_GUARD_TIMEOUT_SECONDS)
+        if worker.is_alive():
+            return _terminal_output_guard_veto(guard_id, "guard_callback_timeout")
+        try:
+            outcome_kind, value = outcome.get_nowait()
+        except queue.Empty:
+            return _terminal_output_guard_veto(guard_id, "guard_callback_invalid")
+        if outcome_kind == "exception":
+            return _terminal_output_guard_veto(guard_id, "guard_callback_exception")
+        if (
+            type(value) is not dict
+            or frozenset(value) != _TERMINAL_OUTPUT_GUARD_RESULT_KEYS
+            or value.get("schema") != _TERMINAL_OUTPUT_GUARD_RESULT_SCHEMA
+            or value.get("guard_id") != guard_id
+            or type(value.get("decision")) is not str
+            or type(value.get("reason_code")) is not str
+        ):
+            return _terminal_output_guard_veto(guard_id, "guard_callback_invalid")
+
+        decision = value["decision"]
+        reason_code = value["reason_code"]
+        if decision == "allow" and reason_code in _TERMINAL_OUTPUT_GUARD_ALLOW_REASONS:
+            return dict(value)
+        if decision == "veto" and reason_code in _TERMINAL_OUTPUT_GUARD_VETO_REASONS:
+            return dict(value)
+        return _terminal_output_guard_veto(guard_id, "guard_callback_invalid")
 
     def invoke_middleware(self, kind: str, **kwargs: Any) -> List[Any]:
         """Call registered middleware callbacks for *kind*.

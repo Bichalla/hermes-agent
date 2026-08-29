@@ -1,8 +1,10 @@
 """Tests for the Hermes plugin system (hermes_cli.plugins)."""
 
-import logging
+import hashlib
 import json
+import logging
 import sys
+import threading
 import types
 from pathlib import Path
 from unittest.mock import MagicMock, patch
@@ -1537,6 +1539,319 @@ class TestPluginToolVisibility:
         # Reachable when no toolset filter is active (all enabled)
         tools3 = get_tool_definitions(quiet_mode=True)
         assert _reachable(tools3)
+
+
+def _terminal_guard_request(
+    guard_id: str = "lifelog.sleep-receipt.v1",
+    requirement: dict | None = None,
+) -> dict:
+    if requirement is None:
+        requirement = {
+            "schema": "terminal-output-guard-requirement/v1",
+            "receipt_id": "sleep-2026-08-29",
+        }
+    canonical = json.dumps(
+        requirement,
+        ensure_ascii=False,
+        allow_nan=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode("utf-8")
+    return {
+        "guard_id": guard_id,
+        "requirement": requirement,
+        "requirement_sha256": hashlib.sha256(canonical).hexdigest(),
+        "response_text": "I logged sleep.",
+        "session_id": "session-1",
+        "turn_id": "turn-1",
+        "platform": "discord",
+        "model": "test-model",
+    }
+
+
+def _terminal_guard_allow(**kwargs):
+    return {
+        "schema": "terminal-output-guard-result/v1",
+        "guard_id": kwargs["guard_id"],
+        "decision": "allow",
+        "reason_code": "receipt_exact",
+    }
+
+
+class TestPluginTerminalOutputGuards:
+    """Host-owned terminal-output guard registration and evaluation."""
+
+    def test_registration_handle_and_strict_evaluation_allow_exact_receipt(self):
+        """The host ledger owns a usable strict terminal guard registration."""
+        mgr = PluginManager()
+        ctx = PluginContext(PluginManifest(name="guard-plugin", source="user"), mgr)
+
+        def allow_guard(**kwargs):
+            assert kwargs["requirement"] == {
+                "schema": "terminal-output-guard-requirement/v1",
+                "receipt_id": "sleep-2026-08-29",
+            }
+            return {
+                "schema": "terminal-output-guard-result/v1",
+                "guard_id": kwargs["guard_id"],
+                "decision": "allow",
+                "reason_code": "receipt_exact",
+            }
+
+        handle = ctx.register_terminal_output_guard(
+            "lifelog.sleep-receipt.v1", allow_guard
+        )
+
+        assert handle.active is True
+        assert handle.kind == "terminal_output_guard"
+        assert mgr.invoke_terminal_output_guard_strict(
+            **_terminal_guard_request()
+        ) == {
+            "schema": "terminal-output-guard-result/v1",
+            "guard_id": "lifelog.sleep-receipt.v1",
+            "decision": "allow",
+            "reason_code": "receipt_exact",
+        }
+
+    @pytest.mark.parametrize(
+        ("guard_id", "callback"),
+        [
+            ("", _terminal_guard_allow),
+            (" leading", _terminal_guard_allow),
+            ("trailing ", _terminal_guard_allow),
+            ("x" * 129, _terminal_guard_allow),
+            (1, _terminal_guard_allow),
+            ("valid", None),
+        ],
+    )
+    def test_registration_rejects_inexact_id_or_noncallable(
+        self, guard_id, callback
+    ):
+        mgr = PluginManager()
+        ctx = PluginContext(PluginManifest(name="guard-plugin", source="user"), mgr)
+
+        with pytest.raises(ValueError, match="exact ID and callable"):
+            ctx.register_terminal_output_guard(guard_id, callback)
+
+        assert mgr._terminal_output_guards == {}
+        assert mgr._ownership_ledger == {}
+
+    def test_duplicate_fails_closed_until_conflicting_owner_unloads(self):
+        """A duplicate conflict has its own reversible ledger ownership."""
+        mgr = PluginManager()
+        ctx_a = PluginContext(PluginManifest(name="guard-a", source="user"), mgr)
+        ctx_b = PluginContext(PluginManifest(name="guard-b", source="user"), mgr)
+
+        owner_handle = ctx_a.register_terminal_output_guard(
+            "lifelog.sleep-receipt.v1", _terminal_guard_allow
+        )
+        with pytest.raises(ValueError, match="already registered"):
+            ctx_b.register_terminal_output_guard(
+                "lifelog.sleep-receipt.v1", lambda **_: {}
+            )
+
+        assert mgr.invoke_terminal_output_guard_strict(
+            **_terminal_guard_request()
+        ) == {
+            "schema": "terminal-output-guard-result/v1",
+            "guard_id": "lifelog.sleep-receipt.v1",
+            "decision": "veto",
+            "reason_code": "guard_callback_duplicate",
+        }
+        assert mgr.unload("guard-b") is True
+        assert mgr._terminal_output_guard_conflicts == {}
+        assert owner_handle.active is True
+        assert mgr.invoke_terminal_output_guard_strict(
+            **_terminal_guard_request()
+        )["decision"] == "allow"
+
+    def test_unload_terminal_output_guard_removes_callback(self):
+        """unloading a plugin removes its terminal guard callback."""
+        mgr = PluginManager()
+        ctx = PluginContext(PluginManifest(name="guard-plugin", source="user"), mgr)
+        handle = ctx.register_terminal_output_guard(
+            "lifelog.sleep-receipt.v1", _terminal_guard_allow
+        )
+
+        assert mgr.unload("guard-plugin") is True
+        assert handle.active is False
+        assert mgr._terminal_output_guards == {}
+
+        assert mgr.invoke_terminal_output_guard_strict(
+            **_terminal_guard_request()
+        ) == {
+            "schema": "terminal-output-guard-result/v1",
+            "guard_id": "lifelog.sleep-receipt.v1",
+            "decision": "veto",
+            "reason_code": "guard_callback_missing",
+        }
+
+    def test_strict_evaluation_rejects_invalid_inputs_without_callback(self):
+        mgr = PluginManager()
+        ctx = PluginContext(PluginManifest(name="guard-plugin", source="user"), mgr)
+        calls = []
+        ctx.register_terminal_output_guard(
+            "lifelog.sleep-receipt.v1", lambda **kwargs: calls.append(kwargs)
+        )
+
+        missing_key = _terminal_guard_request()
+        missing_key.pop("model")
+        extra_key = {**_terminal_guard_request(), "unexpected": "value"}
+        bad_digest = {**_terminal_guard_request(), "requirement_sha256": "0" * 64}
+        noncanonical = _terminal_guard_request()
+        noncanonical["requirement"] = {"value": float("nan")}
+
+        for request in (missing_key, extra_key, bad_digest, noncanonical):
+            result = mgr.invoke_terminal_output_guard_strict(**request)
+            assert result["decision"] == "veto"
+            assert result["reason_code"] == "guard_input_invalid"
+        assert calls == []
+
+    def test_strict_evaluation_accepts_only_exact_results(self):
+        veto_mgr = PluginManager()
+        veto_ctx = PluginContext(
+            PluginManifest(name="veto-plugin", source="user"), veto_mgr
+        )
+        veto_ctx.register_terminal_output_guard(
+            "lifelog.sleep-receipt.v1",
+            lambda **kwargs: {
+                "schema": "terminal-output-guard-result/v1",
+                "guard_id": kwargs["guard_id"],
+                "decision": "veto",
+                "reason_code": "receipt_mismatch",
+            },
+        )
+        assert veto_mgr.invoke_terminal_output_guard_strict(
+            **_terminal_guard_request()
+        )["reason_code"] == "receipt_mismatch"
+
+        invalid_mgr = PluginManager()
+        invalid_ctx = PluginContext(
+            PluginManifest(name="invalid-plugin", source="user"), invalid_mgr
+        )
+        invalid_ctx.register_terminal_output_guard(
+            "lifelog.sleep-receipt.v1",
+            lambda **_: {
+                "schema": "terminal-output-guard-result/v1",
+                "guard_id": "lifelog.sleep-receipt.v1",
+                "decision": "allow",
+                "reason_code": "unowned_reason",
+            },
+        )
+        assert invalid_mgr.invoke_terminal_output_guard_strict(
+            **_terminal_guard_request()
+        )["reason_code"] == "guard_callback_invalid"
+
+        exception_mgr = PluginManager()
+        exception_ctx = PluginContext(
+            PluginManifest(name="exception-plugin", source="user"), exception_mgr
+        )
+
+        def raise_guard(**_kwargs):
+            raise RuntimeError("guard failed")
+
+        exception_ctx.register_terminal_output_guard(
+            "lifelog.sleep-receipt.v1", raise_guard
+        )
+        assert exception_mgr.invoke_terminal_output_guard_strict(
+            **_terminal_guard_request()
+        )["reason_code"] == "guard_callback_exception"
+
+    def test_strict_evaluation_bounds_timeout_and_abandoned_capacity(
+        self, monkeypatch
+    ):
+        from hermes_cli import plugins as plugins_mod
+
+        slots = threading.BoundedSemaphore(1)
+        release_callback = threading.Event()
+        callback_finished = threading.Event()
+        monkeypatch.setattr(plugins_mod, "_TERMINAL_OUTPUT_GUARD_SLOTS", slots)
+        monkeypatch.setattr(
+            plugins_mod, "_TERMINAL_OUTPUT_GUARD_TIMEOUT_SECONDS", 0.01
+        )
+
+        def blocking_guard(**kwargs):
+            release_callback.wait(timeout=1)
+            callback_finished.set()
+            return _terminal_guard_allow(**kwargs)
+
+        mgr = PluginManager()
+        ctx = PluginContext(PluginManifest(name="guard-plugin", source="user"), mgr)
+        ctx.register_terminal_output_guard(
+            "lifelog.sleep-receipt.v1", blocking_guard
+        )
+
+        assert mgr.invoke_terminal_output_guard_strict(
+            **_terminal_guard_request()
+        )["reason_code"] == "guard_callback_timeout"
+        assert mgr.invoke_terminal_output_guard_strict(
+            **_terminal_guard_request()
+        )["reason_code"] == "guard_capacity_exhausted"
+
+        release_callback.set()
+        assert callback_finished.wait(timeout=1)
+        assert slots.acquire(timeout=1) is True
+        slots.release()
+
+    def test_failed_plugin_registration_removes_partial_terminal_guard(
+        self, tmp_path, monkeypatch
+    ):
+        """failed plugin registration removes its partial terminal guard."""
+        plugins_dir = tmp_path / "hermes_test" / "plugins"
+        _make_plugin_dir(
+            plugins_dir,
+            "broken_guard",
+            register_body=(
+                "ctx.register_terminal_output_guard("
+                "'lifelog.sleep-receipt.v1', lambda **kw: {"
+                "'schema': 'terminal-output-guard-result/v1', "
+                "'guard_id': kw['guard_id'], "
+                "'decision': 'allow', "
+                "'reason_code': 'receipt_exact'})\n"
+                "    raise RuntimeError('boom after guard')"
+            ),
+        )
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path / "hermes_test"))
+
+        mgr = PluginManager()
+        mgr.discover_and_load()
+
+        assert mgr._plugins["broken_guard"].enabled is False
+        assert mgr.invoke_terminal_output_guard_strict(
+            **_terminal_guard_request()
+        ) == {
+            "schema": "terminal-output-guard-result/v1",
+            "guard_id": "lifelog.sleep-receipt.v1",
+            "decision": "veto",
+            "reason_code": "guard_callback_missing",
+        }
+
+    def test_failed_duplicate_registration_releases_conflict_marker(
+        self, tmp_path, monkeypatch
+    ):
+        """A failed duplicate plugin cannot strand ambiguity on its owner."""
+        plugins_dir = tmp_path / "hermes_test" / "plugins"
+        allow_body = (
+            "ctx.register_terminal_output_guard("
+            "'lifelog.sleep-receipt.v1', lambda **kw: {"
+            "'schema': 'terminal-output-guard-result/v1', "
+            "'guard_id': kw['guard_id'], "
+            "'decision': 'allow', "
+            "'reason_code': 'receipt_exact'})"
+        )
+        _make_plugin_dir(plugins_dir, "a_guard", register_body=allow_body)
+        _make_plugin_dir(plugins_dir, "b_duplicate", register_body=allow_body)
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path / "hermes_test"))
+
+        mgr = PluginManager()
+        mgr.discover_and_load()
+
+        assert mgr._plugins["a_guard"].enabled is True
+        assert mgr._plugins["b_duplicate"].enabled is False
+        assert mgr._terminal_output_guard_conflicts == {}
+        assert mgr.invoke_terminal_output_guard_strict(
+            **_terminal_guard_request()
+        )["decision"] == "allow"
 
 
 # ── TestPluginManagerList ──────────────────────────────────────────────────

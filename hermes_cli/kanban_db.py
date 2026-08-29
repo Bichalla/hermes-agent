@@ -90,6 +90,9 @@ from pathlib import Path
 from typing import Any, Iterable, Mapping, Optional
 
 from hermes_cli.change_gate import (
+    ARCHITECTURE_INVENTORY_SCHEMA,
+    ArchitectureInventoryRecord,
+    EvidencePacket,
     ChangeGateAdapter,
     ChangeGateReason,
     ChangeGateRequest,
@@ -98,13 +101,23 @@ from hermes_cli.change_gate import (
     DurableReleaseArtifact,
     GateDecision,
     GatePhase,
+    MAX_EVIDENCE_LIFETIME_SECONDS,
+    PreFreezeRouteRule,
     ReleasePurpose,
+    ReviewRoute,
     ReviewResult,
     ReviewVerdict,
+    ReviewerClass,
+    RiskLevel,
+    RouteProjection,
+    SourceIdentity,
     TransitionAnchor,
     UpstreamRouteSelector,
+    WorkIdentity,
     canonical_sha256,
     expected_release_statement,
+    freeze_handoff,
+    resolve_route_before_freeze,
     validate_durable_release_artifact,
 )
 from hermes_cli.sqlite_util import add_column_if_missing as _add_column_if_missing
@@ -4198,6 +4211,7 @@ def store_attachment_bytes(
     uploaded_by: Optional[str] = None,
     board: Optional[str] = None,
     max_bytes: Optional[int] = None,
+    _allow_nested: bool = False,
 ) -> int:
     """Validate, size-check, persist a blob, and record its metadata row.
 
@@ -4236,6 +4250,7 @@ def store_attachment_bytes(
             content_type=content_type,
             size=len(data),
             uploaded_by=uploaded_by,
+            _allow_nested=_allow_nested,
         )
     except Exception:
         # Don't leave an orphan blob if the metadata insert fails (most
@@ -4256,6 +4271,7 @@ def add_attachment(
     content_type: Optional[str] = None,
     size: int = 0,
     uploaded_by: Optional[str] = None,
+    _allow_nested: bool = False,
 ) -> int:
     """Record a file attachment for a task. Returns the new attachment id.
 
@@ -4268,7 +4284,7 @@ def add_attachment(
     if not stored_path or not stored_path.strip():
         raise ValueError("attachment stored_path is required")
     now = int(time.time())
-    with write_txn(conn):
+    with write_txn(conn, allow_nested=_allow_nested):
         if not conn.execute(
             "SELECT 1 FROM tasks WHERE id = ?", (task_id,)
         ).fetchone():
@@ -4378,6 +4394,543 @@ def change_gate_runtime_schema_exists(conn: sqlite3.Connection) -> bool:
 
 
 _MAX_CHANGE_GATE_EVENT_PAYLOAD_BYTES = 64 * 1024
+
+
+def _load_change_gate_policy_unique_yaml() -> dict[str, Any]:
+    policy_path = kanban_home() / "policies" / "change-gate" / "policy.yaml"
+    if not policy_path.is_file():
+        raise ValueError(f"canonical change-gate policy not found at {policy_path}")
+    try:
+        import yaml
+
+        class _UniqueKeyLoader(yaml.SafeLoader):
+            pass
+
+        def _construct_mapping(loader, node, deep=False):
+            seen: set[object] = set()
+            for key_node, _value_node in node.value:
+                key = loader.construct_object(key_node, deep=deep)
+                if key in seen:
+                    raise ValueError(f"duplicate yaml key: {key}")
+                seen.add(key)
+            return yaml.SafeLoader.construct_mapping(loader, node, deep=deep)
+
+        _UniqueKeyLoader.add_constructor(
+            yaml.resolver.BaseResolver.DEFAULT_MAPPING_TAG,
+            _construct_mapping,
+        )
+        data = yaml.load(policy_path.read_text(encoding="utf-8"), Loader=_UniqueKeyLoader) or {}
+    except ValueError:
+        raise
+    except Exception as exc:
+        raise ValueError(f"canonical change-gate policy could not be read: {exc}") from exc
+    if (
+        type(data) is not dict
+        or data.get("schema") != "change-gate-policy/v1"
+        or data.get("policy_version") != "change-gate-policy/v1"
+        or type(data.get("owner")) is not dict
+        or data["owner"].get("canonical_owner") != str(policy_path)
+        or data["owner"].get("mutation_owner") != "Planner"
+        or type(data.get("risk_tiers")) is not dict
+        or type(data.get("route_matrix")) is not dict
+    ):
+        raise ValueError("canonical change-gate policy is invalid")
+    return data
+
+
+def _policy_profile(value: object) -> str:
+    if type(value) is not str or not value.strip():
+        raise ValueError("policy profile is required")
+    return _canonical_assignee(value) or ""
+
+
+def _selector_from_policy_row(row: object, *, expected_role: str) -> UpstreamRouteSelector:
+    if type(row) is not dict or row.get("role") != expected_role:
+        raise ValueError(f"policy route row must have role {expected_role}")
+    model = row.get("model")
+    provider = row.get("provider")
+    effort = row.get("reasoning_effort")
+    if (
+        (model is not None and type(model) is not str)
+        or (provider is not None and type(provider) is not str)
+        or (effort is not None and type(effort) is not str)
+    ):
+        raise ValueError("policy selector fields must be strings or null")
+    return UpstreamRouteSelector(
+        assignee=_policy_profile(row.get("profile")),
+        model_override=model.strip() if model is not None and model.strip() else None,
+        provider_override=provider.strip() if provider is not None and provider.strip() else None,
+        reasoning_effort=effort.strip() if effort is not None and effort.strip() else None,
+    ).normalized()
+
+
+def _review_route_from_policy_row(row: object) -> ReviewRoute:
+    if type(row) is not dict:
+        raise ValueError("policy reviewer row is invalid")
+    role = row.get("role")
+    if role == "REVIEWER":
+        return ReviewRoute(
+            ReviewerClass.REVIEWER,
+            _selector_from_policy_row(row, expected_role="REVIEWER"),
+        )
+    if role == "NORMAL_REVIEWER":
+        return ReviewRoute(
+            ReviewerClass.NORMAL,
+            _selector_from_policy_row(row, expected_role="NORMAL_REVIEWER"),
+        )
+    if role == "DEEP_REVIEWER":
+        return ReviewRoute(
+            ReviewerClass.DEEP,
+            _selector_from_policy_row(row, expected_role="DEEP_REVIEWER"),
+        )
+    raise ValueError(f"unsupported reviewer role {role!r}")
+
+
+def _route_rule_from_canonical_policy(policy: dict[str, Any], risk: RiskLevel) -> PreFreezeRouteRule:
+    risk_tiers = policy["risk_tiers"]
+    route_matrix = policy["route_matrix"]
+    tier = risk_tiers.get(risk.value)
+    if type(tier) is not dict or type(tier.get("route_key")) is not str:
+        raise ValueError(f"policy risk row missing for {risk.value}")
+    route_key = tier["route_key"]
+    row = route_matrix.get(route_key)
+    if type(row) is not dict:
+        raise ValueError(f"policy route_matrix row missing for {route_key}")
+    reviews = row.get("reviewers")
+    if type(reviews) is not list:
+        raise ValueError("policy reviewer route row is invalid")
+    return PreFreezeRouteRule(
+        rule_id="kanban_g2_handoff",
+        metadata_equals=(("route_key", route_key),),
+        route=RouteProjection(
+            risk=risk,
+            executor=_selector_from_policy_row(row.get("executor"), expected_role="EXECUTOR"),
+            reviews=tuple(_review_route_from_policy_row(review) for review in reviews),
+        ),
+    )
+
+
+def _artifact_binding_from_mapping(value: object) -> "ArtifactBinding":
+    from hermes_cli.change_gate import ArtifactBinding
+    from hermes_cli.change_gate_codec import ArtifactCodecReason, validate_artifact_binding
+
+    if type(value) is not dict or set(value) - {"path", "sha256", "role", "git_oid"}:
+        raise ValueError("artifact binding is invalid")
+    if (
+        type(value.get("path")) is not str
+        or type(value.get("sha256")) is not str
+        or type(value.get("role")) is not str
+        or (value.get("git_oid") is not None and type(value.get("git_oid")) is not str)
+    ):
+        raise ValueError("artifact binding fields must be strings or null")
+    binding = ArtifactBinding(
+        path=value.get("path") or "",
+        sha256=value.get("sha256") or "",
+        role=value.get("role") or "",
+        git_oid=(
+            value.get("git_oid").strip()
+            if value.get("git_oid") is not None and value.get("git_oid").strip()
+            else None
+        ),
+    )
+    if validate_artifact_binding(binding) is not ArtifactCodecReason.OK:
+        raise ValueError("artifact binding is invalid")
+    return binding
+
+
+def _artifact_bindings_from_list(values: object, name: str) -> tuple["ArtifactBinding", ...]:
+    if type(values) is not list:
+        raise ValueError(f"{name} must be a list")
+    return tuple(_artifact_binding_from_mapping(value) for value in values)
+
+
+def _required_g2_text(value: object, name: str) -> str:
+    if type(value) is not str or not value.strip() or "\0" in value:
+        raise ValueError(f"{name} is required")
+    return value.strip()
+
+
+def _required_g2_texts(values: object, name: str, *, allow_empty: bool = False) -> tuple[str, ...]:
+    if type(values) is not list or (not values and not allow_empty):
+        raise ValueError(f"{name} must be a non-empty list")
+    out: list[str] = []
+    for value in values:
+        out.append(_required_g2_text(value, name))
+    return tuple(out)
+
+
+def _load_g2_inventory(inventory_id: str) -> tuple[object, ArchitectureInventoryRecord]:
+    from hermes_cli.change_gate_codec import read_artifact
+    from hermes_cli.change_gate_runtime import load_runtime_policy
+
+    runtime_policy = load_runtime_policy()
+    if (
+        runtime_policy.enabled is not True
+        or runtime_policy.valid is not True
+        or runtime_policy.inventory_root is None
+    ):
+        raise ValueError("change_gate runtime policy with inventory_root is required")
+    result = read_artifact(
+        runtime_policy.inventory_root,
+        f"{inventory_id}.json",
+        expected_schema=ARCHITECTURE_INVENTORY_SCHEMA,
+    )
+    if (
+        not result.ok
+        or type(result.value) is not ArchitectureInventoryRecord
+        or result.value.inventory_id != inventory_id
+    ):
+        raise ValueError(f"inventory record {inventory_id!r} could not be loaded")
+    return runtime_policy, result.value
+
+
+def _remove_action_worktree(path: Path, branch_name: str) -> None:
+    if not path.exists():
+        return
+    common = _git_common_dir(path)
+    if common is None or common.name != ".git":
+        raise RuntimeError(f"refusing to clean non-linked worktree path: {path}")
+    repo_root = common.parent
+    if path.resolve(strict=False) == repo_root.resolve(strict=False):
+        raise RuntimeError(f"refusing to clean primary checkout: {path}")
+    branch_leaf = branch_name.rsplit("/", 1)[-1]
+    if branch_leaf != path.name and not branch_leaf.startswith(f"{path.name}-"):
+        raise RuntimeError(
+            f"refusing to clean non-action branch {branch_name!r} for {path}"
+        )
+    result = subprocess.run(
+        ["git", "-C", str(repo_root), "worktree", "remove", "--force", str(path)],
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+        timeout=60,
+        check=False,
+    )
+    if result.returncode != 0:
+        detail = (result.stderr or result.stdout or "").strip()
+        raise RuntimeError(f"git worktree remove failed for {path}: {detail}")
+    if path.exists():
+        raise RuntimeError(f"git worktree remove left path behind: {path}")
+    if _git_branch_exists(repo_root, branch_name):
+        result = subprocess.run(
+            ["git", "-C", str(repo_root), "branch", "-D", "--", branch_name],
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            timeout=60,
+            check=False,
+        )
+        if result.returncode != 0 or _git_branch_exists(repo_root, branch_name):
+            detail = (result.stderr or result.stdout or "").strip()
+            raise RuntimeError(
+                f"git branch cleanup failed for {branch_name!r}: {detail}"
+            )
+
+
+def _cleanup_g2_handoff_outputs(
+    worktree_path: Path | None,
+    branch_name: str | None,
+    attachment_dir: Path | None,
+) -> None:
+    errors: list[Exception] = []
+    if (
+        worktree_path is not None
+        and branch_name is not None
+        and worktree_path.name.startswith("t_")
+    ):
+        try:
+            _remove_action_worktree(worktree_path, branch_name)
+        except Exception as exc:
+            errors.append(exc)
+    if attachment_dir is not None and attachment_dir.name.startswith("t_"):
+        try:
+            if attachment_dir.exists() and attachment_dir.is_dir():
+                shutil.rmtree(attachment_dir)
+        except Exception as exc:
+            errors.append(exc)
+    if errors:
+        raise RuntimeError(
+            "kanban_g2_handoff rollback cleanup failed: "
+            + "; ".join(str(error) for error in errors)
+        ) from errors[0]
+
+
+def issue_change_gate_g2_handoff(
+    conn: sqlite3.Connection,
+    *,
+    parent_task_id: str,
+    parent_run_id: int,
+    parent_claim_lock: str,
+    caller_profile: str,
+    title: object,
+    risk: object,
+    repository: object,
+    run_id: object,
+    work_id: object,
+    operation: object,
+    effect: object,
+    allowed_paths: object,
+    required_inputs: object,
+    produced_artifacts: object,
+    inventory_id: object,
+    inventory_consumer: object,
+    scope: object,
+    forbidden_effects: object,
+    expires_at_epoch: object,
+    priority: object = 0,
+    body: object = None,
+    board: Optional[str] = None,
+) -> dict[str, object]:
+    """Bounded Planner→Executor G2 transition adapter.
+
+    This is the production owner for EvidencePacket/FrozenHandoff issuance.
+    The only intended executable call site is the ``kanban_g2_handoff`` tool,
+    which supplies the active dispatcher-worker identity and formats the
+    result.  This adapter reuses the existing policy, route resolver, Kanban
+    create/link transaction, artifact store, runtime loader, and worktree
+    resolver; it creates no new authority, store, scheduler, or schema.
+    """
+
+    from hermes_cli.change_gate_codec import encode_artifact
+    from hermes_cli.change_gate_runtime import (
+        EVIDENCE_ATTACHMENT_FILENAME,
+        HANDOFF_ATTACHMENT_FILENAME,
+        load_task_gate_artifacts,
+        read_current_source_identity,
+        validate_bound_artifacts,
+    )
+
+    child_id: str | None = None
+    action_worktree: Path | None = None
+    action_branch_name: str | None = None
+    action_attachment_dir: Path | None = None
+    committed = False
+    try:
+        if type(risk) is not str:
+            raise ValueError("risk is required")
+        risk_level = RiskLevel(risk)
+        policy = _load_change_gate_policy_unique_yaml()
+        rule = _route_rule_from_canonical_policy(policy, risk_level)
+        route_key = rule.metadata_equals[0][1]
+        route, selected_rule = resolve_route_before_freeze(
+            None,
+            risk=risk_level,
+            automatic=True,
+            metadata={"route_key": route_key},
+            ordered_rules=(rule,),
+        )
+        planner_row = policy["route_matrix"][route_key].get("planner")
+        planner_profile = _selector_from_policy_row(
+            planner_row,
+            expected_role="PLANNER",
+        ).assignee
+        if (_canonical_assignee(caller_profile) or "") != planner_profile:
+            raise PermissionError("caller is not the canonical planner profile")
+
+        runtime_policy, inventory = _load_g2_inventory(
+            _required_g2_text(inventory_id, "inventory_id")
+        )
+        if (
+            getattr(runtime_policy, "planner_assignee", None)
+            and (_canonical_assignee(runtime_policy.planner_assignee) or "") != planner_profile
+        ):
+            raise PermissionError(
+                "runtime planner_assignee conflicts with canonical policy planner"
+            )
+        consumer = _required_g2_text(inventory_consumer, "inventory_consumer")
+        if consumer not in inventory.consumers:
+            raise ValueError("inventory_consumer is not declared by inventory")
+        if inventory.risk is not risk_level:
+            raise ValueError("inventory record does not match requested risk")
+
+        title_text = _required_g2_text(title, "title")
+        if body is not None and type(body) is not str:
+            raise ValueError("body must be a string")
+        body_text = body
+        repository_text = _required_g2_text(repository, "repository")
+        effect_text = _required_g2_text(effect, "effect")
+        scope_values = _required_g2_texts(scope, "scope")
+        forbidden_values = _required_g2_texts(forbidden_effects, "forbidden_effects")
+        if effect_text not in scope_values or effect_text in forbidden_values:
+            raise ValueError("effect must be in scope and outside forbidden_effects")
+        if type(expires_at_epoch) is not int:
+            raise ValueError("expires_at_epoch must be an integer")
+        expires = expires_at_epoch
+        now = int(time.time())
+        if expires <= now or expires - now > MAX_EVIDENCE_LIFETIME_SECONDS:
+            raise ValueError(
+                f"expires_at_epoch must be within {MAX_EVIDENCE_LIFETIME_SECONDS} seconds"
+            )
+        if type(priority) is bool or type(priority) is not int:
+            raise ValueError("priority must be an integer")
+
+        required_bindings = _artifact_bindings_from_list(required_inputs, "required_inputs")
+        produced_bindings = _artifact_bindings_from_list(produced_artifacts, "produced_artifacts")
+
+        with write_txn(conn):
+            parent = get_task(conn, parent_task_id)
+            if parent is None:
+                raise ValueError("active planner task not found")
+            if (
+                parent.status != "running"
+                or parent.current_run_id != int(parent_run_id)
+                or parent.claim_lock != parent_claim_lock
+                or (_canonical_assignee(parent.assignee) or "") != planner_profile
+            ):
+                raise PermissionError("active task is not owned by canonical planner")
+
+            child_id = create_task(
+                conn,
+                title=title_text,
+                body=body_text,
+                assignee=route.executor.assignee,
+                parents=(parent_task_id,),
+                tenant=parent.tenant,
+                priority=priority,
+                workspace_kind="worktree",
+                workspace_path=parent.workspace_path,
+                project_id=parent.project_id,
+                project_source_task_id=parent.id if parent.project_id else None,
+                model_override=route.executor.model_override,
+                provider_override=route.executor.provider_override,
+                reasoning_effort=route.executor.reasoning_effort,
+                initial_status="blocked",
+                created_by=planner_profile,
+                board=board,
+            )
+            child = get_task(conn, child_id)
+            if child is None or child.workspace_kind != "worktree":
+                raise ValueError("kanban_g2_handoff requires a git worktree child")
+            requested = Path(child.workspace_path).expanduser() if child.workspace_path else None
+            for candidate in (
+                requested,
+                (requested / ".worktrees" / child.id) if requested is not None else None,
+                (requested.parent / child.id) if requested is not None else None,
+            ):
+                if candidate is not None and candidate.name == child.id and candidate.exists():
+                    raise ValueError("child worktree path already exists")
+            materialized_path, branch_name = _resolve_worktree_workspace(
+                child,
+                board=board,
+                require_new_branch=True,
+            )
+            action_worktree = materialized_path
+            action_branch_name = branch_name
+            conn.execute(
+                "UPDATE tasks SET workspace_path = ?, branch_name = ? WHERE id = ?",
+                (str(materialized_path.resolve(strict=False)), branch_name, child_id),
+            )
+
+            source_result = read_current_source_identity(str(materialized_path), repository_text)
+            if type(source_result) is not SourceIdentity:
+                raise ValueError(source_result.value)
+            artifact_reason = validate_bound_artifacts(
+                materialized_path,
+                required_bindings + produced_bindings,
+            )
+            if artifact_reason is not ChangeGateReason.ALLOWED:
+                raise ValueError(artifact_reason.value)
+
+            evidence = EvidencePacket(
+                source=source_result,
+                work=WorkIdentity(
+                    task_id=child_id,
+                    run_id=_required_g2_text(run_id, "run_id"),
+                    work_id=_required_g2_text(work_id, "work_id"),
+                    operation=_required_g2_text(operation, "operation"),
+                    effect=effect_text,
+                ),
+                risk=risk_level,
+                route=route,
+                allowed_paths=_required_g2_texts(allowed_paths, "allowed_paths"),
+                required_inputs=required_bindings,
+                produced_artifacts=produced_bindings,
+                inventory_id=inventory.inventory_id,
+                created_at_epoch=now,
+                expires_at_epoch=expires,
+            )
+            handoff = freeze_handoff(
+                evidence,
+                inventory=inventory,
+                inventory_consumer=consumer,
+                scope=scope_values,
+                forbidden_effects=forbidden_values,
+            )
+            evidence_bytes = encode_artifact(evidence)
+            handoff_bytes = encode_artifact(handoff)
+            attachment_dir = task_attachments_dir(child_id, board=board)
+            if attachment_dir.exists():
+                raise ValueError("child attachment directory already exists")
+            action_attachment_dir = attachment_dir
+            evidence_attachment_id = store_attachment_bytes(
+                conn,
+                child_id,
+                EVIDENCE_ATTACHMENT_FILENAME,
+                evidence_bytes,
+                content_type="application/json",
+                uploaded_by="kanban_g2_handoff",
+                board=board,
+                _allow_nested=True,
+            )
+            handoff_attachment_id = store_attachment_bytes(
+                conn,
+                child_id,
+                HANDOFF_ATTACHMENT_FILENAME,
+                handoff_bytes,
+                content_type="application/json",
+                uploaded_by="kanban_g2_handoff",
+                board=board,
+                _allow_nested=True,
+            )
+
+            child_after_route = get_task(conn, child_id)
+            if (
+                child_after_route is None
+                or UpstreamRouteSelector(
+                    assignee=child_after_route.assignee,
+                    model_override=child_after_route.model_override,
+                    provider_override=child_after_route.provider_override,
+                    reasoning_effort=child_after_route.reasoning_effort,
+                ).normalized()
+                != route.executor
+            ):
+                raise ValueError("child selector does not match frozen executor")
+            load = load_task_gate_artifacts(
+                conn,
+                child_id,
+                policy=runtime_policy,
+                attachment_root=task_attachments_dir(child_id, board=board),
+            )
+            if not load.ok:
+                raise ValueError(load.reason.value)
+            if not unblock_task(conn, child_id, _allow_nested=True):
+                raise ValueError("child handoff unblock failed")
+        committed = True
+        child = get_task(conn, child_id)
+        return {
+            "task_id": child_id,
+            "parent_task_id": parent_task_id,
+            "status": child.status if child else None,
+            "assignee": child.assignee if child else None,
+            "workspace_path": child.workspace_path if child else None,
+            "branch_name": child.branch_name if child else None,
+            "evidence_attachment_id": evidence_attachment_id,
+            "handoff_attachment_id": handoff_attachment_id,
+            "evidence_sha256": evidence.digest(),
+            "handoff_sha256": handoff.digest(),
+            "selected_rule": selected_rule,
+            "route_key": route_key,
+        }
+    except Exception:
+        if not committed and child_id is not None:
+            _cleanup_g2_handoff_outputs(
+                action_worktree,
+                action_branch_name,
+                action_attachment_dir,
+            )
+        raise
 
 
 def derive_change_gate_transition_anchor(
@@ -8505,7 +9058,7 @@ def _landing_status_after_parents(conn: sqlite3.Connection, task_id: str) -> str
     return "todo" if undone_parents else "ready"
 
 
-def unblock_task(conn: sqlite3.Connection, task_id: str) -> bool:
+def unblock_task(conn: sqlite3.Connection, task_id: str, *, _allow_nested: bool = False) -> bool:
     """Transition ``blocked``/``scheduled`` to its safe resumable phase.
 
     Defensively closes any stale ``current_run_id`` pointer before flipping
@@ -8516,7 +9069,7 @@ def unblock_task(conn: sqlite3.Connection, task_id: str) -> bool:
     state) holds for the rest of this function's lifetime.
     """
     now = int(time.time())
-    with write_txn(conn):
+    with write_txn(conn, allow_nested=_allow_nested):
         current = conn.execute(
             "SELECT status FROM tasks WHERE id = ?",
             (task_id,),
@@ -9328,16 +9881,31 @@ def _repo_root_for_worktree_target(path: Path) -> Optional[Path]:
         current = current.parent
 
 
-def _ensure_git_worktree(repo_root: Path, target: Path, branch_name: str) -> None:
+def _ensure_git_worktree(
+    repo_root: Path,
+    target: Path,
+    branch_name: str,
+    *,
+    require_new_branch: bool = False,
+) -> None:
     """Materialize ``target`` as a linked git worktree under ``repo_root``."""
     target = target.expanduser()
     repo_common = _git_common_dir(repo_root)
     if target.exists() and repo_common is not None:
         target_common = _git_common_dir(target)
         if target_common == repo_common:
+            if require_new_branch:
+                raise ValueError(
+                    f"fresh worktree target already exists: {target}"
+                )
             return
     target.parent.mkdir(parents=True, exist_ok=True)
-    if _git_branch_exists(repo_root, branch_name):
+    if require_new_branch:
+        cmd = [
+            "git", "-C", str(repo_root), "worktree", "add", "-b", branch_name,
+            str(target), "HEAD",
+        ]
+    elif _git_branch_exists(repo_root, branch_name):
         cmd = ["git", "-C", str(repo_root), "worktree", "add", str(target), branch_name]
     else:
         cmd = [
@@ -9359,7 +9927,10 @@ def _ensure_git_worktree(repo_root: Path, target: Path, branch_name: str) -> Non
 
 
 def _resolve_worktree_workspace(
-    task: Task, *, board: Optional[str] = None
+    task: Task,
+    *,
+    board: Optional[str] = None,
+    require_new_branch: bool = False,
 ) -> tuple[Path, str]:
     """Resolve + materialize a linked git worktree for ``task``.
 
@@ -9398,7 +9969,12 @@ def _resolve_worktree_workspace(
                 f"{board_slug!r} default_workdir {board_default!r} is not inside a git repo"
             )
         target = repo_root / ".worktrees" / task.id
-        _ensure_git_worktree(repo_root, target, branch_name)
+        _ensure_git_worktree(
+            repo_root,
+            target,
+            branch_name,
+            require_new_branch=require_new_branch,
+        )
         return target, branch_name
 
     requested = Path(task.workspace_path).expanduser()
@@ -9411,7 +9987,7 @@ def _resolve_worktree_workspace(
 
     if requested.exists() and _is_linked_worktree_checkout(requested):
         actual_branch = _git_current_branch(requested)
-        if actual_branch == branch_name:
+        if not require_new_branch and actual_branch == branch_name:
             return requested_resolved, actual_branch
         # The requested path is an existing checkout of a DIFFERENT
         # task's branch. Decompose children inherit the root's
@@ -9424,17 +10000,31 @@ def _resolve_worktree_workspace(
         if fallback_root is not None:
             fallback = fallback_root / ".worktrees" / task.id
             if fallback.resolve(strict=False) != requested_resolved:
-                _ensure_git_worktree(fallback_root, fallback, branch_name)
+                _ensure_git_worktree(
+                    fallback_root,
+                    fallback,
+                    branch_name,
+                    require_new_branch=require_new_branch,
+                )
                 return fallback.resolve(strict=False), branch_name
         # No repo to anchor a fallback on (or the occupied path IS this
         # task's own canonical worktree): keep the legacy reuse rather
         # than failing dispatch.
+        if require_new_branch:
+            raise ValueError(
+                f"task {task.id} requires a fresh action-owned worktree"
+            )
         return requested_resolved, actual_branch or branch_name
 
     repo_root = _git_toplevel(requested)
     if repo_root is not None and requested_resolved == repo_root:
         target = repo_root / ".worktrees" / task.id
-        _ensure_git_worktree(repo_root, target, branch_name)
+        _ensure_git_worktree(
+            repo_root,
+            target,
+            branch_name,
+            require_new_branch=require_new_branch,
+        )
         return target, branch_name
 
     repo_root = _repo_root_for_worktree_target(requested.parent)
@@ -9443,7 +10033,12 @@ def _resolve_worktree_workspace(
             f"task {task.id} worktree path {task.workspace_path!r} is not inside a git repo "
             "and does not point at a git repo root"
         )
-    _ensure_git_worktree(repo_root, requested, branch_name)
+    _ensure_git_worktree(
+        repo_root,
+        requested,
+        branch_name,
+        require_new_branch=require_new_branch,
+    )
     return requested, branch_name
 
 

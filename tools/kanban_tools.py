@@ -31,6 +31,7 @@ from __future__ import annotations
 import json
 import logging
 import os
+import time
 from dataclasses import dataclass
 from typing import Any, Optional
 
@@ -134,6 +135,13 @@ def _check_kanban_orchestrator_mode() -> bool:
     if os.environ.get("HERMES_KANBAN_TASK") and _is_dispatcher_owned_worker():
         return False
     return _profile_has_kanban_toolset()
+
+
+def _check_kanban_g2_handoff_mode() -> bool:
+    """Expose G2 issuance only to dispatcher-owned task workers."""
+    if _is_delegated_child_context():
+        return False
+    return bool(os.environ.get("HERMES_KANBAN_TASK") and _is_dispatcher_owned_worker())
 
 
 # ---------------------------------------------------------------------------
@@ -1593,6 +1601,53 @@ def _handle_create(args: dict, **kw) -> str:
         return tool_error(f"kanban_create: {e}")
 
 
+def _handle_g2_handoff(args: dict, **kw) -> str:
+    """Issue one bounded Planner→Executor Change Gate handoff."""
+    delegated_err = _reject_delegated_child_mutation("kanban_g2_handoff")
+    if delegated_err:
+        return delegated_err
+    worker = snapshot_dispatcher_worker_run()
+    if worker is None:
+        return tool_error("kanban_g2_handoff: active dispatcher worker run is required")
+    try:
+        kb, conn = _connect()
+        try:
+            result = kb.issue_change_gate_g2_handoff(
+                conn,
+                parent_task_id=worker.task_id,
+                parent_run_id=worker.run_id,
+                parent_claim_lock=worker.claim_lock,
+                caller_profile=os.environ.get("HERMES_PROFILE") or "",
+                title=args.get("title"),
+                body=args.get("body"),
+                risk=args.get("risk"),
+                repository=args.get("repository"),
+                run_id=args.get("run_id"),
+                work_id=args.get("work_id"),
+                operation=args.get("operation"),
+                effect=args.get("effect"),
+                allowed_paths=args.get("allowed_paths"),
+                required_inputs=args.get("required_inputs"),
+                produced_artifacts=args.get("produced_artifacts"),
+                inventory_id=args.get("inventory_id"),
+                inventory_consumer=args.get("inventory_consumer"),
+                scope=args.get("scope"),
+                forbidden_effects=args.get("forbidden_effects"),
+                expires_at_epoch=args.get("expires_at_epoch"),
+                priority=args.get("priority", 0),
+            )
+            return _ok(**result)
+        finally:
+            conn.close()
+    except ValueError as e:
+        return tool_error(f"kanban_g2_handoff: {e}")
+    except PermissionError as e:
+        return tool_error(f"kanban_g2_handoff: {e}")
+    except Exception as e:
+        logger.exception("kanban_g2_handoff failed")
+        return tool_error(f"kanban_g2_handoff: {e}")
+
+
 def _maybe_auto_subscribe(conn: Any, task_id: str) -> bool:
     """Auto-subscribe the calling session to task completion / block events.
 
@@ -2464,6 +2519,98 @@ KANBAN_CREATE_SCHEMA = {
     },
 }
 
+_G2_ARTIFACT_BINDING_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "path": {"type": "string"},
+        "sha256": {"type": "string"},
+        "role": {"type": "string"},
+        "git_oid": {"type": "string"},
+    },
+    "required": ["path", "sha256", "role"],
+    "additionalProperties": False,
+}
+
+KANBAN_G2_HANDOFF_SCHEMA = {
+    "name": "kanban_g2_handoff",
+    "description": (
+        "Planner-only Gate 2 action: create exactly one Executor child task, "
+        "bind the canonical Change Gate route into EvidencePacket and "
+        "FrozenHandoff attachments, and link the child under the current "
+        "dispatcher-owned planner task. This action is inert outside an "
+        "active canonical planner worker run."
+    ),
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "title": {"type": "string", "description": "Executor child task title."},
+            "body": {"type": "string", "description": "Executor child task body."},
+            "risk": {"type": "string", "enum": ["LOW", "NORMAL", "HIGH"]},
+            "repository": {
+                "type": "string",
+                "description": "Expected source repository name for the child workspace.",
+            },
+            "run_id": {
+                "type": "string",
+                "description": "Explicit frozen WorkIdentity run_id semantics.",
+            },
+            "work_id": {"type": "string"},
+            "operation": {"type": "string"},
+            "effect": {"type": "string"},
+            "allowed_paths": {
+                "type": "array",
+                "items": {"type": "string"},
+                "minItems": 1,
+            },
+            "required_inputs": {
+                "type": "array",
+                "items": _G2_ARTIFACT_BINDING_SCHEMA,
+            },
+            "produced_artifacts": {
+                "type": "array",
+                "items": _G2_ARTIFACT_BINDING_SCHEMA,
+            },
+            "inventory_id": {"type": "string"},
+            "inventory_consumer": {
+                "type": "string",
+                "description": "Existing inventory consumer name to bind into FrozenHandoff.",
+            },
+            "scope": {"type": "array", "items": {"type": "string"}, "minItems": 1},
+            "forbidden_effects": {
+                "type": "array",
+                "items": {"type": "string"},
+                "minItems": 1,
+            },
+            "expires_at_epoch": {
+                "type": "integer",
+                "description": (
+                    "Exact EvidencePacket expiry epoch; must be in the future "
+                    "and no more than 600 seconds from issuance."
+                ),
+            },
+            "priority": {"type": "integer"},
+        },
+        "required": [
+            "title",
+            "risk",
+            "repository",
+            "run_id",
+            "work_id",
+            "operation",
+            "effect",
+            "allowed_paths",
+            "required_inputs",
+            "produced_artifacts",
+            "inventory_id",
+            "inventory_consumer",
+            "scope",
+            "forbidden_effects",
+            "expires_at_epoch",
+        ],
+        "additionalProperties": False,
+    },
+}
+
 KANBAN_UNBLOCK_SCHEMA = {
     "name": "kanban_unblock",
     "description": (
@@ -2618,6 +2765,15 @@ registry.register(
     handler=_handle_create,
     check_fn=_check_kanban_mode,
     emoji="➕",
+)
+
+registry.register(
+    name="kanban_g2_handoff",
+    toolset="kanban",
+    schema=KANBAN_G2_HANDOFF_SCHEMA,
+    handler=_handle_g2_handoff,
+    check_fn=_check_kanban_g2_handoff_mode,
+    emoji="🧊",
 )
 
 registry.register(

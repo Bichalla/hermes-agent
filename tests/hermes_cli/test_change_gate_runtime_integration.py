@@ -332,6 +332,14 @@ def _snapshot(conn: sqlite3.Connection, task_id: str) -> dict[str, object]:
         "SELECT status, assignee, claim_lock, current_run_id FROM tasks WHERE id = ?",
         (task_id,),
     ).fetchone()
+    release_count = (
+        conn.execute(
+            "SELECT COUNT(*) FROM change_gate_releases WHERE task_id = ?",
+            (task_id,),
+        ).fetchone()[0]
+        if kb.change_gate_runtime_schema_exists(conn)
+        else 0
+    )
     return {
         "task": tuple(task),
         "runs": conn.execute(
@@ -342,6 +350,15 @@ def _snapshot(conn: sqlite3.Connection, task_id: str) -> dict[str, object]:
             "SELECT COUNT(*) FROM task_events WHERE task_id = ?",
             (task_id,),
         ).fetchone()[0],
+        "links": conn.execute(
+            "SELECT COUNT(*) FROM task_links WHERE parent_id = ? OR child_id = ?",
+            (task_id, task_id),
+        ).fetchone()[0],
+        "attachments": conn.execute(
+            "SELECT COUNT(*) FROM task_attachments WHERE task_id = ?",
+            (task_id,),
+        ).fetchone()[0],
+        "releases": release_count,
     }
 
 
@@ -580,6 +597,44 @@ def test_enabled_dispatcher_denial_has_no_claim_event_or_spawn(
             (task_id, ChangeGateReason.RELEASE_MISSING.value)
         ]
         assert _snapshot(conn, task_id) == before
+
+
+def test_worker_provenance_failure_precedes_claim_and_provider(
+    tmp_path: Path,
+    isolated_home: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    with _connect(tmp_path / "kanban.db") as conn:
+        task_id = _create_ready_task(conn)
+        fixture = _attach_runtime_artifacts(conn, tmp_path, task_id)
+        _enable_runtime(monkeypatch, tmp_path / "inventory")
+        release_id = _store_release(
+            conn,
+            fixture,
+            ReleasePurpose.CLAIM,
+            "f",
+        )
+        before = _snapshot(conn, task_id)
+
+        def fail_provenance():
+            raise RuntimeError("worker_runtime_provenance:g2_registry_mismatch")
+
+        monkeypatch.setattr(kb, "_read_worker_runtime_provenance", fail_provenance)
+        monkeypatch.setattr(
+            kb,
+            "_default_spawn",
+            lambda *_args, **_kwargs: pytest.fail("provider process was reached"),
+        )
+
+        result = kb.dispatch_once(conn, reconcile_orphans=False)
+
+        assert result.spawned == []
+        assert result.worker_provenance_denied == [
+            (task_id, "worker_runtime_provenance:g2_registry_mismatch")
+        ]
+        assert _snapshot(conn, task_id) == before
+        state = kb.change_gate_release_state(conn, release_id)
+        assert state is not None and state["state"] == "ISSUED"
 
 
 def test_initial_blocked_change_gate_task_does_not_dispatch_while_artifacts_attach(

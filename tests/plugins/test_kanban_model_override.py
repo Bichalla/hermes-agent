@@ -118,7 +118,7 @@ def test_migration_adds_provider_override_column(conn):
 
 
 def _spawn_and_capture(monkeypatch, tmp_path, task):
-    monkeypatch.setattr(kb, "_resolve_hermes_argv", lambda: ["hermes"])
+    runtime_provenance = kb._read_worker_runtime_provenance()
     captured = {}
 
     class FakeProc:
@@ -131,7 +131,11 @@ def _spawn_and_capture(monkeypatch, tmp_path, task):
     monkeypatch.setattr(subprocess, "Popen", fake_popen)
     workspace = tmp_path / "ws"
     workspace.mkdir(exist_ok=True)
-    kb._default_spawn(task, str(workspace))
+    kb._default_spawn(
+        task,
+        str(workspace),
+        runtime_provenance=runtime_provenance,
+    )
     return captured["cmd"]
 
 
@@ -142,7 +146,7 @@ def test_spawn_passes_model_and_provider(monkeypatch, tmp_path, conn):
     )
     task = kb.get_task(conn, tid)
     cmd = _spawn_and_capture(monkeypatch, tmp_path, task)
-    i = cmd.index("-m")
+    i = cmd.index("-m", 3)
     assert cmd[i + 1] == "glm-5"
     j = cmd.index("--provider")
     assert j == i + 2
@@ -255,7 +259,7 @@ def test_spawn_passes_reasoning_without_a_model(monkeypatch, tmp_path, conn):
     tid = kb.create_task(conn, title="t", assignee="elias", reasoning_effort="high")
     task = kb.get_task(conn, tid)
     cmd = _spawn_and_capture(monkeypatch, tmp_path, task)
-    assert "-m" not in cmd
+    assert "-m" not in cmd[3:]
     i = cmd.index("--reasoning")
     assert cmd[i + 1] == "high"
 

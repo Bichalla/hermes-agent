@@ -33,6 +33,7 @@ def test_worker_spawn_tags_session_source_kanban(monkeypatch, tmp_path):
         captured["env"] = kwargs["env"]
         return _Proc()
 
+    runtime_provenance = kb._read_worker_runtime_provenance()
     monkeypatch.setattr("subprocess.Popen", _fake_popen)
     monkeypatch.setattr(kb, "_retag_legacy_worker_sessions", lambda _root: None)
     monkeypatch.setattr(kb, "worker_logs_dir", lambda board=None: tmp_path / "logs")
@@ -57,7 +58,11 @@ def test_worker_spawn_tags_session_source_kanban(monkeypatch, tmp_path):
     workspace = str(tmp_path / "ws")
     os.makedirs(workspace, exist_ok=True)
 
-    kb._default_spawn(task, workspace)
+    kb._default_spawn(
+        task,
+        workspace,
+        runtime_provenance=runtime_provenance,
+    )
 
     assert captured["env"]["HERMES_SESSION_SOURCE"] == "kanban"
 

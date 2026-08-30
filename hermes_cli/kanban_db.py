@@ -397,6 +397,7 @@ def _fire_dispatch_tick_hook(
             result.rate_limited,
             result.auto_assigned_default,
             result.change_gate_denied,
+            result.worker_provenance_denied,
             result.respawn_guarded,
             result.skipped_per_profile_capped,
             result.skipped_unassigned,
@@ -4781,6 +4782,55 @@ def issue_change_gate_g2_handoff(
             ):
                 raise PermissionError("active task is not owned by canonical planner")
 
+            duplicate = conn.execute(
+                "SELECT l.child_id FROM task_links l "
+                "JOIN task_attachments e ON e.task_id = l.child_id "
+                "AND e.filename = ? "
+                "JOIN task_attachments h ON h.task_id = l.child_id "
+                "AND h.filename = ? "
+                "WHERE l.parent_id = ? LIMIT 1",
+                (
+                    EVIDENCE_ATTACHMENT_FILENAME,
+                    HANDOFF_ATTACHMENT_FILENAME,
+                    parent_task_id,
+                ),
+            ).fetchone()
+            if duplicate is not None:
+                raise PermissionError(
+                    "active planner run already issued a G2 handoff"
+                )
+
+            parent_load = load_task_gate_artifacts(
+                conn,
+                parent_task_id,
+                policy=runtime_policy,
+                attachment_root=task_attachments_dir(parent_task_id, board=board),
+            )
+            if not parent_load.ok or parent_load.artifacts is None:
+                raise PermissionError(
+                    "active planner Change Gate artifacts are invalid: "
+                    f"{parent_load.reason.value}"
+                )
+            parent_artifacts = parent_load.artifacts
+            if (
+                parent_artifacts.evidence.risk is not risk_level
+                or parent_artifacts.inventory.inventory_id != inventory.inventory_id
+                or parent_artifacts.actual_source.repository != repository_text
+            ):
+                raise PermissionError(
+                    "G2 request does not match the active planner frozen lineage"
+                )
+            if _consumed_change_gate_claim_for_active_run(
+                conn,
+                task_id=parent_task_id,
+                run_id=parent_run_id,
+                claim_lock=parent_claim_lock,
+                artifacts=parent_artifacts,
+            ) is None:
+                raise PermissionError(
+                    "active planner run lacks exact consumed CLAIM provenance"
+                )
+
             child_id = create_task(
                 conn,
                 title=title_text,
@@ -5471,6 +5521,150 @@ def _load_change_gate_release(
     ):
         return None
     return decoded.value
+
+
+def _consumed_change_gate_claim_for_active_run(
+    conn: sqlite3.Connection,
+    *,
+    task_id: str,
+    run_id: int,
+    claim_lock: str,
+    artifacts: object,
+) -> DurableReleaseArtifact | None:
+    """Read back the one CLAIM consumed by the exact active worker run.
+
+    A consumed release is evidence, never reusable transition authority. This
+    helper therefore does not call the pre-transition evaluator or accept a
+    caller-supplied anchor. It proves that the protected release row, its
+    canonical artifact, the ready->running event, the live task/run ownership,
+    and the currently re-observed frozen artifacts all describe one lineage.
+    """
+
+    from hermes_cli.change_gate_runtime import TaskGateArtifacts
+
+    if (
+        type(task_id) is not str
+        or not task_id
+        or type(run_id) is not int
+        or run_id < 1
+        or type(claim_lock) is not str
+        or not claim_lock
+        or type(artifacts) is not TaskGateArtifacts
+        or artifacts.evidence.work.task_id != task_id
+        or not change_gate_runtime_schema_exists(conn)
+    ):
+        return None
+    rows = conn.execute(
+        "SELECT release_id, state, issued_at, expires_at, max_consumptions, "
+        "consumed_at, "
+        "consumed_run_id, consumed_event_id, consumed_from_status, "
+        "consumed_to_status FROM change_gate_releases "
+        "WHERE task_id = ? AND purpose = ? AND state = 'CONSUMED' "
+        "AND consumed_run_id = ? ORDER BY rowid ASC",
+        (task_id, ReleasePurpose.CLAIM.value, run_id),
+    ).fetchall()
+    if len(rows) != 1:
+        return None
+    row = rows[0]
+    release = _load_change_gate_release(conn, row["release_id"])
+    if release is None:
+        return None
+    try:
+        release_reason = validate_durable_release_artifact(
+            release,
+            purpose=ReleasePurpose.CLAIM,
+            evidence=artifacts.evidence,
+            handoff=artifacts.handoff,
+            now_epoch=release.issued_at_epoch,
+            require_unexpired=False,
+            expected_transition_anchor=release.transition_anchor,
+        )
+        inventory_sha256 = artifacts.inventory.digest()
+    except (TypeError, ValueError):
+        return None
+    if (
+        release_reason is not ChangeGateReason.ALLOWED
+        or release.task_id != task_id
+        or release.max_consumptions != 1
+        or release.inventory_sha256 != inventory_sha256
+        or release.transition_anchor.status != "ready"
+        or release.transition_anchor.current_run_id is not None
+        or row["state"] != "CONSUMED"
+        or type(row["issued_at"]) is not int
+        or row["issued_at"] != release.issued_at_epoch
+        or type(row["expires_at"]) is not int
+        or row["expires_at"] != release.expires_at_epoch
+        or row["max_consumptions"] != 1
+        or type(row["consumed_at"]) is not int
+        or row["consumed_at"] < release.issued_at_epoch
+        or row["consumed_at"] >= release.expires_at_epoch
+        or row["consumed_run_id"] != run_id
+        or type(row["consumed_event_id"]) is not int
+        or row["consumed_from_status"] != "ready"
+        or row["consumed_to_status"] != "running"
+    ):
+        return None
+
+    task_row = conn.execute(
+        "SELECT status, assignee, model_override, provider_override, "
+        "reasoning_effort, current_run_id, claim_lock, claim_expires "
+        "FROM tasks WHERE id = ?",
+        (task_id,),
+    ).fetchone()
+    run_row = conn.execute(
+        "SELECT task_id, profile, status, claim_lock, claim_expires, ended_at "
+        "FROM task_runs WHERE id = ?",
+        (run_id,),
+    ).fetchone()
+    event_row = conn.execute(
+        "SELECT task_id, run_id, kind, payload FROM task_events WHERE id = ?",
+        (row["consumed_event_id"],),
+    ).fetchone()
+    claimed_event_count = conn.execute(
+        "SELECT COUNT(*) FROM task_events "
+        "WHERE task_id = ? AND run_id = ? AND kind = 'claimed'",
+        (task_id, run_id),
+    ).fetchone()[0]
+    if (
+        task_row is None
+        or run_row is None
+        or event_row is None
+        or claimed_event_count != 1
+    ):
+        return None
+    try:
+        actual_route = UpstreamRouteSelector(
+            assignee=task_row["assignee"],
+            model_override=task_row["model_override"],
+            provider_override=task_row["provider_override"],
+            reasoning_effort=task_row["reasoning_effort"],
+        ).normalized()
+        payload = json.loads(event_row["payload"])
+    except (TypeError, ValueError, json.JSONDecodeError):
+        return None
+    anchor_event_id = release.transition_anchor.latest_event_id
+    return release if (
+        task_row["status"] == "running"
+        and task_row["current_run_id"] == run_id
+        and task_row["claim_lock"] == claim_lock
+        and type(task_row["claim_expires"]) is int
+        and actual_route == artifacts.actual_route.normalized()
+        and run_row["task_id"] == task_id
+        and run_row["profile"] == task_row["assignee"]
+        and run_row["status"] == "running"
+        and run_row["claim_lock"] == claim_lock
+        and run_row["claim_expires"] == task_row["claim_expires"]
+        and run_row["ended_at"] is None
+        and event_row["task_id"] == task_id
+        and event_row["run_id"] == run_id
+        and event_row["kind"] == "claimed"
+        and type(payload) is dict
+        and set(payload) == {"lock", "expires", "run_id"}
+        and payload["lock"] == claim_lock
+        and payload["expires"] == task_row["claim_expires"]
+        and payload["run_id"] == run_id
+        and (anchor_event_id is None or row["consumed_event_id"] > anchor_event_id)
+    ) else None
 
 
 def latest_change_gate_release_id(
@@ -10284,6 +10478,13 @@ class DispatchResult:
     deliberately non-durable; the immutable inputs and release row remain the
     evidence, while a later valid release can make the same task eligible.
     """
+    worker_provenance_denied: list[tuple[str, str]] = field(default_factory=list)
+    """Production worker spawns rejected before CLAIM or any provider action.
+
+    Each pair is ``(task_id, bounded_reason)``. The check is read-only and
+    proves the dispatcher-bound interpreter, source modules, and G2 registry;
+    a mismatch leaves the task and its unconsumed release untouched.
+    """
     rate_limited: list[str] = field(default_factory=list)
     """Task ids whose workers bailed on a provider rate-limit / quota wall
     (EX_TEMPFAIL sentinel exit) and were released back to ``ready`` WITHOUT
@@ -12377,6 +12578,14 @@ def _dispatch_once_locked(
                         board=board,
                     )
                 continue
+        worker_provenance = None
+        if spawn_fn is None:
+            try:
+                worker_provenance = _read_worker_runtime_provenance()
+            except Exception as exc:
+                reason = str(exc)[:256] or "worker_runtime_provenance_invalid"
+                result.worker_provenance_denied.append((row["id"], reason))
+                continue
         row_assignee = row["assignee"]
         if not row_assignee:
             # Honour kanban.default_assignee: when the dispatcher hits an
@@ -12517,20 +12726,26 @@ def _dispatch_once_locked(
         if claimed.workspace_kind == "worktree":
             set_branch_name(conn, claimed.id, resolved_branch_name or (claimed.branch_name or "").strip() or f"wt/{claimed.id}")
         _maybe_emit_scratch_tip(conn, claimed.id, claimed.workspace_kind)
-        _spawn = spawn_fn if spawn_fn is not None else _default_spawn
         try:
-            # Back-compat: older spawn_fn signatures accept only
-            # (task, workspace). Test stubs in the suite rely on that.
-            # Introspect the callable and pass `board` only when supported.
-            import inspect
-            try:
-                sig = inspect.signature(_spawn)
-                if "board" in sig.parameters:
-                    pid = _spawn(claimed, str(workspace), board=board)
-                else:
-                    pid = _spawn(claimed, str(workspace))
-            except (TypeError, ValueError):
-                pid = _spawn(claimed, str(workspace))
+            if spawn_fn is None:
+                pid = _default_spawn(
+                    claimed,
+                    str(workspace),
+                    board=board,
+                    runtime_provenance=worker_provenance,
+                )
+            else:
+                # Back-compat: older spawn_fn signatures accept only
+                # (task, workspace). Test stubs in the suite rely on that.
+                import inspect
+                try:
+                    sig = inspect.signature(spawn_fn)
+                    if "board" in sig.parameters:
+                        pid = spawn_fn(claimed, str(workspace), board=board)
+                    else:
+                        pid = spawn_fn(claimed, str(workspace))
+                except (TypeError, ValueError):
+                    pid = spawn_fn(claimed, str(workspace))
             if pid:
                 _set_worker_pid(conn, claimed.id, int(pid))
             # Worker-lifecycle observer (RFC #58548): fires AFTER spawn_fn
@@ -12598,6 +12813,14 @@ def _dispatch_once_locked(
                 result.change_gate_denied.append(
                     (row["id"], review_gate.reason.value)
                 )
+                continue
+        worker_provenance = None
+        if spawn_fn is None:
+            try:
+                worker_provenance = _read_worker_runtime_provenance()
+            except Exception as exc:
+                reason = str(exc)[:256] or "worker_runtime_provenance_invalid"
+                result.worker_provenance_denied.append((row["id"], reason))
                 continue
         if not row["assignee"]:
             result.skipped_unassigned.append(row["id"])
@@ -12669,17 +12892,24 @@ def _dispatch_once_locked(
         claimed.skills = list(
             dict.fromkeys([*(claimed.skills or []), "sdlc-review"])
         )
-        _spawn = spawn_fn if spawn_fn is not None else _default_spawn
         try:
-            import inspect
-            try:
-                sig = inspect.signature(_spawn)
-                if "board" in sig.parameters:
-                    pid = _spawn(claimed, str(workspace), board=board)
-                else:
-                    pid = _spawn(claimed, str(workspace))
-            except (TypeError, ValueError):
-                pid = _spawn(claimed, str(workspace))
+            if spawn_fn is None:
+                pid = _default_spawn(
+                    claimed,
+                    str(workspace),
+                    board=board,
+                    runtime_provenance=worker_provenance,
+                )
+            else:
+                import inspect
+                try:
+                    sig = inspect.signature(spawn_fn)
+                    if "board" in sig.parameters:
+                        pid = spawn_fn(claimed, str(workspace), board=board)
+                    else:
+                        pid = spawn_fn(claimed, str(workspace))
+                except (TypeError, ValueError):
+                    pid = spawn_fn(claimed, str(workspace))
             if pid:
                 _set_worker_pid(conn, claimed.id, int(pid))
             # Worker-lifecycle observer (RFC #58548): same contract as the
@@ -12793,111 +13023,136 @@ def _module_hermes_argv() -> list[str]:
     return [sys.executable, "-m", "hermes_cli.main"]
 
 
-def _absolute_hermes_path(path: str) -> str:
-    """Return an absolute filesystem path for a resolved Hermes shim."""
-    expanded = os.path.expanduser(path)
-    return expanded if os.path.isabs(expanded) else os.path.abspath(expanded)
+@dataclass(frozen=True, slots=True)
+class WorkerRuntimeProvenance:
+    """Read-only receipt for the exact code used by a dispatcher worker."""
+
+    argv: tuple[str, str, str]
+    interpreter: str
+    interpreter_realpath: str
+    source_root: str
+    source_commit: str | None
+    source_tree: str | None
+    module_identities: tuple[tuple[str, str, str], ...]
+    runtime_identity_sha256: str
+    g2_tool_name: str
+    g2_toolset: str
 
 
-def _looks_like_path(value: str) -> bool:
-    """Return true when a command override is an explicit path, not a name."""
-    expanded = os.path.expanduser(value)
-    return (
-        expanded.startswith("~")
-        or os.path.isabs(expanded)
-        or bool(os.path.dirname(expanded))
-        or "\\" in expanded
-        or bool(re.match(r"^[A-Za-z]:", expanded))
+def _read_worker_source_git_object(source_root: Path, revision: str) -> str | None:
+    """Read one exact Git object identity without making Git state changes."""
+
+    try:
+        result = subprocess.run(
+            ["git", "-C", str(source_root), "rev-parse", "--verify", revision],
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="strict",
+            timeout=5,
+            check=False,
+        )
+    except (OSError, subprocess.SubprocessError, UnicodeError):
+        return None
+    value = (result.stdout or "").strip().lower()
+    if (
+        result.returncode != 0
+        or len(value) not in (40, 64)
+        or any(character not in "0123456789abcdef" for character in value)
+    ):
+        return None
+    return value
+
+
+def _read_worker_runtime_provenance() -> WorkerRuntimeProvenance:
+    """Prove interpreter, source, and G2 registry before any worker CLAIM."""
+
+    import importlib.util
+
+    import toolsets as toolsets_module
+    from tools import kanban_tools
+    from tools.registry import registry
+
+    argv = tuple(_resolve_hermes_argv())
+    if argv != (sys.executable, "-m", "hermes_cli.main"):
+        raise RuntimeError("worker_runtime_provenance:argv_not_interpreter_bound")
+    interpreter = Path(sys.executable).expanduser()
+    if not interpreter.is_absolute() or not interpreter.is_file():
+        raise RuntimeError("worker_runtime_provenance:interpreter_unresolved")
+    source_root = Path(__file__).resolve().parent.parent
+    source_commit = _read_worker_source_git_object(source_root, "HEAD")
+    source_tree = _read_worker_source_git_object(source_root, "HEAD^{tree}")
+    module_identities: list[tuple[str, str, str]] = []
+    for module_name in (
+        "hermes_cli",
+        "hermes_cli.main",
+        "hermes_cli.kanban_db",
+        "tools.registry",
+        "tools.kanban_tools",
+        "toolsets",
+    ):
+        spec = importlib.util.find_spec(module_name)
+        if spec is None or type(spec.origin) is not str:
+            raise RuntimeError(
+                f"worker_runtime_provenance:module_unresolved:{module_name}"
+            )
+        module_path = Path(spec.origin).resolve()
+        try:
+            relative_path = module_path.relative_to(source_root).as_posix()
+            module_sha256 = hashlib.sha256(module_path.read_bytes()).hexdigest()
+        except (OSError, ValueError):
+            raise RuntimeError(
+                f"worker_runtime_provenance:module_outside_source:{module_name}"
+            ) from None
+        module_identities.append((module_name, relative_path, module_sha256))
+
+    entry = registry.snapshot_registration("kanban_g2_handoff")
+    active_entry = registry.get_entry("kanban_g2_handoff")
+    if (
+        entry is None
+        or active_entry is not entry
+        or entry.name != "kanban_g2_handoff"
+        or entry.toolset != "kanban"
+        or entry.schema is not kanban_tools.KANBAN_G2_HANDOFF_SCHEMA
+        or entry.handler is not kanban_tools._handle_g2_handoff
+        or entry.check_fn is not kanban_tools._check_kanban_g2_handoff_mode
+        or "kanban_g2_handoff"
+        not in toolsets_module.resolve_toolset("kanban", include_registry=False)
+    ):
+        raise RuntimeError("worker_runtime_provenance:g2_registry_mismatch")
+    runtime_identity_sha256 = canonical_sha256(
+        {
+            "argv": argv,
+            "interpreter_realpath": str(interpreter.resolve()),
+            "source_root": str(source_root),
+            "source_commit": source_commit,
+            "source_tree": source_tree,
+            "module_identities": module_identities,
+            "g2_tool_name": entry.name,
+            "g2_toolset": entry.toolset,
+        }
+    )
+    return WorkerRuntimeProvenance(
+        argv=argv,
+        interpreter=str(interpreter),
+        interpreter_realpath=str(interpreter.resolve()),
+        source_root=str(source_root),
+        source_commit=source_commit,
+        source_tree=source_tree,
+        module_identities=tuple(module_identities),
+        runtime_identity_sha256=runtime_identity_sha256,
+        g2_tool_name=entry.name,
+        g2_toolset=entry.toolset,
     )
 
 
-def _is_windows_batch_shim(path: str) -> bool:
-    """Return true for Windows shell/batch shims that should not be argv[0]."""
-    return path.lower().endswith((".cmd", ".bat"))
-
-
-def _path_search_names(command: str) -> list[str]:
-    """Return executable names to try for an unqualified command."""
-    if not _IS_WINDOWS or os.path.splitext(command)[1]:
-        return [command]
-    raw = os.environ.get("PATHEXT") or ".COM;.EXE;.BAT;.CMD"
-    exts = [ext for ext in raw.split(";") if ext]
-    return [command + ext for ext in exts]
-
-
-def _safe_which_no_cwd(command: str) -> Optional[str]:
-    """Resolve a bare command from PATH without implicit current-dir search.
-
-    ``shutil.which`` follows platform search behavior. On Windows that can
-    include the current directory before PATH for bare names, which is not a
-    safe dispatcher primitive. This resolver only considers explicit PATH
-    entries and skips empty / ``.`` entries.
-    """
-    path_env = os.environ.get("PATH", "")
-    for raw_dir in path_env.split(os.pathsep):
-        if not raw_dir or raw_dir == ".":
-            continue
-        directory = os.path.expanduser(raw_dir)
-        for name in _path_search_names(command):
-            candidate = os.path.join(directory, name)
-            if not os.path.isfile(candidate):
-                continue
-            if _IS_WINDOWS or os.access(candidate, os.X_OK):
-                return candidate
-    return None
-
-
-def _hermes_path_argv(path: str) -> list[str]:
-    """Return argv for a resolved Hermes executable path.
-
-    Windows batch shims (`.cmd` / `.bat`) are not safe as argv[0] for
-    worker launches because the argument vector includes task-derived
-    values. Prefer the interpreter-bound module form whenever the resolved
-    executable is only a shell shim.
-    """
-    if _IS_WINDOWS and _is_windows_batch_shim(path):
-        return _module_hermes_argv()
-    return [_absolute_hermes_path(path)]
-
-
 def _resolve_hermes_argv() -> list[str]:
-    """Resolve the ``hermes`` invocation as argv parts for ``Popen``.
+    """Pin workers to the dispatcher's current interpreter and source runtime.
 
-    Tries in order:
-
-    1. ``$HERMES_BIN`` — explicit operator override. Path-like values are
-       normalized to absolute paths; bare command names keep normal PATH
-       semantics and never prefer a same-directory file before ``PATH``.
-    2. ``shutil.which("hermes")`` — the console-script shim, normalized to
-       an absolute path. On Windows, ``which`` can return a relative
-       ``.\\hermes.CMD`` when the current directory is on ``PATH``; directly
-       launching batch shims is also unsafe with task-derived argv. The
-       dispatcher therefore falls back to the interpreter-bound module form
-       for implicit ``.cmd`` / ``.bat`` shims.
-    3. ``sys.executable -m hermes_cli.main`` — fallback for setups where
-       Hermes is launched from a venv and the ``hermes`` shim is not on
-       the dispatcher's ``$PATH`` (cron, systemd ``User=`` services,
-       launchd jobs, detached processes, etc.). Goes through the running
-       interpreter so the result is independent of ``$PATH``.
-
-    Mirrors ``gateway.run._resolve_hermes_bin`` for the same reason. Kept
-    local (not imported from gateway) because ``hermes_cli`` sits below
-    ``gateway`` in the dependency order.
+    ``HERMES_BIN`` and ``PATH`` are intentionally irrelevant here: allowing a
+    long-lived Gateway to find another version's console shim lets a verified
+    runtime claim a task and then execute it with different code.
     """
-    import shutil
-
-    env_bin = os.environ.get("HERMES_BIN", "").strip()
-    if env_bin:
-        if _looks_like_path(env_bin):
-            return _hermes_path_argv(env_bin)
-        resolved_env_bin = _safe_which_no_cwd(env_bin)
-        if resolved_env_bin:
-            return _hermes_path_argv(resolved_env_bin)
-        return _module_hermes_argv()
-
-    hermes_bin = _safe_which_no_cwd("hermes") if _IS_WINDOWS else shutil.which("hermes")
-    if hermes_bin:
-        return _hermes_path_argv(hermes_bin)
     return _module_hermes_argv()
 
 
@@ -12996,6 +13251,7 @@ def _default_spawn(
     workspace: str,
     *,
     board: Optional[str] = None,
+    runtime_provenance: WorkerRuntimeProvenance,
 ) -> Optional[int]:
     """Fire-and-forget ``hermes -p <profile> chat -q ...`` subprocess.
 
@@ -13015,10 +13271,20 @@ def _default_spawn(
 
     from hermes_cli.profiles import normalize_profile_name
 
+    if type(runtime_provenance) is not WorkerRuntimeProvenance:
+        raise RuntimeError("worker_runtime_provenance:preclaim_receipt_required")
+    provenance = runtime_provenance
+
     profile_arg = normalize_profile_name(task.assignee)
 
     prompt = f"work kanban task {task.id}"
     env = dict(os.environ)
+    existing_pythonpath = env.get("PYTHONPATH", "")
+    env["PYTHONPATH"] = provenance.source_root + (
+        os.pathsep + existing_pythonpath if existing_pythonpath else ""
+    )
+    env["PYTHONSAFEPATH"] = "1"
+    env["PYTHONNOUSERSITE"] = "1"
     # The dispatcher is detached from every conversation. Its worker must never
     # inherit routing mirrored by a previous gateway turn, even before the first
     # session binds ContextVars in this process.
@@ -13124,7 +13390,7 @@ def _default_spawn(
     env.pop("HERMES_TUI", None)
 
     cmd = [
-        *_resolve_hermes_argv(),
+        *provenance.argv,
         "-p", profile_arg,
         "--cli",
         # Worker subprocesses switch to a profile-scoped HERMES_HOME above,

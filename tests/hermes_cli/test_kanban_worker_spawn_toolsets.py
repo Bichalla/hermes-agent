@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import subprocess
+import sys
 
 
 def _make_task(kb, *, assignee: str):
@@ -61,8 +62,6 @@ agent:
 
     from hermes_cli import kanban_db as kb
 
-    monkeypatch.setattr(kb, "_resolve_hermes_argv", lambda: ["hermes"])
-
     captured = {}
 
     class FakeProc:
@@ -74,11 +73,16 @@ agent:
         captured["cwd"] = kwargs.get("cwd")
         return FakeProc()
 
+    runtime_provenance = kb._read_worker_runtime_provenance()
     monkeypatch.setattr(subprocess, "Popen", fake_popen)
 
     workspace = tmp_path / "workspace"
     workspace.mkdir()
-    pid = kb._default_spawn(_make_task(kb, assignee="elias"), str(workspace))
+    pid = kb._default_spawn(
+        _make_task(kb, assignee="elias"),
+        str(workspace),
+        runtime_provenance=runtime_provenance,
+    )
 
     assert pid == 4242
     assert captured["env"]["HERMES_HOME"] == str(profile)
@@ -104,7 +108,6 @@ def test_default_spawn_model_override_survives_real_cli_parse(monkeypatch, tmp_p
     from hermes_cli import kanban_db as kb
     from hermes_cli._parser import build_top_level_parser
 
-    monkeypatch.setattr(kb, "_resolve_hermes_argv", lambda: ["hermes"])
     captured = {}
 
     class FakeProc:
@@ -114,20 +117,26 @@ def test_default_spawn_model_override_survives_real_cli_parse(monkeypatch, tmp_p
         captured["cmd"] = list(cmd)
         return FakeProc()
 
+    runtime_provenance = kb._read_worker_runtime_provenance()
     monkeypatch.setattr(subprocess, "Popen", fake_popen)
 
     workspace = tmp_path / "workspace"
     workspace.mkdir()
     task = _make_task(kb, assignee="elias")
     task.model_override = "gpt-5.6-sol"
-    kb._default_spawn(task, str(workspace))
+    kb._default_spawn(
+        task,
+        str(workspace),
+        runtime_provenance=runtime_provenance,
+    )
 
     parser, _subparsers, _chat_parser = build_top_level_parser()
     # Profile selection is attached by the outer CLI bootstrap rather than
     # build_top_level_parser(); remove that already-validated prefix and parse
     # the worker flags/subcommand through the real shared parser.
-    assert captured["cmd"][1:3] == ["-p", "elias"]
-    args = parser.parse_args(captured["cmd"][3:])
+    assert captured["cmd"][:3] == [sys.executable, "-m", "hermes_cli.main"]
+    assert captured["cmd"][3:5] == ["-p", "elias"]
+    args = parser.parse_args(captured["cmd"][5:])
 
     assert args.command == "chat"
     assert args.model == "gpt-5.6-sol"

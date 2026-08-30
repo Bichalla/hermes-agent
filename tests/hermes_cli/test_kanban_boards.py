@@ -254,6 +254,7 @@ class TestWorkerSpawnEnv:
             captured["env"] = kwargs.get("env", {})
             return FakeProc()
 
+        runtime_provenance = kb._read_worker_runtime_provenance()
         monkeypatch.setattr(subprocess, "Popen", fake_popen)
         kb.create_board("spawntest")
 
@@ -275,9 +276,18 @@ class TestWorkerSpawnEnv:
             tenant=None,
         )
 
-        kb._default_spawn(task, str(fresh_home / "ws"), board="spawntest")
+        kb._default_spawn(
+            task,
+            str(fresh_home / "ws"),
+            board="spawntest",
+            runtime_provenance=runtime_provenance,
+        )
 
         env = captured["env"]
+        assert captured["cmd"][:3] == [sys.executable, "-m", "hermes_cli.main"]
+        assert env["PYTHONSAFEPATH"] == "1"
+        assert env["PYTHONNOUSERSITE"] == "1"
+        assert env["PYTHONPATH"].split(os.pathsep)[0] == str(_WORKTREE)
         assert env["HERMES_KANBAN_BOARD"] == "spawntest"
         assert env["HERMES_KANBAN_TASK"] == "t_abc"
         # DB path should match the per-board DB, not the legacy default.
@@ -341,6 +351,4 @@ class TestCLI:
         assert titlesA == ["Task A"]
         assert titlesB == ["Task B"]
         assert titlesD == []
-
-
 

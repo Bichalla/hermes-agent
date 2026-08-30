@@ -38,9 +38,8 @@ def _make_task(kb, *, assignee: str = "w"):
 
 
 def _capture_spawn_env(kb, monkeypatch, workspace: str) -> dict:
-    monkeypatch.setattr(kb, "_resolve_hermes_argv", lambda: ["hermes"])
-
     captured: dict = {}
+    runtime_provenance = kb._read_worker_runtime_provenance()
 
     class FakeProc:
         pid = 4242
@@ -52,7 +51,11 @@ def _capture_spawn_env(kb, monkeypatch, workspace: str) -> dict:
         return FakeProc()
 
     monkeypatch.setattr(subprocess, "Popen", fake_popen)
-    kb._default_spawn(_make_task(kb), workspace)
+    kb._default_spawn(
+        _make_task(kb),
+        workspace,
+        runtime_provenance=runtime_provenance,
+    )
     return captured
 
 
@@ -75,5 +78,3 @@ def test_terminal_cwd_pinned_to_workspace(monkeypatch, tmp_path):
     # The subprocess cwd and TERMINAL_CWD must agree — both anchor the workspace.
     assert captured["cwd"] == str(workspace)
     assert captured["env"]["HERMES_KANBAN_WORKSPACE"] == str(workspace)
-
-

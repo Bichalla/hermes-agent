@@ -13082,6 +13082,8 @@ def _read_worker_runtime_provenance() -> WorkerRuntimeProvenance:
     source_root = Path(__file__).resolve().parent.parent
     source_commit = _read_worker_source_git_object(source_root, "HEAD")
     source_tree = _read_worker_source_git_object(source_root, "HEAD^{tree}")
+    if source_commit is None or source_tree is None:
+        raise RuntimeError("worker_runtime_provenance:source_identity_unavailable")
     module_identities: list[tuple[str, str, str]] = []
     for module_name in (
         "hermes_cli",

@@ -1322,6 +1322,18 @@ def test_worker_runtime_provenance_binds_g2_owner_and_source():
     assert all(len(sha256) == 64 for _name, _path, sha256 in proof.module_identities)
 
 
+def test_worker_runtime_provenance_rejects_missing_source_identity(monkeypatch):
+    import hermes_cli.kanban_db as kb
+
+    monkeypatch.setattr(kb, "_read_worker_source_git_object", lambda *_args: None)
+
+    with pytest.raises(
+        RuntimeError,
+        match="worker_runtime_provenance:source_identity_unavailable",
+    ):
+        kb._read_worker_runtime_provenance()
+
+
 def test_resolve_hermes_argv_module_actually_runs():
     """The fallback module name must be importable + runnable.
 

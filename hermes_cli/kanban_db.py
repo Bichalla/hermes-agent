@@ -5650,6 +5650,7 @@ def _consumed_change_gate_claim_for_active_run(
         and task_row["claim_lock"] == claim_lock
         and type(task_row["claim_expires"]) is int
         and actual_route == artifacts.actual_route.normalized()
+        and canonical_sha256(actual_route) == release.transition_anchor.route_sha256
         and run_row["task_id"] == task_id
         and run_row["profile"] == task_row["assignee"]
         and run_row["status"] == "running"

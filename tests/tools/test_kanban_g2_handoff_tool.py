@@ -5,6 +5,8 @@ import subprocess
 import time
 from pathlib import Path
 
+import pytest
+
 from hermes_cli.change_gate import (
     ARCHITECTURE_INVENTORY_SCHEMA,
     ArtifactBinding,
@@ -202,6 +204,8 @@ def _active_planner(
     monkeypatch,
     repo: Path,
     risk: RiskLevel = RiskLevel.NORMAL,
+    *,
+    claimer: str = "claim-g2",
 ) -> str:
     from hermes_cli.change_gate_runtime import (
         load_runtime_policy,
@@ -348,14 +352,14 @@ def _active_planner(
         expires_at_epoch=now + 300,
     )
     kb._store_change_gate_release(conn, release)
-    claimed = kb.claim_task(conn, parent_id, claimer="claim-g2")
+    claimed = kb.claim_task(conn, parent_id, claimer=claimer)
     assert claimed is not None
     state = kb.change_gate_release_state(conn, release.release_id)
     assert state is not None and state["state"] == "CONSUMED"
     claimed = kb.get_task(conn, parent_id)
     monkeypatch.setenv("HERMES_KANBAN_TASK", parent_id)
     monkeypatch.setenv("HERMES_KANBAN_RUN_ID", str(claimed.current_run_id))
-    monkeypatch.setenv("HERMES_KANBAN_CLAIM_LOCK", "claim-g2")
+    monkeypatch.setenv("HERMES_KANBAN_CLAIM_LOCK", claimer)
     return parent_id
 
 
@@ -380,19 +384,178 @@ def _args(binding: dict[str, str], repo: Path, risk: str = "NORMAL") -> dict:
     }
 
 
-def _counts(conn) -> dict[str, int]:
+def _g2_material_state(conn, repo: Path) -> dict[str, object]:
+    tables = (
+        "tasks",
+        "task_runs",
+        "task_links",
+        "task_attachments",
+        "task_events",
+        "task_comments",
+        "change_gate_releases",
+    )
+    attachments = conn.execute(
+        "SELECT stored_path FROM task_attachments ORDER BY task_id, filename"
+    ).fetchall()
     return {
-        "tasks": conn.execute("SELECT COUNT(*) FROM tasks").fetchone()[0],
-        "links": conn.execute("SELECT COUNT(*) FROM task_links").fetchone()[0],
-        "attachments": conn.execute("SELECT COUNT(*) FROM task_attachments").fetchone()[0],
-        "runs": conn.execute("SELECT COUNT(*) FROM task_runs").fetchone()[0],
+        "tables": {
+            table: tuple(
+                tuple(row)
+                for row in conn.execute(
+                    f"SELECT * FROM {table} ORDER BY rowid"
+                ).fetchall()
+            )
+            for table in tables
+        },
+        "attachment_files": tuple(
+            (
+                row["stored_path"],
+                hashlib.sha256(Path(row["stored_path"]).read_bytes()).hexdigest(),
+            )
+            for row in attachments
+        ),
+        "inventory_files": tuple(
+            (
+                str(path),
+                hashlib.sha256(path.read_bytes()).hexdigest(),
+            )
+            for path in sorted(
+                (Path(os.environ["HERMES_HOME"]) / "inventory").glob("*.json")
+            )
+        ),
+        "worktrees": _worktree_paths(repo),
+        "branches": _local_branches(repo),
+        "child_worktree_paths": tuple(
+            sorted(str(path) for path in (repo / ".worktrees").glob("t_*") if path.exists())
+        ),
     }
 
 
-def _assert_no_g2_material_delta(conn, before: dict[str, int], repo: Path) -> None:
-    assert _counts(conn) == before
-    assert not any((repo / ".worktrees").glob("t_*"))
-    assert not any("/.worktrees/t_" in path for path in _worktree_paths(repo))
+def _assert_no_g2_material_delta(conn, before: dict[str, object], repo: Path) -> None:
+    assert _g2_material_state(conn, repo) == before
+
+
+def _apply_additional_provenance_corruption(
+    case: str,
+    conn,
+    kb,
+    parent_id: str,
+) -> None:
+    task = kb.get_task(conn, parent_id)
+    assert task is not None and task.current_run_id is not None
+    run_id = int(task.current_run_id)
+    release = conn.execute(
+        "SELECT * FROM change_gate_releases "
+        "WHERE task_id = ? AND purpose = 'CLAIM'",
+        (parent_id,),
+    ).fetchone()
+    assert release is not None and release["consumed_event_id"] is not None
+    event_id = int(release["consumed_event_id"])
+    event = conn.execute(
+        "SELECT * FROM task_events WHERE id = ?",
+        (event_id,),
+    ).fetchone()
+    assert event is not None
+
+    if case == "wrong_event_task":
+        conn.execute(
+            "UPDATE task_events SET task_id = 't_wrong' WHERE id = ?",
+            (event_id,),
+        )
+    elif case == "wrong_event_run":
+        conn.execute(
+            "UPDATE task_events SET run_id = ? WHERE id = ?",
+            (run_id + 1, event_id),
+        )
+    elif case == "wrong_consumed_event":
+        other_event_id = conn.execute(
+            "SELECT id FROM task_events WHERE task_id = ? AND id != ? "
+            "ORDER BY id LIMIT 1",
+            (parent_id, event_id),
+        ).fetchone()[0]
+        conn.execute(
+            "UPDATE change_gate_releases SET consumed_event_id = ? "
+            "WHERE release_id = ?",
+            (other_event_id, release["release_id"]),
+        )
+    elif case == "wrong_expiry_type":
+        payload = json.loads(event["payload"])
+        payload["expires"] = str(payload["expires"])
+        conn.execute(
+            "UPDATE task_events SET payload = ? WHERE id = ?",
+            (json.dumps(payload), event_id),
+        )
+    elif case == "duplicate_consumed_release":
+        columns = tuple(release.keys())
+        values = dict(zip(columns, tuple(release), strict=True))
+        values["release_id"] = "cgr_" + "b" * 64
+        values["artifact_sha256"] = "b" * 64
+        conn.execute(
+            f"INSERT INTO change_gate_releases ({', '.join(columns)}) "
+            f"VALUES ({', '.join('?' for _ in columns)})",
+            tuple(values[column] for column in columns),
+        )
+    elif case == "release_drift":
+        conn.execute(
+            "UPDATE change_gate_releases SET state = 'REVOKED', revoked_at = 1, "
+            "revoked_reason = 'test drift' WHERE release_id = ?",
+            (release["release_id"],),
+        )
+    elif case == "artifact_drift":
+        attachment = conn.execute(
+            "SELECT stored_path FROM task_attachments "
+            "WHERE task_id = ? AND filename = ?",
+            (parent_id, EVIDENCE_ATTACHMENT_FILENAME),
+        ).fetchone()
+        assert attachment is not None
+        Path(attachment["stored_path"]).write_bytes(b"tampered")
+    elif case == "inventory_drift":
+        inventory = Path(os.environ["HERMES_HOME"]) / "inventory" / "inv-normal.json"
+        inventory.write_bytes(b"tampered")
+    elif case == "route_drift":
+        conn.execute(
+            "UPDATE tasks SET model_override = 'drift-model' WHERE id = ?",
+            (parent_id,),
+        )
+    elif case == "ended_run":
+        conn.execute(
+            "UPDATE task_runs SET ended_at = ? WHERE id = ?",
+            (int(time.time()), run_id),
+        )
+    elif case == "reclaimed_run":
+        conn.execute(
+            "UPDATE task_runs SET status = 'reclaimed', outcome = 'reclaimed', "
+            "ended_at = ? WHERE id = ?",
+            (int(time.time()), run_id),
+        )
+    elif case == "superseded_run":
+        replacement = conn.execute(
+            "INSERT INTO task_runs (task_id, profile, status, claim_lock, "
+            "claim_expires, started_at) VALUES (?, ?, 'running', ?, ?, ?)",
+            (
+                parent_id,
+                task.assignee,
+                task.claim_lock,
+                task.claim_expires,
+                int(time.time()),
+            ),
+        )
+        conn.execute(
+            "UPDATE tasks SET current_run_id = ? WHERE id = ?",
+            (int(replacement.lastrowid), parent_id),
+        )
+    elif case == "current_claim_lock_drift":
+        conn.execute(
+            "UPDATE tasks SET claim_lock = 'other-lock' WHERE id = ?",
+            (parent_id,),
+        )
+        conn.execute(
+            "UPDATE task_runs SET claim_lock = 'other-lock' WHERE id = ?",
+            (run_id,),
+        )
+    else:
+        raise AssertionError(f"unknown corruption case: {case}")
+    conn.commit()
 
 
 def test_kanban_g2_handoff_creates_child_and_frozen_artifacts(monkeypatch, tmp_path):
@@ -411,7 +574,9 @@ def test_kanban_g2_handoff_creates_child_and_frozen_artifacts(monkeypatch, tmp_p
         post_claim = kb.evaluate_change_gate_claim_runtime(conn, parent_id)
         assert post_claim.applicable
         assert post_claim.result.reason is ChangeGateReason.RELEASE_TRANSITION_STALE
+        replay_preimage = _g2_material_state(conn, repo)
         assert kb.claim_task(conn, parent_id, claimer="claim-replay") is None
+        _assert_no_g2_material_delta(conn, replay_preimage, repo)
         assert conn.execute(
             "SELECT COUNT(*) FROM task_runs WHERE task_id = ?",
             (parent_id,),
@@ -454,10 +619,10 @@ def test_kanban_g2_handoff_creates_child_and_frozen_artifacts(monkeypatch, tmp_p
         )
         assert load.ok
 
+        duplicate_preimage = _g2_material_state(conn, repo)
         duplicate = json.loads(_handle_g2_handoff(_args(binding, repo)))
         assert "already issued a G2 handoff" in duplicate["error"]
-        assert conn.execute("SELECT COUNT(*) FROM tasks").fetchone()[0] == 2
-        assert conn.execute("SELECT COUNT(*) FROM task_links").fetchone()[0] == 1
+        _assert_no_g2_material_delta(conn, duplicate_preimage, repo)
     finally:
         conn.close()
 
@@ -480,11 +645,10 @@ def test_kanban_g2_handoff_rejects_consumed_claim_from_another_run(
     )
     conn.commit()
     try:
+        preimage = _g2_material_state(conn, repo)
         result = json.loads(_handle_g2_handoff(_args(binding, repo)))
         assert "exact consumed CLAIM provenance" in result["error"]
-        assert conn.execute("SELECT COUNT(*) FROM tasks").fetchone()[0] == 1
-        assert conn.execute("SELECT COUNT(*) FROM task_links").fetchone()[0] == 0
-        assert not any((repo / ".worktrees").glob("t_*"))
+        _assert_no_g2_material_delta(conn, preimage, repo)
     finally:
         conn.close()
 
@@ -493,27 +657,23 @@ def test_kanban_g2_handoff_accepts_consumed_claim_after_heartbeat_extends_lease(
     monkeypatch,
     tmp_path,
 ):
-    from tools.kanban_tools import _handle_g2_handoff
+    from tools.kanban_tools import _handle_g2_handoff, _handle_heartbeat
 
     kb, conn = _setup_env(monkeypatch, tmp_path)
     repo, binding = _git_repo(tmp_path)
     parent_id = _active_planner(conn, kb, monkeypatch, repo)
     parent = kb.get_task(conn, parent_id)
     assert parent is not None and parent.current_run_id is not None
-    claimed_payload = json.loads(
-        conn.execute(
-            "SELECT payload FROM task_events "
-            "WHERE task_id = ? AND run_id = ? AND kind = 'claimed'",
-            (parent_id, parent.current_run_id),
-        ).fetchone()["payload"]
-    )
+    claimed = conn.execute(
+        "SELECT payload, created_at FROM task_events "
+        "WHERE task_id = ? AND run_id = ? AND kind = 'claimed'",
+        (parent_id, parent.current_run_id),
+    ).fetchone()
+    claimed_payload = json.loads(claimed["payload"])
+    monkeypatch.setattr(kb.time, "time", lambda: int(claimed["created_at"]) + 3)
 
-    assert kb.heartbeat_claim(
-        conn,
-        parent_id,
-        ttl_seconds=3600,
-        claimer="claim-g2",
-    )
+    heartbeat = json.loads(_handle_heartbeat({"task_id": parent_id}))
+    assert heartbeat["ok"] is True
     extended_task = kb.get_task(conn, parent_id)
     extended_run = conn.execute(
         "SELECT claim_expires FROM task_runs WHERE id = ?",
@@ -521,6 +681,11 @@ def test_kanban_g2_handoff_accepts_consumed_claim_after_heartbeat_extends_lease(
     ).fetchone()
     assert extended_task.claim_expires == extended_run["claim_expires"]
     assert extended_task.claim_expires > claimed_payload["expires"]
+    assert conn.execute(
+        "SELECT COUNT(*) FROM task_events "
+        "WHERE task_id = ? AND kind = 'heartbeat'",
+        (parent_id,),
+    ).fetchone()[0] == 1
 
     try:
         result = json.loads(_handle_g2_handoff(_args(binding, repo)))
@@ -530,7 +695,7 @@ def test_kanban_g2_handoff_accepts_consumed_claim_after_heartbeat_extends_lease(
         conn.close()
 
 
-def test_kanban_g2_handoff_accepts_consumed_claim_after_live_pid_reclaim_defers_lease(
+def test_kanban_g2_handoff_accepts_consumed_claim_after_live_pid_lease_extension(
     monkeypatch,
     tmp_path,
 ):
@@ -538,25 +703,36 @@ def test_kanban_g2_handoff_accepts_consumed_claim_after_live_pid_reclaim_defers_
 
     kb, conn = _setup_env(monkeypatch, tmp_path)
     repo, binding = _git_repo(tmp_path)
-    parent_id = _active_planner(conn, kb, monkeypatch, repo)
+    host = kb._claimer_id().split(":", 1)[0]
+    parent_id = _active_planner(
+        conn,
+        kb,
+        monkeypatch,
+        repo,
+        claimer=f"{host}:live-pid-test",
+    )
     parent = kb.get_task(conn, parent_id)
     assert parent is not None and parent.current_run_id is not None
-    claimed_payload = json.loads(
-        conn.execute(
-            "SELECT payload FROM task_events "
-            "WHERE task_id = ? AND run_id = ? AND kind = 'claimed'",
-            (parent_id, parent.current_run_id),
-        ).fetchone()["payload"]
+    claimed = conn.execute(
+        "SELECT payload, created_at FROM task_events "
+        "WHERE task_id = ? AND run_id = ? AND kind = 'claimed'",
+        (parent_id, parent.current_run_id),
+    ).fetchone()
+    claimed_payload = json.loads(claimed["payload"])
+    extension_now = int(claimed["created_at"]) + 5
+    monkeypatch.setattr(kb.time, "time", lambda: extension_now)
+    monkeypatch.setattr(kb, "_pid_alive", lambda _pid: True)
+    kb._set_worker_pid(conn, parent_id, 424242)
+    conn.execute(
+        "UPDATE tasks SET claim_expires = ?, last_heartbeat_at = ? WHERE id = ?",
+        (extension_now - 1, extension_now, parent_id),
     )
-
-    kb._defer_reclaim_for_live_worker(
-        conn,
-        parent_id,
-        "claim-g2",
-        int(time.time()) + 3000,
-        {"termination_attempted": True, "host_local": True, "terminated": False},
-        reason="test-live-pid",
+    conn.execute(
+        "UPDATE task_runs SET claim_expires = ?, last_heartbeat_at = ? WHERE id = ?",
+        (extension_now - 1, extension_now, int(parent.current_run_id)),
     )
+    conn.commit()
+    assert kb.release_stale_claims(conn) == 0
     deferred_task = kb.get_task(conn, parent_id)
     deferred_run = conn.execute(
         "SELECT claim_expires FROM task_runs WHERE id = ?",
@@ -564,6 +740,11 @@ def test_kanban_g2_handoff_accepts_consumed_claim_after_live_pid_reclaim_defers_
     ).fetchone()
     assert deferred_task.claim_expires == deferred_run["claim_expires"]
     assert deferred_task.claim_expires > claimed_payload["expires"]
+    assert conn.execute(
+        "SELECT COUNT(*) FROM task_events "
+        "WHERE task_id = ? AND kind = 'claim_extended'",
+        (parent_id,),
+    ).fetchone()[0] == 1
 
     try:
         result = json.loads(_handle_g2_handoff(_args(binding, repo)))
@@ -589,7 +770,7 @@ def test_kanban_g2_handoff_rejects_task_run_lease_disagreement_without_material_
         (parent.current_run_id,),
     )
     conn.commit()
-    before = _counts(conn)
+    before = _g2_material_state(conn, repo)
     try:
         result = json.loads(_handle_g2_handoff(_args(binding, repo)))
         assert "exact consumed CLAIM provenance" in result["error"]
@@ -615,7 +796,7 @@ def test_kanban_g2_handoff_rejects_malformed_claimed_payload_without_material_de
         (json.dumps({"lock": "claim-g2", "run_id": parent.current_run_id}), parent_id, parent.current_run_id),
     )
     conn.commit()
-    before = _counts(conn)
+    before = _g2_material_state(conn, repo)
     try:
         result = json.loads(_handle_g2_handoff(_args(binding, repo)))
         assert "exact consumed CLAIM provenance" in result["error"]
@@ -651,7 +832,7 @@ def test_kanban_g2_handoff_rejects_wrong_claim_lock_event_without_material_delta
         ),
     )
     conn.commit()
-    before = _counts(conn)
+    before = _g2_material_state(conn, repo)
     try:
         result = json.loads(_handle_g2_handoff(_args(binding, repo)))
         assert "exact consumed CLAIM provenance" in result["error"]
@@ -679,7 +860,7 @@ def test_kanban_g2_handoff_rejects_multiple_claimed_events_without_material_delt
         run_id=parent.current_run_id,
     )
     conn.commit()
-    before = _counts(conn)
+    before = _g2_material_state(conn, repo)
     try:
         result = json.loads(_handle_g2_handoff(_args(binding, repo)))
         assert "exact consumed CLAIM provenance" in result["error"]
@@ -710,11 +891,49 @@ def test_kanban_g2_handoff_rejects_terminal_planner_run_without_material_delta(
         (int(time.time()), parent.current_run_id),
     )
     conn.commit()
-    before = _counts(conn)
+    before = _g2_material_state(conn, repo)
     try:
         result = json.loads(_handle_g2_handoff(_args(binding, repo)))
         assert "active dispatcher worker run is required" in result["error"]
         _assert_no_g2_material_delta(conn, before, repo)
+    finally:
+        conn.close()
+
+
+@pytest.mark.parametrize(
+    "case",
+    (
+        "wrong_event_task",
+        "wrong_event_run",
+        "wrong_consumed_event",
+        "wrong_expiry_type",
+        "duplicate_consumed_release",
+        "release_drift",
+        "artifact_drift",
+        "inventory_drift",
+        "route_drift",
+        "ended_run",
+        "reclaimed_run",
+        "superseded_run",
+        "current_claim_lock_drift",
+    ),
+)
+def test_kanban_g2_handoff_rejects_additional_provenance_drift_without_delta(
+    monkeypatch,
+    tmp_path,
+    case,
+):
+    from tools.kanban_tools import _handle_g2_handoff
+
+    kb, conn = _setup_env(monkeypatch, tmp_path)
+    repo, binding = _git_repo(tmp_path)
+    parent_id = _active_planner(conn, kb, monkeypatch, repo)
+    try:
+        _apply_additional_provenance_corruption(case, conn, kb, parent_id)
+        preimage = _g2_material_state(conn, repo)
+        result = json.loads(_handle_g2_handoff(_args(binding, repo)))
+        assert "error" in result
+        _assert_no_g2_material_delta(conn, preimage, repo)
     finally:
         conn.close()
 

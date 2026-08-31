@@ -624,6 +624,42 @@ def test_kanban_g2_handoff_rejects_malformed_claimed_payload_without_material_de
         conn.close()
 
 
+def test_kanban_g2_handoff_rejects_wrong_claim_lock_event_without_material_delta(
+    monkeypatch,
+    tmp_path,
+):
+    from tools.kanban_tools import _handle_g2_handoff
+
+    kb, conn = _setup_env(monkeypatch, tmp_path)
+    repo, binding = _git_repo(tmp_path)
+    parent_id = _active_planner(conn, kb, monkeypatch, repo)
+    parent = kb.get_task(conn, parent_id)
+    assert parent is not None and parent.current_run_id is not None
+    conn.execute(
+        "UPDATE task_events SET payload = ? "
+        "WHERE task_id = ? AND run_id = ? AND kind = 'claimed'",
+        (
+            json.dumps(
+                {
+                    "lock": "other-lock",
+                    "expires": parent.claim_expires,
+                    "run_id": parent.current_run_id,
+                }
+            ),
+            parent_id,
+            parent.current_run_id,
+        ),
+    )
+    conn.commit()
+    before = _counts(conn)
+    try:
+        result = json.loads(_handle_g2_handoff(_args(binding, repo)))
+        assert "exact consumed CLAIM provenance" in result["error"]
+        _assert_no_g2_material_delta(conn, before, repo)
+    finally:
+        conn.close()
+
+
 def test_kanban_g2_handoff_rejects_multiple_claimed_events_without_material_delta(
     monkeypatch,
     tmp_path,
@@ -647,6 +683,37 @@ def test_kanban_g2_handoff_rejects_multiple_claimed_events_without_material_delt
     try:
         result = json.loads(_handle_g2_handoff(_args(binding, repo)))
         assert "exact consumed CLAIM provenance" in result["error"]
+        _assert_no_g2_material_delta(conn, before, repo)
+    finally:
+        conn.close()
+
+
+def test_kanban_g2_handoff_rejects_terminal_planner_run_without_material_delta(
+    monkeypatch,
+    tmp_path,
+):
+    from tools.kanban_tools import _handle_g2_handoff
+
+    kb, conn = _setup_env(monkeypatch, tmp_path)
+    repo, binding = _git_repo(tmp_path)
+    parent_id = _active_planner(conn, kb, monkeypatch, repo)
+    parent = kb.get_task(conn, parent_id)
+    assert parent is not None and parent.current_run_id is not None
+    conn.execute(
+        "UPDATE tasks SET status = 'blocked', claim_lock = NULL, "
+        "claim_expires = NULL, current_run_id = NULL WHERE id = ?",
+        (parent_id,),
+    )
+    conn.execute(
+        "UPDATE task_runs SET status = 'blocked', outcome = 'blocked', "
+        "ended_at = ?, claim_lock = NULL, claim_expires = NULL WHERE id = ?",
+        (int(time.time()), parent.current_run_id),
+    )
+    conn.commit()
+    before = _counts(conn)
+    try:
+        result = json.loads(_handle_g2_handoff(_args(binding, repo)))
+        assert "active dispatcher worker run is required" in result["error"]
         _assert_no_g2_material_delta(conn, before, repo)
     finally:
         conn.close()

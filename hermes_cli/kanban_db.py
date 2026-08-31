@@ -5643,6 +5643,7 @@ def _consumed_change_gate_claim_for_active_run(
     except (TypeError, ValueError, json.JSONDecodeError):
         return None
     anchor_event_id = release.transition_anchor.latest_event_id
+    initial_claim_expires = payload.get("expires") if type(payload) is dict else None
     return release if (
         task_row["status"] == "running"
         and task_row["current_run_id"] == run_id
@@ -5661,7 +5662,9 @@ def _consumed_change_gate_claim_for_active_run(
         and type(payload) is dict
         and set(payload) == {"lock", "expires", "run_id"}
         and payload["lock"] == claim_lock
-        and payload["expires"] == task_row["claim_expires"]
+        and type(initial_claim_expires) is int
+        and initial_claim_expires > row["consumed_at"]
+        and initial_claim_expires <= task_row["claim_expires"]
         and payload["run_id"] == run_id
         and (anchor_event_id is None or row["consumed_event_id"] > anchor_event_id)
     ) else None

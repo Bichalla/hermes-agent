@@ -380,6 +380,21 @@ def _args(binding: dict[str, str], repo: Path, risk: str = "NORMAL") -> dict:
     }
 
 
+def _counts(conn) -> dict[str, int]:
+    return {
+        "tasks": conn.execute("SELECT COUNT(*) FROM tasks").fetchone()[0],
+        "links": conn.execute("SELECT COUNT(*) FROM task_links").fetchone()[0],
+        "attachments": conn.execute("SELECT COUNT(*) FROM task_attachments").fetchone()[0],
+        "runs": conn.execute("SELECT COUNT(*) FROM task_runs").fetchone()[0],
+    }
+
+
+def _assert_no_g2_material_delta(conn, before: dict[str, int], repo: Path) -> None:
+    assert _counts(conn) == before
+    assert not any((repo / ".worktrees").glob("t_*"))
+    assert not any("/.worktrees/t_" in path for path in _worktree_paths(repo))
+
+
 def test_kanban_g2_handoff_creates_child_and_frozen_artifacts(monkeypatch, tmp_path):
     from tools.kanban_tools import _handle_g2_handoff
 
@@ -470,6 +485,169 @@ def test_kanban_g2_handoff_rejects_consumed_claim_from_another_run(
         assert conn.execute("SELECT COUNT(*) FROM tasks").fetchone()[0] == 1
         assert conn.execute("SELECT COUNT(*) FROM task_links").fetchone()[0] == 0
         assert not any((repo / ".worktrees").glob("t_*"))
+    finally:
+        conn.close()
+
+
+def test_kanban_g2_handoff_accepts_consumed_claim_after_heartbeat_extends_lease(
+    monkeypatch,
+    tmp_path,
+):
+    from tools.kanban_tools import _handle_g2_handoff
+
+    kb, conn = _setup_env(monkeypatch, tmp_path)
+    repo, binding = _git_repo(tmp_path)
+    parent_id = _active_planner(conn, kb, monkeypatch, repo)
+    parent = kb.get_task(conn, parent_id)
+    assert parent is not None and parent.current_run_id is not None
+    claimed_payload = json.loads(
+        conn.execute(
+            "SELECT payload FROM task_events "
+            "WHERE task_id = ? AND run_id = ? AND kind = 'claimed'",
+            (parent_id, parent.current_run_id),
+        ).fetchone()["payload"]
+    )
+
+    assert kb.heartbeat_claim(
+        conn,
+        parent_id,
+        ttl_seconds=3600,
+        claimer="claim-g2",
+    )
+    extended_task = kb.get_task(conn, parent_id)
+    extended_run = conn.execute(
+        "SELECT claim_expires FROM task_runs WHERE id = ?",
+        (parent.current_run_id,),
+    ).fetchone()
+    assert extended_task.claim_expires == extended_run["claim_expires"]
+    assert extended_task.claim_expires > claimed_payload["expires"]
+
+    try:
+        result = json.loads(_handle_g2_handoff(_args(binding, repo)))
+        assert result["ok"] is True
+        assert conn.execute("SELECT COUNT(*) FROM task_links").fetchone()[0] == 1
+    finally:
+        conn.close()
+
+
+def test_kanban_g2_handoff_accepts_consumed_claim_after_live_pid_reclaim_defers_lease(
+    monkeypatch,
+    tmp_path,
+):
+    from tools.kanban_tools import _handle_g2_handoff
+
+    kb, conn = _setup_env(monkeypatch, tmp_path)
+    repo, binding = _git_repo(tmp_path)
+    parent_id = _active_planner(conn, kb, monkeypatch, repo)
+    parent = kb.get_task(conn, parent_id)
+    assert parent is not None and parent.current_run_id is not None
+    claimed_payload = json.loads(
+        conn.execute(
+            "SELECT payload FROM task_events "
+            "WHERE task_id = ? AND run_id = ? AND kind = 'claimed'",
+            (parent_id, parent.current_run_id),
+        ).fetchone()["payload"]
+    )
+
+    kb._defer_reclaim_for_live_worker(
+        conn,
+        parent_id,
+        "claim-g2",
+        int(time.time()) + 3000,
+        {"termination_attempted": True, "host_local": True, "terminated": False},
+        reason="test-live-pid",
+    )
+    deferred_task = kb.get_task(conn, parent_id)
+    deferred_run = conn.execute(
+        "SELECT claim_expires FROM task_runs WHERE id = ?",
+        (parent.current_run_id,),
+    ).fetchone()
+    assert deferred_task.claim_expires == deferred_run["claim_expires"]
+    assert deferred_task.claim_expires > claimed_payload["expires"]
+
+    try:
+        result = json.loads(_handle_g2_handoff(_args(binding, repo)))
+        assert result["ok"] is True
+        assert conn.execute("SELECT COUNT(*) FROM task_links").fetchone()[0] == 1
+    finally:
+        conn.close()
+
+
+def test_kanban_g2_handoff_rejects_task_run_lease_disagreement_without_material_delta(
+    monkeypatch,
+    tmp_path,
+):
+    from tools.kanban_tools import _handle_g2_handoff
+
+    kb, conn = _setup_env(monkeypatch, tmp_path)
+    repo, binding = _git_repo(tmp_path)
+    parent_id = _active_planner(conn, kb, monkeypatch, repo)
+    parent = kb.get_task(conn, parent_id)
+    assert parent is not None and parent.current_run_id is not None
+    conn.execute(
+        "UPDATE task_runs SET claim_expires = claim_expires + 1 WHERE id = ?",
+        (parent.current_run_id,),
+    )
+    conn.commit()
+    before = _counts(conn)
+    try:
+        result = json.loads(_handle_g2_handoff(_args(binding, repo)))
+        assert "exact consumed CLAIM provenance" in result["error"]
+        _assert_no_g2_material_delta(conn, before, repo)
+    finally:
+        conn.close()
+
+
+def test_kanban_g2_handoff_rejects_malformed_claimed_payload_without_material_delta(
+    monkeypatch,
+    tmp_path,
+):
+    from tools.kanban_tools import _handle_g2_handoff
+
+    kb, conn = _setup_env(monkeypatch, tmp_path)
+    repo, binding = _git_repo(tmp_path)
+    parent_id = _active_planner(conn, kb, monkeypatch, repo)
+    parent = kb.get_task(conn, parent_id)
+    assert parent is not None and parent.current_run_id is not None
+    conn.execute(
+        "UPDATE task_events SET payload = ? "
+        "WHERE task_id = ? AND run_id = ? AND kind = 'claimed'",
+        (json.dumps({"lock": "claim-g2", "run_id": parent.current_run_id}), parent_id, parent.current_run_id),
+    )
+    conn.commit()
+    before = _counts(conn)
+    try:
+        result = json.loads(_handle_g2_handoff(_args(binding, repo)))
+        assert "exact consumed CLAIM provenance" in result["error"]
+        _assert_no_g2_material_delta(conn, before, repo)
+    finally:
+        conn.close()
+
+
+def test_kanban_g2_handoff_rejects_multiple_claimed_events_without_material_delta(
+    monkeypatch,
+    tmp_path,
+):
+    from tools.kanban_tools import _handle_g2_handoff
+
+    kb, conn = _setup_env(monkeypatch, tmp_path)
+    repo, binding = _git_repo(tmp_path)
+    parent_id = _active_planner(conn, kb, monkeypatch, repo)
+    parent = kb.get_task(conn, parent_id)
+    assert parent is not None and parent.current_run_id is not None
+    kb._append_event(
+        conn,
+        parent_id,
+        "claimed",
+        {"lock": "claim-g2", "expires": parent.claim_expires, "run_id": parent.current_run_id},
+        run_id=parent.current_run_id,
+    )
+    conn.commit()
+    before = _counts(conn)
+    try:
+        result = json.loads(_handle_g2_handoff(_args(binding, repo)))
+        assert "exact consumed CLAIM provenance" in result["error"]
+        _assert_no_g2_material_delta(conn, before, repo)
     finally:
         conn.close()
 

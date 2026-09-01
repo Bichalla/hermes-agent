@@ -604,6 +604,122 @@ def test_dispatcher_projects_one_reviewer_after_worker_terminal_exit(
     assert current is not None and current.status == "running"
 
 
+def test_g2_terminal_outcome_stops_before_post_g2_provider_or_tool_calls(
+    kanban_home: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    task = _claimed_task(assignee="planner")
+    _bind_worker(monkeypatch, task)
+    agent = _make_agent(kanban_home, "kanban_g2_handoff", "terminal")
+    agent.client.chat.completions.create.side_effect = [
+        _response(
+            tool_calls=[
+                _tool_call("kanban_g2_handoff", {}, "g2"),
+                _tool_call("terminal", {"command": "must-not-run"}, "after"),
+            ]
+        ),
+        _response(content="must not run", finish_reason="stop"),
+    ]
+    observed_calls: list[str] = []
+
+    def dispatch(name, args, task_id=None, **kwargs):
+        observed_calls.append(name)
+        if name != "kanban_g2_handoff":
+            return json.dumps({"ok": True})
+        with kb.connect() as conn, kb.write_txn(conn):
+            conn.execute(
+                "UPDATE tasks SET status = 'done', claim_lock = NULL, "
+                "claim_expires = NULL WHERE id = ?",
+                (task.id,),
+            )
+            closed = kb._end_run(
+                conn,
+                task.id,
+                outcome="g2_handoff",
+                status="done",
+            )
+            assert closed == task.current_run_id
+        return json.dumps({"ok": True, "parent_status": "done"})
+
+    with patch("run_agent.handle_function_call", side_effect=dispatch):
+        result = agent.run_conversation("freeze the planner handoff")
+
+    assert agent.client.chat.completions.create.call_count == 1
+    assert observed_calls == ["kanban_g2_handoff"]
+    assert result["final_response"] == TERMINAL_RESPONSE
+    assert result["turn_exit_reason"] == "dispatcher_worker_run_terminal"
+    tool_results = [
+        message for message in result["messages"] if message.get("role") == "tool"
+    ]
+    assert [message["tool_call_id"] for message in tool_results[-2:]] == [
+        "g2",
+        "after",
+    ]
+    assert "Tool skipped" in tool_results[-1]["content"]
+    assert tool_results[-1]["effect_disposition"] == "none"
+
+
+def test_terminal_outcome_drift_stops_fail_closed_before_g2(
+    kanban_home: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    task = _claimed_task(assignee="planner")
+    _bind_worker(monkeypatch, task)
+    agent = _make_agent(kanban_home, "terminal", "kanban_g2_handoff")
+    agent.client.chat.completions.create.side_effect = [
+        _response(
+            tool_calls=[
+                _tool_call("terminal", {"command": "unexpected-close"}, "ordinary"),
+                _tool_call("kanban_g2_handoff", {}, "g2"),
+            ]
+        ),
+        _response(content="must not run", finish_reason="stop"),
+    ]
+    observed_calls: list[str] = []
+
+    def dispatch(name, args, task_id=None, **kwargs):
+        observed_calls.append(name)
+        if name != "terminal":
+            raise AssertionError("G2 must not execute after terminal outcome drift")
+        with kb.connect() as conn:
+            assert kb.complete_task(
+                conn,
+                task.id,
+                summary="unexpected non-G2 close",
+                expected_run_id=task.current_run_id,
+                fire_lifecycle_hook=False,
+            )
+        return json.dumps({"ok": True})
+
+    with patch("run_agent.handle_function_call", side_effect=dispatch):
+        result = agent.run_conversation("attempt an outcome-confused G2 batch")
+
+    assert agent.client.chat.completions.create.call_count == 1
+    assert observed_calls == ["terminal"]
+    assert result["completed"] is False
+    assert result["turn_exit_reason"] == (
+        "dispatcher_worker_run_terminal_outcome_mismatch"
+    )
+    assert "unexpected terminal lifecycle outcome" in result["final_response"]
+    assert agent._dispatcher_worker_terminal_exit == {
+        "task_id": task.id,
+        "run_id": task.current_run_id,
+        "outcome": "completed",
+        "tool_name": "terminal",
+        "matched_registry_outcome": False,
+        "allowed_outcomes": [],
+    }
+    tool_results = [
+        message for message in result["messages"] if message.get("role") == "tool"
+    ]
+    assert [message["tool_call_id"] for message in tool_results[-2:]] == [
+        "ordinary",
+        "g2",
+    ]
+    assert "Tool skipped" in tool_results[-1]["content"]
+    assert tool_results[-1]["effect_disposition"] == "none"
+
+
 def test_registry_terminal_metadata_is_model_invisible_and_outcome_specific() -> None:
     from tools.registry import registry
 
@@ -612,6 +728,7 @@ def test_registry_terminal_metadata_is_model_invisible_and_outcome_specific() ->
         "kanban_block": {"blocked"},
         "kanban_request_review": {"review_requested"},
         "kanban_request_changes": {"changes_requested"},
+        "kanban_g2_handoff": {"g2_handoff"},
     }
     for name, outcomes in expected.items():
         entry = registry.get_entry(name)

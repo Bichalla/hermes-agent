@@ -7472,18 +7472,34 @@ def _run_conversation_inner(
                     failed = True
                     break
 
-                if getattr(agent, "_dispatcher_worker_terminal_exit", None):
+                terminal_exit = getattr(
+                    agent, "_dispatcher_worker_terminal_exit", None
+                )
+                if terminal_exit:
                     # The registered lifecycle metadata selected a sequential
                     # boundary and the exact dispatcher-owned task/run/claim
                     # row is now durably terminal. End locally before another
                     # provider request. The bounded host response carries no
                     # authority text or task identity; normal turn finalizers
                     # still persist the closing assistant row and clean up.
-                    _turn_exit_reason = "dispatcher_worker_run_terminal"
-                    final_response = (
-                        "Kanban worker run ended after its terminal lifecycle "
-                        "transition."
+                    matched_outcome = terminal_exit.get(
+                        "matched_registry_outcome", True
                     )
+                    if matched_outcome:
+                        _turn_exit_reason = "dispatcher_worker_run_terminal"
+                        final_response = (
+                            "Kanban worker run ended after its terminal lifecycle "
+                            "transition."
+                        )
+                    else:
+                        _turn_exit_reason = (
+                            "dispatcher_worker_run_terminal_outcome_mismatch"
+                        )
+                        final_response = (
+                            "Kanban worker run ended with an unexpected terminal "
+                            "lifecycle outcome."
+                        )
+                        failed = True
                     # This dispatcher worker is finished, so turn-finalizer
                     # maintenance must not open an auxiliary model request.
                     # Background review has a public agent flag; the optional
@@ -7494,7 +7510,14 @@ def _run_conversation_inner(
                         _compressor, "_micro_compact_enabled"
                     ):
                         _compressor._micro_compact_enabled = False
-                    agent._emit_status("Kanban worker run completed its handoff")
+                    if matched_outcome:
+                        agent._emit_status(
+                            "Kanban worker run completed its handoff"
+                        )
+                    else:
+                        agent._emit_status(
+                            "Kanban worker run stopped on terminal outcome drift"
+                        )
                     break
 
                 if agent._tool_guardrail_halt_decision is not None:

@@ -1528,8 +1528,8 @@ CREATE TABLE IF NOT EXISTS task_runs (
     started_at          INTEGER NOT NULL,
     ended_at            INTEGER,
     outcome             TEXT,
-    -- outcome: completed | blocked | crashed | timed_out | spawn_failed |
-    --          gave_up | reclaimed | (null while still running)
+    -- outcome: completed | g2_handoff | blocked | crashed | timed_out |
+    --          spawn_failed | gave_up | reclaimed | (null while still running)
     summary             TEXT,
     metadata            TEXT,
     error               TEXT
@@ -4658,6 +4658,87 @@ def _cleanup_g2_handoff_outputs(
         ) from errors[0]
 
 
+def _terminalize_g2_planner(
+    conn: sqlite3.Connection,
+    *,
+    parent_task_id: str,
+    parent_run_id: int,
+    parent_claim_lock: str,
+    child_task_id: str,
+    consumed_claim: DurableReleaseArtifact,
+) -> int:
+    """Atomically close the exact Planner run consumed by a G2 handoff."""
+
+    now = int(time.time())
+    claim_row = conn.execute(
+        "SELECT consumed_event_id FROM change_gate_releases "
+        "WHERE release_id = ? AND task_id = ? AND purpose = 'CLAIM' "
+        "AND state = 'CONSUMED' AND consumed_run_id = ?",
+        (consumed_claim.release_id, parent_task_id, parent_run_id),
+    ).fetchone()
+    if claim_row is None or type(claim_row["consumed_event_id"]) is not int:
+        raise PermissionError("planner CLAIM provenance changed during G2 handoff")
+    claim_provenance = {
+        "claim_release_id": consumed_claim.release_id,
+        "claim_consumed_event_id": int(claim_row["consumed_event_id"]),
+        "claim_authority_receipt_sha256": canonical_sha256(
+            consumed_claim.authority_receipt
+        ),
+        "planner_handoff_sha256": consumed_claim.handoff_sha256,
+    }
+    terminal_payload = {
+        "child_task_id": child_task_id,
+        **claim_provenance,
+    }
+    result = f"G2 frozen handoff issued to {child_task_id}"
+    cur = conn.execute(
+        """
+        UPDATE tasks
+           SET status = 'done',
+               result = ?,
+               completed_at = ?,
+               claim_lock = NULL,
+               claim_expires = NULL,
+               worker_pid = NULL,
+               block_kind = NULL,
+               block_recurrences = 0,
+               consecutive_failures = 0,
+               last_failure_error = NULL
+         WHERE id = ?
+           AND status = 'running'
+           AND current_run_id = ?
+           AND claim_lock = ?
+        """,
+        (
+            result,
+            now,
+            parent_task_id,
+            parent_run_id,
+            parent_claim_lock,
+        ),
+    )
+    if cur.rowcount != 1:
+        raise PermissionError("active planner ownership changed during G2 handoff")
+    closed_run_id = _end_run(
+        conn,
+        parent_task_id,
+        outcome="g2_handoff",
+        status="done",
+        summary=result,
+        metadata=terminal_payload,
+        ended_at=now,
+    )
+    if closed_run_id != parent_run_id:
+        raise RuntimeError("planner run closure lost during G2 handoff")
+    return _append_event(
+        conn,
+        parent_task_id,
+        "g2_handoff_completed",
+        terminal_payload,
+        run_id=closed_run_id,
+    )
+
+
 def issue_change_gate_g2_handoff(
     conn: sqlite3.Connection,
     *,
@@ -4820,13 +4901,14 @@ def issue_change_gate_g2_handoff(
                 raise PermissionError(
                     "G2 request does not match the active planner frozen lineage"
                 )
-            if _consumed_change_gate_claim_for_active_run(
+            consumed_claim = _consumed_change_gate_claim_for_active_run(
                 conn,
                 task_id=parent_task_id,
                 run_id=parent_run_id,
                 claim_lock=parent_claim_lock,
                 artifacts=parent_artifacts,
-            ) is None:
+            )
+            if consumed_claim is None:
                 raise PermissionError(
                     "active planner run lacks exact consumed CLAIM provenance"
                 )
@@ -4955,6 +5037,14 @@ def issue_change_gate_g2_handoff(
             )
             if not load.ok:
                 raise ValueError(load.reason.value)
+            terminal_event_id = _terminalize_g2_planner(
+                conn,
+                parent_task_id=parent_task_id,
+                parent_run_id=parent_run_id,
+                parent_claim_lock=parent_claim_lock,
+                child_task_id=child_id,
+                consumed_claim=consumed_claim,
+            )
             if not unblock_task(conn, child_id, _allow_nested=True):
                 raise ValueError("child handoff unblock failed")
         committed = True
@@ -4970,6 +5060,9 @@ def issue_change_gate_g2_handoff(
             "handoff_attachment_id": handoff_attachment_id,
             "evidence_sha256": evidence.digest(),
             "handoff_sha256": handoff.digest(),
+            "parent_status": "done",
+            "parent_run_outcome": "g2_handoff",
+            "parent_terminal_event_id": terminal_event_id,
             "selected_rule": selected_rule,
             "route_key": route_key,
         }
@@ -6015,12 +6108,11 @@ def _end_run(
 ) -> Optional[int]:
     """Close the currently-active run for ``task_id`` and clear the pointer.
 
-    ``outcome`` is the semantic result (completed / blocked / crashed /
-    timed_out / spawn_failed / gave_up / reclaimed). ``status`` is the
-    run-row status (usually just ``outcome``, but callers can pass it
-    explicitly). Returns the closed run_id or ``None`` if no active run
-    existed (e.g. a CLI user calling ``hermes kanban complete`` on a
-    task that was never claimed).
+    ``outcome`` is the semantic result (completed / g2_handoff / blocked /
+    crashed / timed_out / spawn_failed / gave_up / reclaimed). ``status`` is
+    the run-row status (usually just ``outcome``, but callers can pass it
+    explicitly). Returns the closed run_id or ``None`` if no active run existed
+    (e.g. a CLI user calling ``hermes kanban complete`` on an unclaimed task).
     """
     now = int(time.time()) if ended_at is None else ended_at
     if type(now) is not int:
@@ -13041,6 +13133,7 @@ class WorkerRuntimeProvenance:
     runtime_identity_sha256: str
     g2_tool_name: str
     g2_toolset: str
+    g2_terminal_outcomes: tuple[str, ...]
 
 
 def _read_worker_source_git_object(source_root: Path, revision: str) -> str | None:
@@ -13122,6 +13215,7 @@ def _read_worker_runtime_provenance() -> WorkerRuntimeProvenance:
         or entry.schema is not kanban_tools.KANBAN_G2_HANDOFF_SCHEMA
         or entry.handler is not kanban_tools._handle_g2_handoff
         or entry.check_fn is not kanban_tools._check_kanban_g2_handoff_mode
+        or entry.dispatcher_worker_terminal_outcomes != frozenset({"g2_handoff"})
         or "kanban_g2_handoff"
         not in toolsets_module.resolve_toolset("kanban", include_registry=False)
     ):
@@ -13136,6 +13230,9 @@ def _read_worker_runtime_provenance() -> WorkerRuntimeProvenance:
             "module_identities": module_identities,
             "g2_tool_name": entry.name,
             "g2_toolset": entry.toolset,
+            "g2_terminal_outcomes": tuple(
+                sorted(entry.dispatcher_worker_terminal_outcomes)
+            ),
         }
     )
     return WorkerRuntimeProvenance(
@@ -13149,6 +13246,9 @@ def _read_worker_runtime_provenance() -> WorkerRuntimeProvenance:
         runtime_identity_sha256=runtime_identity_sha256,
         g2_tool_name=entry.name,
         g2_toolset=entry.toolset,
+        g2_terminal_outcomes=tuple(
+            sorted(entry.dispatcher_worker_terminal_outcomes)
+        ),
     )
 
 

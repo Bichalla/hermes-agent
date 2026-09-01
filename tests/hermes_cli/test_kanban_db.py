@@ -1311,6 +1311,7 @@ def test_worker_runtime_provenance_binds_g2_owner_and_source():
     assert len(proof.runtime_identity_sha256) == 64
     assert proof.g2_tool_name == "kanban_g2_handoff"
     assert proof.g2_toolset == "kanban"
+    assert proof.g2_terminal_outcomes == ("g2_handoff",)
     assert {name for name, _path, _sha256 in proof.module_identities} == {
         "hermes_cli",
         "hermes_cli.main",

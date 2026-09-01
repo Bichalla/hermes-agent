@@ -1,6 +1,7 @@
 import hashlib
 import json
 import os
+import sqlite3
 import subprocess
 import time
 from pathlib import Path
@@ -133,9 +134,10 @@ def _git_repo(tmp_path: Path) -> tuple[Path, dict[str, str]]:
     _run(["git", "config", "user.email", "tests@example.invalid"], repo)
     _run(["git", "config", "user.name", "Tests"], repo)
     _run(["git", "remote", "add", "origin", "https://github.com/Bichalla/hermes-agent.git"], repo)
+    (repo / ".gitignore").write_text(".worktrees/\n", encoding="utf-8")
     artifact = repo / "gate-artifact.txt"
     artifact.write_text("candidate\n", encoding="utf-8")
-    _run(["git", "add", "gate-artifact.txt"], repo)
+    _run(["git", "add", ".gitignore", "gate-artifact.txt"], repo)
     _run(["git", "commit", "-m", "seed"], repo)
     binding = {
         "path": "gate-artifact.txt",
@@ -384,6 +386,105 @@ def _args(binding: dict[str, str], repo: Path, risk: str = "NORMAL") -> dict:
     }
 
 
+def _store_task_release(conn, kb, task_id: str, purpose: ReleasePurpose, suffix: str):
+    from hermes_cli.change_gate_runtime import (
+        load_runtime_policy,
+        load_task_gate_artifacts,
+        project_upstream_reviews,
+    )
+    from tools.workflow_authority import fingerprint_user_action
+
+    load = load_task_gate_artifacts(
+        conn,
+        task_id,
+        policy=load_runtime_policy(),
+        attachment_root=kb.task_attachments_dir(task_id),
+    )
+    assert load.ok and load.artifacts is not None
+    artifacts = load.artifacts
+    reviews = ()
+    if purpose is ReleasePurpose.G4:
+        projection = project_upstream_reviews(
+            conn,
+            task_id,
+            handoff=artifacts.handoff,
+        )
+        assert projection.ok
+        reviews = projection.reviews
+    transition_anchor = kb.derive_change_gate_transition_anchor(
+        conn,
+        task_id,
+        purpose=purpose,
+        artifacts=artifacts,
+        reviews=reviews,
+    )
+    assert transition_anchor is not None
+    now = int(time.time())
+    statement = expected_release_statement(
+        purpose=purpose,
+        handoff_sha256=artifacts.handoff.digest(),
+    )
+    release = DurableReleaseArtifact(
+        release_id="cgr_" + suffix * 64,
+        purpose=purpose,
+        handoff_sha256=artifacts.handoff.digest(),
+        evidence_sha256=artifacts.evidence.digest(),
+        inventory_sha256=artifacts.inventory.digest(),
+        artifact_set_sha256=canonical_sha256(
+            {
+                "allowed_paths": artifacts.handoff.allowed_paths,
+                "required_inputs": artifacts.handoff.required_inputs,
+                "produced_artifacts": artifacts.handoff.produced_artifacts,
+            }
+        ),
+        route_sha256=canonical_sha256(artifacts.handoff.route),
+        task_id=task_id,
+        work_id=artifacts.evidence.work.work_id,
+        source=artifacts.actual_source,
+        authority_receipt=HumanReleaseReceipt(
+            purpose=purpose,
+            handoff_sha256=artifacts.handoff.digest(),
+            action_fingerprint=fingerprint_user_action(statement),
+            turn_id_sha256=suffix * 64,
+            session_scope_sha256="2" * 64,
+            platform_scope_sha256="3" * 64,
+            user_message_index=1,
+            source_role="user",
+        ),
+        transition_anchor=transition_anchor,
+        issued_at_epoch=now - 1,
+        expires_at_epoch=now + 300,
+    )
+    kb._store_change_gate_release(conn, release)
+    return release
+
+
+def _review_and_complete(conn, kb, task_id: str, g4_suffix: str) -> None:
+    task = kb.get_task(conn, task_id)
+    assert task is not None and task.current_run_id is not None
+    reviewed, reason = kb.request_review(
+        conn,
+        task_id,
+        expected_run_id=task.current_run_id,
+        with_reason=True,
+    )
+    assert reviewed, reason
+    reviewer = kb.claim_review_task(conn, task_id)
+    assert reviewer is not None and reviewer.current_run_id is not None
+    assert kb.request_review(
+        conn,
+        task_id,
+        expected_run_id=reviewer.current_run_id,
+        change_gate_review={
+            "reviewer_class": "REVIEWER",
+            "verdict": "PASS",
+            "finding_codes": [],
+        },
+    )
+    _store_task_release(conn, kb, task_id, ReleasePurpose.G4, g4_suffix)
+    assert kb.complete_task(conn, task_id, result="verified")
+
+
 def _g2_material_state(conn, repo: Path) -> dict[str, object]:
     tables = (
         "tasks",
@@ -586,7 +687,7 @@ def test_kanban_g2_handoff_creates_child_and_frozen_artifacts(monkeypatch, tmp_p
         assert result["ok"] is True
         child = kb.get_task(conn, result["task_id"])
         assert child is not None
-        assert child.status == "todo"
+        assert child.status == "ready"
         assert child.assignee == "change-gate-xhigh"
         assert child.model_override == "gpt-5.6-luna"
         assert child.provider_override == "openai-codex"
@@ -621,8 +722,163 @@ def test_kanban_g2_handoff_creates_child_and_frozen_artifacts(monkeypatch, tmp_p
 
         duplicate_preimage = _g2_material_state(conn, repo)
         duplicate = json.loads(_handle_g2_handoff(_args(binding, repo)))
-        assert "already issued a G2 handoff" in duplicate["error"]
+        assert "active dispatcher worker run is required" in duplicate["error"]
         _assert_no_g2_material_delta(conn, duplicate_preimage, repo)
+    finally:
+        conn.close()
+
+
+def test_g2_terminal_planner_to_child_full_lifecycle_has_two_claims_one_g4(
+    monkeypatch,
+    tmp_path,
+):
+    from hermes_cli.change_gate_runtime import (
+        load_runtime_policy,
+        load_task_gate_artifacts,
+    )
+    from tools.kanban_tools import _handle_g2_handoff, _handle_heartbeat
+
+    kb, conn = _setup_env(monkeypatch, tmp_path)
+    repo, binding = _git_repo(tmp_path)
+    parent_id = _active_planner(conn, kb, monkeypatch, repo)
+    try:
+        assert json.loads(_handle_heartbeat({"task_id": parent_id}))["ok"] is True
+        handoff = json.loads(_handle_g2_handoff(_args(binding, repo)))
+        assert handoff["ok"] is True
+        child_id = handoff["task_id"]
+        parent = kb.get_task(conn, parent_id)
+        assert parent.status == "done"
+        assert parent.current_run_id is None
+        assert parent.claim_lock is None
+        assert kb.get_task(conn, child_id).status == "ready"
+        parent_run = kb.list_runs(conn, parent_id)[-1]
+        assert parent_run.status == "done"
+        assert parent_run.outcome == "g2_handoff"
+        assert parent_run.claim_lock is None
+        parent_claim = conn.execute(
+            "SELECT release_id, consumed_event_id, authority_receipt_sha256, "
+            "handoff_sha256 FROM change_gate_releases "
+            "WHERE task_id = ? AND purpose = 'CLAIM'",
+            (parent_id,),
+        ).fetchone()
+        expected_terminal_payload = {
+            "child_task_id": child_id,
+            "claim_release_id": parent_claim["release_id"],
+            "claim_consumed_event_id": parent_claim["consumed_event_id"],
+            "claim_authority_receipt_sha256": parent_claim[
+                "authority_receipt_sha256"
+            ],
+            "planner_handoff_sha256": parent_claim["handoff_sha256"],
+        }
+        assert parent_run.metadata == expected_terminal_payload
+        terminal_event = [
+            event
+            for event in kb.list_events(conn, parent_id)
+            if event.kind == "g2_handoff_completed"
+        ]
+        assert len(terminal_event) == 1
+        assert terminal_event[0].run_id == parent_run.id
+        assert terminal_event[0].payload == expected_terminal_payload
+        assert conn.execute(
+            "SELECT COUNT(*) FROM task_links WHERE parent_id = ? AND child_id = ?",
+            (parent_id, child_id),
+        ).fetchone()[0] == 1
+        assert conn.execute(
+            "SELECT COUNT(*) FROM task_attachments WHERE task_id = ?",
+            (child_id,),
+        ).fetchone()[0] == 2
+        assert conn.execute(
+            "SELECT COUNT(*) FROM task_attachments WHERE task_id = ?",
+            (parent_id,),
+        ).fetchone()[0] == 2
+        for task_id in (parent_id, child_id):
+            artifacts = load_task_gate_artifacts(
+                conn,
+                task_id,
+                policy=load_runtime_policy(),
+                attachment_root=kb.task_attachments_dir(task_id),
+            )
+            assert artifacts.ok and artifacts.artifacts is not None
+            assert artifacts.artifacts.handoff.claim_release_required is True
+            assert artifacts.artifacts.handoff.g4_release_required is True
+
+        missing_child_claim = _g2_material_state(conn, repo)
+        assert kb.claim_task(conn, child_id, claimer="parent-claim-reuse") is None
+        _assert_no_g2_material_delta(conn, missing_child_claim, repo)
+
+        child_claim = _store_task_release(
+            conn,
+            kb,
+            child_id,
+            ReleasePurpose.CLAIM,
+            "4",
+        )
+        child = kb.claim_task(conn, child_id, claimer="child-claim")
+        assert child is not None
+        _review_and_complete(conn, kb, child_id, "5")
+
+        releases = conn.execute(
+            "SELECT task_id, purpose, state FROM change_gate_releases "
+            "ORDER BY rowid"
+        ).fetchall()
+        assert [(row["task_id"], row["purpose"], row["state"]) for row in releases] == [
+            (parent_id, "CLAIM", "CONSUMED"),
+            (child_id, "CLAIM", "CONSUMED"),
+            (child_id, "G4", "CONSUMED"),
+        ]
+        assert child_claim.task_id == child_id
+        assert kb.get_task(conn, parent_id).status == "done"
+        assert kb.get_task(conn, child_id).status == "done"
+        assert conn.execute(
+            "SELECT COUNT(*) FROM task_runs WHERE task_id = ? AND profile = ?",
+            (child_id, "change-gate-high"),
+        ).fetchone()[0] == 1
+    finally:
+        conn.close()
+
+
+def test_g2_child_ready_is_not_observable_before_parent_terminal_commit(
+    monkeypatch,
+    tmp_path,
+):
+    from hermes_cli import kanban_db as kb_module
+    from tools.kanban_tools import _handle_g2_handoff
+
+    kb, conn = _setup_env(monkeypatch, tmp_path)
+    repo, binding = _git_repo(tmp_path)
+    parent_id = _active_planner(conn, kb, monkeypatch, repo)
+    real_unblock = kb_module.unblock_task
+    observed: dict[str, object] = {}
+
+    def observe_before_commit(writer, child_id, **kwargs):
+        assert real_unblock(writer, child_id, **kwargs)
+        observed["writer_parent"] = kb.get_task(writer, parent_id).status
+        observed["writer_child"] = kb.get_task(writer, child_id).status
+        db_path = Path(os.environ["HERMES_KANBAN_DB"])
+        with sqlite3.connect(f"file:{db_path}?mode=ro", uri=True) as reader:
+            observed["reader_parent"] = reader.execute(
+                "SELECT status FROM tasks WHERE id = ?",
+                (parent_id,),
+            ).fetchone()[0]
+            observed["reader_child"] = reader.execute(
+                "SELECT status FROM tasks WHERE id = ?",
+                (child_id,),
+            ).fetchone()
+        return True
+
+    monkeypatch.setattr(kb_module, "unblock_task", observe_before_commit)
+    try:
+        result = json.loads(_handle_g2_handoff(_args(binding, repo)))
+        assert result["ok"] is True
+        child_id = result["task_id"]
+        assert observed == {
+            "writer_parent": "done",
+            "writer_child": "ready",
+            "reader_parent": "running",
+            "reader_child": None,
+        }
+        assert kb.get_task(conn, parent_id).status == "done"
+        assert kb.get_task(conn, child_id).status == "ready"
     finally:
         conn.close()
 
@@ -1034,6 +1290,49 @@ def test_kanban_g2_handoff_rolls_back_child_link_artifacts_and_worktree(
             if attachments_root.exists()
             else False
         )
+    finally:
+        conn.close()
+
+
+def test_kanban_g2_handoff_rolls_back_parent_terminal_and_all_outputs(
+    monkeypatch,
+    tmp_path,
+):
+    from hermes_cli import kanban_db as kb_module
+    from tools.kanban_tools import _handle_g2_handoff
+
+    kb, conn = _setup_env(monkeypatch, tmp_path)
+    repo, binding = _git_repo(tmp_path)
+    parent_id = _active_planner(conn, kb, monkeypatch, repo)
+    before = _g2_material_state(conn, repo)
+    monkeypatch.setattr(kb_module, "unblock_task", lambda *_args, **_kwargs: False)
+    try:
+        result = json.loads(_handle_g2_handoff(_args(binding, repo)))
+        assert "child handoff unblock failed" in result["error"]
+        _assert_no_g2_material_delta(conn, before, repo)
+        parent = kb.get_task(conn, parent_id)
+        assert parent is not None and parent.status == "running"
+        assert parent.current_run_id is not None
+        assert parent.claim_lock == "claim-g2"
+    finally:
+        conn.close()
+
+
+def test_kanban_g2_handoff_wrong_worker_task_has_zero_material_delta(
+    monkeypatch,
+    tmp_path,
+):
+    from tools.kanban_tools import _handle_g2_handoff
+
+    kb, conn = _setup_env(monkeypatch, tmp_path)
+    repo, binding = _git_repo(tmp_path)
+    _active_planner(conn, kb, monkeypatch, repo)
+    before = _g2_material_state(conn, repo)
+    monkeypatch.setenv("HERMES_KANBAN_TASK", "t_wrong_task")
+    try:
+        result = json.loads(_handle_g2_handoff(_args(binding, repo)))
+        assert "active dispatcher worker run is required" in result["error"]
+        _assert_no_g2_material_delta(conn, before, repo)
     finally:
         conn.close()
 

@@ -8222,6 +8222,7 @@ class AIAgent:
 
         tool_calls = list(assistant_message.tool_calls)
         for index, tool_call in enumerate(tool_calls):
+            allowed_outcomes = self._dispatcher_worker_terminal_outcomes(tool_call)
             single_call_message = SimpleNamespace(tool_calls=[tool_call])
             execute_tool_calls_sequential(
                 self,
@@ -8263,6 +8264,9 @@ class AIAgent:
                 "task_id": worker_identity.task_id,
                 "run_id": worker_identity.run_id,
                 "outcome": outcome,
+                "tool_name": tool_call.function.name,
+                "matched_registry_outcome": outcome in allowed_outcomes,
+                "allowed_outcomes": sorted(allowed_outcomes),
             }
             break
 

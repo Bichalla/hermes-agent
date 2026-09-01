@@ -2774,6 +2774,7 @@ registry.register(
     handler=_handle_g2_handoff,
     check_fn=_check_kanban_g2_handoff_mode,
     emoji="🧊",
+    dispatcher_worker_terminal_outcomes=("g2_handoff",),
 )
 
 registry.register(

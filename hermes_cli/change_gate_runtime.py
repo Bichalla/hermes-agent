@@ -402,6 +402,58 @@ def evaluate_loaded_runtime(
     return RuntimeEvaluation(True, result, artifacts, release)
 
 
+def evaluate_loaded_release_candidate(
+    load: TaskGateLoad,
+    *,
+    task_id: str,
+    purpose: ReleasePurpose,
+    now_epoch: int,
+    reviews: Sequence[ReviewResult] = (),
+) -> RuntimeEvaluation:
+    """Run the production adapter through every pre-release predicate.
+
+    A valid candidate deliberately stops at ``RELEASE_RECEIPT_MISSING``.  The
+    foreground authority owner mints and persists the receipt only after the
+    resolver proves that exactly one candidate reached that boundary.
+    """
+
+    if not load.applicable:
+        return RuntimeEvaluation(
+            False,
+            _allow(ChangeGateReason.DISABLED, GatePhase.G0_EVIDENCE),
+        )
+    if not load.ok or load.artifacts is None:
+        return RuntimeEvaluation(True, _failure(load.reason, purpose), load.artifacts)
+
+    artifacts = load.artifacts
+    request = ChangeGateRequest(
+        evidence=artifacts.evidence,
+        frozen_handoff=artifacts.handoff,
+        release_receipt=None,
+        source=artifacts.actual_source,
+        work=artifacts.evidence.work,
+        requested_paths=artifacts.workspace_observation.changed_paths,
+        observed_inputs=artifacts.evidence.required_inputs,
+        observed_outputs=artifacts.evidence.produced_artifacts,
+        reviews=tuple(reviews),
+        purpose=purpose,
+        durable_release=None,
+    )
+    from hermes_cli.change_gate import StaticArchitectureInventoryReader
+
+    adapter = ChangeGateAdapter(
+        enabled=True,
+        inventory_reader=StaticArchitectureInventoryReader((artifacts.inventory,)),
+        clock=lambda: now_epoch,
+    )
+    result = adapter.evaluate(
+        request,
+        actual_task_id=task_id,
+        actual_route=artifacts.actual_route,
+    )
+    return RuntimeEvaluation(True, result, artifacts)
+
+
 def evaluate_review_claim_runtime(
     conn: sqlite3.Connection,
     task_id: str,
@@ -1196,6 +1248,7 @@ __all__ = [
     "build_review_claim_payload",
     "build_review_result_metadata",
     "count_change_gate_corrections",
+    "evaluate_loaded_release_candidate",
     "evaluate_review_claim_runtime",
     "evaluate_loaded_runtime",
     "load_runtime_policy",

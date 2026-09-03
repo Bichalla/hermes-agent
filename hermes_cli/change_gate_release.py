@@ -80,8 +80,10 @@ class ChangeGateHostAdapterResult:
     release_sha256: str | None = None
     handoff_sha256: str | None = None
     evidence_sha256: str | None = None
+    issue_reason: str | None = None
     review_count: int = 0
     candidate_count: int = 0
+    eligibility_diagnostic: dict[str, object] | None = None
     issued_at_epoch: int | None = None
     expires_at_epoch: int | None = None
 
@@ -111,6 +113,10 @@ class ChangeGateHostAdapterResult:
             result["handoff_sha256"] = self.handoff_sha256
         if self.evidence_sha256 is not None:
             result["evidence_sha256"] = self.evidence_sha256
+        if self.issue_reason is not None:
+            result["issue_reason"] = self.issue_reason
+        if self.eligibility_diagnostic is not None:
+            result["eligibility_diagnostic"] = self.eligibility_diagnostic
         if self.issued_at_epoch is not None:
             result["issued_at_epoch"] = self.issued_at_epoch
         if self.expires_at_epoch is not None:
@@ -233,12 +239,15 @@ def issue_change_gate_release(
         if evaluation.result.decision is not GateDecision.ALLOW:
             return _deny(task_id, parsed_purpose.value, evaluation.result.reason)
 
-        stored = kb.persist_or_reuse_foreground_change_gate_release(
-            conn,
-            release,
-            board=board,
-            now_epoch=now_epoch,
-        )
+        try:
+            stored = kb.persist_or_reuse_foreground_change_gate_release(
+                conn,
+                release,
+                board=board,
+                now_epoch=now_epoch,
+            )
+        except kb.ChangeGateReleasePersistenceDenied as exc:
+            return _deny(task_id, parsed_purpose.value, exc.reason)
         return ChangeGateReleaseIssueResult(
             True,
             ChangeGateReason.ALLOWED.value,
@@ -257,6 +266,26 @@ def issue_change_gate_release(
 
 def _host_ineligible(reason: str) -> ChangeGateHostAdapterResult:
     return ChangeGateHostAdapterResult(False, "ineligible", reason)
+
+
+def _eligibility_with_issue(
+    diagnostic: dict[str, object] | None,
+    *,
+    ok: bool,
+    reason: str,
+) -> dict[str, object]:
+    receipt = dict(diagnostic or {})
+    receipt.setdefault(
+        "pre_release_eligible_candidate_count",
+        receipt.get("eligible_candidate_count", 0),
+    )
+    receipt["release_candidate_count"] = 1 if ok else 0
+    receipt["release_issue"] = {
+        "verdict": "PASS" if ok else "FAIL",
+        "actual": {"reason": reason},
+        "expected": ChangeGateReason.ALLOWED.value,
+    }
+    return receipt
 
 
 def issue_current_turn_change_gate_release() -> ChangeGateHostAdapterResult:
@@ -284,13 +313,56 @@ def issue_current_turn_change_gate_release() -> ChangeGateHostAdapterResult:
         return _host_ineligible("current_turn_authority_statement_missing")
 
     authority = get_current_turn_user_authority()
+    controller_role = get_session_controller_role()
+    active_turn_ok = bool(
+        authority is not None
+        and matches_active_workflow_turn(authority, user_message=trusted_text)
+    )
+    current_session_ok = bool(
+        authority is not None and matches_current_workflow_session(authority)
+    )
     if (
         authority is None
-        or get_session_controller_role() != "main_controller"
-        or not matches_active_workflow_turn(authority, user_message=trusted_text)
-        or not matches_current_workflow_session(authority)
+        or controller_role != "main_controller"
+        or not active_turn_ok
+        or not current_session_ok
     ):
-        return _host_ineligible("current_turn_authority_invalid")
+        return ChangeGateHostAdapterResult(
+            False,
+            "ineligible",
+            "current_turn_authority_invalid",
+            eligibility_diagnostic={
+                "schema": "change-gate-eligibility-diagnostic/v1",
+                "global_predicates": {
+                    "authority.present": {
+                        "verdict": "PASS" if authority is not None else "FAIL",
+                        "actual": authority is not None,
+                        "expected": True,
+                    },
+                    "controller.main": {
+                        "verdict": (
+                            "PASS" if controller_role == "main_controller" else "FAIL"
+                        ),
+                        "actual": controller_role,
+                        "expected": "main_controller",
+                    },
+                    "current_turn.active_exact_text": {
+                        "verdict": "PASS" if active_turn_ok else "FAIL",
+                        "actual": active_turn_ok,
+                        "expected": True,
+                    },
+                    "current_session.matches": {
+                        "verdict": "PASS" if current_session_ok else "FAIL",
+                        "actual": current_session_ok,
+                        "expected": True,
+                    },
+                },
+                "candidate_count": 0,
+                "eligible_candidate_count": 0,
+                "release_candidate_count": 0,
+                "candidates": [],
+            },
+        )
 
     from hermes_cli import kanban_db as kb
     from hermes_cli.change_gate_runtime import load_runtime_policy
@@ -322,6 +394,7 @@ def issue_current_turn_change_gate_release() -> ChangeGateHostAdapterResult:
             "zero_candidate",
             "change_gate_target_not_found",
             candidate_count=target.candidate_count,
+            eligibility_diagnostic=target.diagnostic,
         )
     if target.status == "ambiguous":
         return ChangeGateHostAdapterResult(
@@ -329,6 +402,7 @@ def issue_current_turn_change_gate_release() -> ChangeGateHostAdapterResult:
             "ambiguous",
             "change_gate_target_ambiguous",
             candidate_count=target.candidate_count,
+            eligibility_diagnostic=target.diagnostic,
         )
     if target.status != "resolved" or target.task_id is None or target.purpose is None:
         return ChangeGateHostAdapterResult(
@@ -336,6 +410,7 @@ def issue_current_turn_change_gate_release() -> ChangeGateHostAdapterResult:
             "owner_failure",
             "change_gate_owner_failure",
             candidate_count=target.candidate_count,
+            eligibility_diagnostic=target.diagnostic,
         )
 
     try:
@@ -351,6 +426,12 @@ def issue_current_turn_change_gate_release() -> ChangeGateHostAdapterResult:
             task_id=target.task_id,
             purpose=target.purpose.value,
             candidate_count=target.candidate_count,
+            issue_reason="change_gate_release_issue_exception",
+            eligibility_diagnostic=_eligibility_with_issue(
+                target.diagnostic,
+                ok=False,
+                reason="change_gate_release_issue_exception",
+            ),
         )
     if type(issued) is not ChangeGateReleaseIssueResult:
         return ChangeGateHostAdapterResult(
@@ -360,6 +441,11 @@ def issue_current_turn_change_gate_release() -> ChangeGateHostAdapterResult:
             task_id=target.task_id,
             purpose=target.purpose.value,
             candidate_count=target.candidate_count,
+            eligibility_diagnostic=_eligibility_with_issue(
+                target.diagnostic,
+                ok=False,
+                reason="change_gate_release_issue_result_invalid",
+            ),
         )
     if not issued.ok:
         return ChangeGateHostAdapterResult(
@@ -370,6 +456,12 @@ def issue_current_turn_change_gate_release() -> ChangeGateHostAdapterResult:
             purpose=target.purpose.value,
             candidate_count=target.candidate_count,
             review_count=issued.review_count,
+            issue_reason=issued.reason,
+            eligibility_diagnostic=_eligibility_with_issue(
+                target.diagnostic,
+                ok=False,
+                reason=issued.reason,
+            ),
         )
     return ChangeGateHostAdapterResult(
         True,
@@ -383,6 +475,11 @@ def issue_current_turn_change_gate_release() -> ChangeGateHostAdapterResult:
         evidence_sha256=issued.evidence_sha256,
         review_count=issued.review_count,
         candidate_count=target.candidate_count,
+        eligibility_diagnostic=_eligibility_with_issue(
+            target.diagnostic,
+            ok=True,
+            reason=issued.reason,
+        ),
         issued_at_epoch=issued.issued_at_epoch,
         expires_at_epoch=issued.expires_at_epoch,
     )

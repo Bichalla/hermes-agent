@@ -1,0 +1,114 @@
+{
+  "capture_schema": "hermes.change-gate.prepare-canary-terminal-capture/v1",
+  "terminal_commit": "9abe0c4f9dfe3fec890302c7872d2431af9e8f8d",
+  "selected_agent_source": "bf8ea3c4737615d0cf53933f3f613f8620f2d2b4",
+  "operation_id": "20260903T022225Z__gate2-aro-bf8ea3c4-versioned-materialized.3b0f6571",
+  "prepare_canary_output": {
+    "schema": "hermes.gate2.bf8ea3c4.canary-preparation/v1",
+    "status": "PASS_AWAITING_HUMAN_PAUSE_2_PLANNER_CLAIM",
+    "parent_task_id": "t_eb3f0935",
+    "parent_claim_statement": "AUTHORIZE_HERMES_CHANGE_GATE_CLAIM 39f9b3d5aa79a5d8685562f1b471f2d8c3081b258bf173f536ec9ac8f30869c6",
+    "parent_evidence_sha256": "6335751ace1456f3d34bd9927b5c01fbb94c4e3cf431dbbc8d28426e38dc1101",
+    "parent_handoff_sha256": "39f9b3d5aa79a5d8685562f1b471f2d8c3081b258bf173f536ec9ac8f30869c6",
+    "evidence_created_at_epoch": 1788402637,
+    "evidence_expires_at_epoch": 1788403237,
+    "thread_id": "1544895587403694090",
+    "parent_chat_id": "1494022092918882356",
+    "claim_rows": 0,
+    "parent_runs": 0,
+    "provider_before_valid_claim": 0,
+    "retry_replay_fallback_second_canary": [0, 0, 0, 0]
+  },
+  "task_row": {
+    "id": "t_eb3f0935",
+    "title": "Gate 2 ARO NORMAL Planner handoff canary",
+    "status": "ready",
+    "assignee": "change-gate-high",
+    "created_by": "gate2-primary-controller",
+    "workspace_kind": "worktree",
+    "branch_name": "wt/t_eb3f0935",
+    "model_override": "gpt-5.6-sol",
+    "provider_override": null,
+    "reasoning_effort": "high",
+    "session_id": null,
+    "current_run_id": null,
+    "claim_lock": null,
+    "created_at": 1788402637
+  },
+  "notify_row": {
+    "task_id": "t_eb3f0935",
+    "platform": "discord",
+    "chat_id": "1494022092918882356",
+    "thread_id": "1544895587403694090",
+    "created_at": 1788402637,
+    "last_event_id": 739,
+    "delivery_metadata": null
+  },
+  "source_repository": {
+    "remote": "https://github.com/Bichalla/hermes-track-g-canary.git",
+    "commit": "dbe8ef74f81237aa6040fee260506eeec2cdeb51",
+    "tree": "a8654d8611998648c618766b15455cc09c59fde5",
+    "author_name": "Hermes Gate 2 Controller",
+    "author_email": "gate2-controller@localhost",
+    "commit_epoch_and_zone": "1788402637 +0900",
+    "commit_message": "Freeze harmless bytes for one authorized Gate 2 canary\n\nThe fresh NORMAL lineage needs immutable, local-only input and output bindings for the Planner, Executor, and Reviewer lifecycle.\n\nConstraint: No Agent source, provider-side source mutation, or external delivery is permitted\nRejected: Reuse a prior canary checkout | the selected contract requires a fresh lineage\nConfidence: high\nScope-risk: narrow\nReversibility: clean\nDirective: Keep these bytes read-only throughout the canary\nTested: Canonical git object and byte readback\nNot-tested: Provider lifecycle, which is the live gate itself\n",
+    "files": {
+      ".gitignore": ".worktrees/\n",
+      "canary/challenge.txt": "Gate 2 ARO NORMAL canary. Read the committed harmless bytes and perform exactly one frozen Planner-to-Executor handoff. Do not modify source, contact external systems, or perform non-canary work.\n",
+      "canary/result.json": "{\n  \"expected_terminal\": \"GATE2_ARO_PASS\",\n  \"operation\": \"LOCAL_CANARY_ARTIFACT_VALIDATION\",\n  \"status\": \"frozen-harmless-input\"\n}\n"
+    }
+  },
+  "evidence": {
+    "allowed_paths": ["canary/result.json"],
+    "created_at_epoch": 1788402637,
+    "expires_at_epoch": 1788403237,
+    "inventory_id": "gate2-aro-normal-canary-1544895587403694090",
+    "produced_artifacts": [{"git_oid": "93e57ca79374d35b36ecf9ba41820c37af201445", "path": "canary/result.json", "role": "output", "sha256": "47720c022a7e2ab7c3ffd3f7680aba4b08412e3aa412cc1de33e5c321f52743d"}],
+    "required_inputs": [{"git_oid": "8ef9b4e5f5e8bba70751119dd6cfbb1e5b395494", "path": "canary/challenge.txt", "role": "input", "sha256": "fcc93f79f740f6cf2782532fc36d31bf08868dc395846f8ec0a8858729a2cd8a"}],
+    "risk": "NORMAL",
+    "route": {
+      "executor": {"assignee": "change-gate-high", "model_override": "gpt-5.6-sol", "provider_override": null, "reasoning_effort": "high"},
+      "reviews": [{"reviewer_class": "REVIEWER", "selector": {"assignee": "change-gate-high", "model_override": "gpt-5.6-sol", "provider_override": null, "reasoning_effort": "high"}}],
+      "risk": "NORMAL"
+    },
+    "schema": "hermes.change-gate.evidence-packet/v1",
+    "source": {"branch": "wt/t_eb3f0935", "commit": "dbe8ef74f81237aa6040fee260506eeec2cdeb51", "repository": "Bichalla/hermes-track-g-canary", "tree": "a8654d8611998648c618766b15455cc09c59fde5"},
+    "work": {"effect": "LOCAL_CANARY_ARTIFACT_VALIDATION", "operation": "issue-one-production-kanban-g2-handoff", "run_id": "gate2-aro-normal-canary-1544895587403694090-planner-run", "task_id": "t_eb3f0935", "work_id": "gate2-aro-normal-canary-1544895587403694090:planner-parent"}
+  },
+  "frozen_handoff": {
+    "allowed_paths": ["canary/result.json"],
+    "claim_release_required": true,
+    "convergence_rule": "exact-required-classes-pass-same-frozen-bundle/v1",
+    "evidence_sha256": "6335751ace1456f3d34bd9927b5c01fbb94c4e3cf431dbbc8d28426e38dc1101",
+    "forbidden_effects": ["CREDENTIAL_ACCESS", "EXTERNAL_DELIVERY", "NON_CANARY_TASK_MUTATION", "PROVIDER_SIDE_NON_LIFECYCLE_TOOL_USE", "RUNTIME_POLICY_PROFILE_MUTATION", "SOURCE_COMMIT_OR_PUSH"],
+    "g4_release_required": true,
+    "inventory_consumer": "hermes_cli.change_gate_runtime.FileArchitectureInventoryReader",
+    "inventory_id": "gate2-aro-normal-canary-1544895587403694090",
+    "inventory_owner": "/Users/honbul/.hermes/scripts/change_gate_validate.py",
+    "inventory_sha256": "b80795cb932d3571f17167a0059d6b72503eb3769d3ca26b9871875d3b388762",
+    "produced_artifacts": [{"git_oid": "93e57ca79374d35b36ecf9ba41820c37af201445", "path": "canary/result.json", "role": "output", "sha256": "47720c022a7e2ab7c3ffd3f7680aba4b08412e3aa412cc1de33e5c321f52743d"}],
+    "required_inputs": [{"git_oid": "8ef9b4e5f5e8bba70751119dd6cfbb1e5b395494", "path": "canary/challenge.txt", "role": "input", "sha256": "fcc93f79f740f6cf2782532fc36d31bf08868dc395846f8ec0a8858729a2cd8a"}],
+    "route": {
+      "executor": {"assignee": "change-gate-high", "model_override": "gpt-5.6-sol", "provider_override": null, "reasoning_effort": "high"},
+      "reviews": [{"reviewer_class": "REVIEWER", "selector": {"assignee": "change-gate-high", "model_override": "gpt-5.6-sol", "provider_override": null, "reasoning_effort": "high"}}],
+      "risk": "NORMAL"
+    },
+    "schema": "hermes.change-gate.frozen-handoff/v1",
+    "scope": ["LOCAL_CANARY_ARTIFACT_VALIDATION"],
+    "source": {"branch": "wt/t_eb3f0935", "commit": "dbe8ef74f81237aa6040fee260506eeec2cdeb51", "repository": "Bichalla/hermes-track-g-canary", "tree": "a8654d8611998648c618766b15455cc09c59fde5"},
+    "work": {"effect": "LOCAL_CANARY_ARTIFACT_VALIDATION", "operation": "issue-one-production-kanban-g2-handoff", "run_id": "gate2-aro-normal-canary-1544895587403694090-planner-run", "task_id": "t_eb3f0935", "work_id": "gate2-aro-normal-canary-1544895587403694090:planner-parent"}
+  },
+  "inventory": {
+    "activation_state": "BOUNDED_LIVE_GATE2_ARO_NORMAL_CANARY",
+    "artifact_paths": ["canary/result.json"],
+    "authority_contract": "/Users/honbul/.hermes/policies/change-gate/policy.yaml#inventory_contract",
+    "blast_radius": ["dedicated-discord-thread-1544895587403694090", "default-board-single-planner-parent-and-single-executor-child", "fresh-operation-local-canary-workspace", "one-planner-one-executor-one-reviewer-run"],
+    "capability": "gate2-aro-normal-canary-1544895587403694090",
+    "consumers": ["hermes_cli.change_gate_runtime.FileArchitectureInventoryReader"],
+    "inventory_id": "gate2-aro-normal-canary-1544895587403694090",
+    "owner": "/Users/honbul/.hermes/scripts/change_gate_validate.py",
+    "risk": "NORMAL",
+    "schema": "hermes.change-gate.architecture-inventory/v1",
+    "source_paths": ["canary/challenge.txt", "canary/result.json"]
+  }
+}

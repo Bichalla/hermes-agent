@@ -53,6 +53,7 @@ def test_set_session_env_sets_contextvars(monkeypatch):
     monkeypatch.delenv("HERMES_SESSION_USER_ID", raising=False)
     monkeypatch.delenv("HERMES_SESSION_USER_NAME", raising=False)
     monkeypatch.delenv("HERMES_SESSION_THREAD_ID", raising=False)
+    monkeypatch.delenv("HERMES_SESSION_PARENT_CHAT_ID", raising=False)
 
     tokens = runner._set_session_env(context)
 
@@ -65,15 +66,45 @@ def test_set_session_env_sets_contextvars(monkeypatch):
     assert get_session_env("HERMES_SESSION_USER_ID") == "123456"
     assert get_session_env("HERMES_SESSION_USER_NAME") == "alice"
     assert get_session_env("HERMES_SESSION_THREAD_ID") == "17585"
+    assert get_session_env("HERMES_SESSION_PARENT_CHAT_ID") == ""
 
     # os.environ should NOT be touched
     assert os.getenv("HERMES_SESSION_PLATFORM") is None
     assert os.getenv("HERMES_SESSION_SOURCE") is None
     assert os.getenv("HERMES_SESSION_CHAT_TYPE") is None
     assert os.getenv("HERMES_SESSION_THREAD_ID") is None
+    assert os.getenv("HERMES_SESSION_PARENT_CHAT_ID") is None
 
     # Clean up
     runner._clear_session_env(tokens)
+
+
+def test_set_session_env_preserves_discord_parent_chat_context(monkeypatch):
+    """Discord thread messages bind both thread chat_id and parent channel id."""
+    runner = object.__new__(GatewayRunner)
+    source = SessionSource(
+        platform=Platform.DISCORD,
+        chat_id="thread-1544",
+        chat_name="Gate 2 thread",
+        chat_type="thread",
+        user_id="123456",
+        user_name="alice",
+        thread_id="thread-1544",
+        parent_chat_id="channel-1494",
+    )
+    context = SessionContext(source=source, connected_platforms=[], home_channels={})
+
+    monkeypatch.delenv("HERMES_SESSION_PARENT_CHAT_ID", raising=False)
+
+    tokens = runner._set_session_env(context)
+    try:
+        assert get_session_env("HERMES_SESSION_PLATFORM") == "discord"
+        assert get_session_env("HERMES_SESSION_CHAT_ID") == "thread-1544"
+        assert get_session_env("HERMES_SESSION_THREAD_ID") == "thread-1544"
+        assert get_session_env("HERMES_SESSION_PARENT_CHAT_ID") == "channel-1494"
+        assert os.getenv("HERMES_SESSION_PARENT_CHAT_ID") is None
+    finally:
+        runner._clear_session_env(tokens)
 
 
 def test_clear_session_env_restores_previous_state(monkeypatch):

@@ -1,24 +1,30 @@
-"""Synthetic integration tests for default-off Change Gate runtime wiring."""
+"""Integration tests for default-off Change Gate runtime wiring."""
 
 from __future__ import annotations
 
 import hashlib
 import json
+import os
 import sqlite3
 import subprocess
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 
 import pytest
 
+import tools.workflow_authority as workflow_authority
+from gateway.config import Platform
+from gateway.run import GatewayRunner
+from gateway.session import SessionContext, SessionSource
+from gateway.session_context import clear_session_vars, set_session_vars
 from hermes_cli import kanban_db as kb
 from hermes_cli.change_gate import (
     ARCHITECTURE_INVENTORY_SCHEMA,
-    ArtifactBinding,
     ArchitectureInventoryRecord,
+    ArtifactBinding,
     ChangeGateReason,
     DurableReleaseArtifact,
     EvidencePacket,
@@ -27,9 +33,9 @@ from hermes_cli.change_gate import (
     HumanReleaseReceipt,
     PreFreezeRouteRule,
     ReleasePurpose,
+    ReviewerClass,
     ReviewResult,
     ReviewRoute,
-    ReviewerClass,
     ReviewVerdict,
     RiskLevel,
     RouteProjection,
@@ -37,6 +43,7 @@ from hermes_cli.change_gate import (
     TransitionAnchor,
     UpstreamRouteSelector,
     WorkIdentity,
+    canonical_json_bytes,
     canonical_sha256,
     evaluate_reviews,
     expected_release_statement,
@@ -49,8 +56,8 @@ from hermes_cli.change_gate_release import (
     issue_current_turn_change_gate_release,
 )
 from hermes_cli.change_gate_runtime import (
-    ChangeGateRuntimePolicy,
     REVIEW_METADATA_KEY,
+    ChangeGateRuntimePolicy,
     build_review_result_metadata,
     count_change_gate_corrections,
     load_task_gate_artifacts,
@@ -60,7 +67,6 @@ from tools.workflow_authority import (
     _scoped_test_current_turn_user_authority,
     fingerprint_user_action,
 )
-from gateway.session_context import clear_session_vars, set_session_vars
 
 
 @dataclass(frozen=True, slots=True)
@@ -455,12 +461,243 @@ def _current_turn_claim_fixture(
 
 
 def _current_turn_release_count(conn: sqlite3.Connection, task_id: str) -> int:
+    if not kb.change_gate_runtime_schema_exists(conn):
+        return 0
     return int(
         conn.execute(
             "SELECT COUNT(*) FROM change_gate_releases WHERE task_id = ?",
             (task_id,),
         ).fetchone()[0]
     )
+
+
+def _add_discord_prepare_notify(
+    conn: sqlite3.Connection,
+    task_id: str,
+    *,
+    thread_id: str = "1544895587403694090",
+    parent_chat_id: str = "1494022092918882356",
+    created_at: int = 20,
+) -> None:
+    """Replay the Discord notify tuple emitted by the terminal prepare_canary."""
+
+    conn.execute("UPDATE tasks SET session_id = NULL WHERE id = ?", (task_id,))
+    conn.execute(
+        "INSERT INTO kanban_notify_subs("
+        "task_id, platform, chat_id, thread_id, created_at, last_event_id"
+        ") VALUES (?, ?, ?, ?, ?, 0)",
+        (task_id, "discord", parent_chat_id, thread_id, created_at),
+    )
+
+
+_TERMINAL_PREPARE_CAPTURE = (
+    Path(__file__).parents[1] / "fixtures" / "gate2_prepare_canary_parent_9abe0c4.json"
+)
+_ELIGIBILITY_SUBPREDICATES = {
+    "task.state_run_lock",
+    "task.purpose_for_authority",
+    "session_or_notify_origin",
+    "task_evidence_handoff_binding",
+    "evidence.task_ttl",
+    "frozen_handoff.binding",
+    "source.binding",
+    "task.route_role",
+    "reviews.binding",
+    "change_gate_adapter.pre_release",
+    "statement.exact",
+}
+
+
+def _load_terminal_prepare_capture() -> dict[str, object]:
+    capture = json.loads(_TERMINAL_PREPARE_CAPTURE.read_text(encoding="utf-8"))
+    assert capture["terminal_commit"] == "9abe0c4f9dfe3fec890302c7872d2431af9e8f8d"
+    assert capture["selected_agent_source"] == (
+        "bf8ea3c4737615d0cf53933f3f613f8620f2d2b4"
+    )
+    return capture
+
+
+def _recreate_terminal_canary_source(
+    tmp_path: Path,
+    capture: dict[str, object],
+) -> Path:
+    source_capture = capture["source_repository"]
+    assert isinstance(source_capture, dict)
+    repo = tmp_path / "terminal-canary-source"
+    repo.mkdir()
+    subprocess.run(["git", "-C", str(repo), "init", "-b", "main"], check=True)
+    _run_git(repo, "config", "user.name", str(source_capture["author_name"]))
+    _run_git(repo, "config", "user.email", str(source_capture["author_email"]))
+    _run_git(repo, "remote", "add", "origin", str(source_capture["remote"]))
+    files = source_capture["files"]
+    assert isinstance(files, dict)
+    for relative_path, content in files.items():
+        target = repo / str(relative_path)
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_text(str(content), encoding="utf-8")
+    _run_git(repo, "add", ".")
+    commit_env = os.environ.copy()
+    commit_env.update(
+        {
+            "GIT_AUTHOR_NAME": str(source_capture["author_name"]),
+            "GIT_AUTHOR_EMAIL": str(source_capture["author_email"]),
+            "GIT_AUTHOR_DATE": str(source_capture["commit_epoch_and_zone"]),
+            "GIT_COMMITTER_NAME": str(source_capture["author_name"]),
+            "GIT_COMMITTER_EMAIL": str(source_capture["author_email"]),
+            "GIT_COMMITTER_DATE": str(source_capture["commit_epoch_and_zone"]),
+        }
+    )
+    subprocess.run(
+        ["git", "-C", str(repo), "commit", "--no-gpg-sign", "--file=-"],
+        input=str(source_capture["commit_message"]),
+        text=True,
+        check=True,
+        capture_output=True,
+        env=commit_env,
+    )
+    assert _run_git(repo, "rev-parse", "HEAD") == source_capture["commit"]
+    assert _run_git(repo, "rev-parse", "HEAD^{tree}") == source_capture["tree"]
+    task_row = capture["task_row"]
+    assert isinstance(task_row, dict)
+    _run_git(repo, "switch", "-c", str(task_row["branch_name"]))
+    return repo
+
+
+def _install_terminal_prepare_canary_output(
+    conn: sqlite3.Connection,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> dict[str, object]:
+    """Install the byte-exact terminal prepare_canary output into an isolated DB."""
+
+    capture = _load_terminal_prepare_capture()
+    prepare = capture["prepare_canary_output"]
+    task_row = capture["task_row"]
+    notify_row = capture["notify_row"]
+    assert isinstance(prepare, dict)
+    assert isinstance(task_row, dict)
+    assert isinstance(notify_row, dict)
+    monkeypatch.setattr(time, "time", lambda: prepare["evidence_created_at_epoch"] + 1)
+    repo = _recreate_terminal_canary_source(tmp_path, capture)
+
+    generated_task_id = _create_ready_task(conn)
+    conn.execute(
+        "UPDATE tasks SET id = ?, title = ?, status = ?, assignee = ?, created_by = ?, "
+        "created_at = ?, workspace_kind = ?, workspace_path = ?, branch_name = ?, "
+        "model_override = ?, provider_override = ?, reasoning_effort = ?, session_id = ?, "
+        "current_run_id = ?, claim_lock = ? WHERE id = ?",
+        (
+            task_row["id"],
+            task_row["title"],
+            task_row["status"],
+            task_row["assignee"],
+            task_row["created_by"],
+            task_row["created_at"],
+            task_row["workspace_kind"],
+            str(repo),
+            task_row["branch_name"],
+            task_row["model_override"],
+            task_row["provider_override"],
+            task_row["reasoning_effort"],
+            task_row["session_id"],
+            task_row["current_run_id"],
+            task_row["claim_lock"],
+            generated_task_id,
+        ),
+    )
+    evidence_bytes = canonical_json_bytes(capture["evidence"])
+    handoff_bytes = canonical_json_bytes(capture["frozen_handoff"])
+    inventory_bytes = canonical_json_bytes(capture["inventory"])
+    assert hashlib.sha256(evidence_bytes).hexdigest() == prepare["parent_evidence_sha256"]
+    assert hashlib.sha256(handoff_bytes).hexdigest() == prepare["parent_handoff_sha256"]
+    assert hashlib.sha256(inventory_bytes).hexdigest() == capture["frozen_handoff"][
+        "inventory_sha256"
+    ]
+    kb.store_attachment_bytes(
+        conn,
+        str(task_row["id"]),
+        filename="change-gate-evidence.json",
+        data=evidence_bytes,
+        content_type="application/json",
+    )
+    kb.store_attachment_bytes(
+        conn,
+        str(task_row["id"]),
+        filename="change-gate-frozen-handoff.json",
+        data=handoff_bytes,
+        content_type="application/json",
+    )
+    conn.execute(
+        "INSERT INTO kanban_notify_subs("
+        "task_id, platform, chat_id, thread_id, created_at, last_event_id, "
+        "delivery_metadata) VALUES (?, ?, ?, ?, ?, ?, ?)",
+        (
+            notify_row["task_id"],
+            notify_row["platform"],
+            notify_row["chat_id"],
+            notify_row["thread_id"],
+            notify_row["created_at"],
+            notify_row["last_event_id"],
+            notify_row["delivery_metadata"],
+        ),
+    )
+    inventory_root = tmp_path / "terminal-inventory"
+    inventory_root.mkdir()
+    inventory_id = capture["inventory"]["inventory_id"]
+    (inventory_root / f"{inventory_id}.json").write_bytes(inventory_bytes)
+    _enable_runtime(monkeypatch, inventory_root)
+    return capture
+
+
+def _wrong_evidence_task_binding(
+    _conn: sqlite3.Connection,
+    _task_id: str,
+    attachments: dict[str, str],
+    fixture: RuntimeFixture,
+) -> str:
+    evidence = replace(
+        fixture.evidence,
+        work=replace(fixture.evidence.work, task_id="t_wrong_parent"),
+    )
+    handoff = freeze_handoff(
+        evidence,
+        inventory=fixture.inventory,
+        inventory_consumer="change-gate-runtime-integration",
+        scope=("SOURCE_CHANGE",),
+        forbidden_effects=("LIVE_SERVICE_MUTATION",),
+    )
+    Path(attachments["evidence"]).write_bytes(encode_artifact(evidence))
+    Path(attachments["handoff"]).write_bytes(encode_artifact(handoff))
+    return handoff.digest()
+
+
+def _wrong_claim_task_state(
+    conn: sqlite3.Connection,
+    task_id: str,
+    _attachments: dict[str, str],
+    _fixture: RuntimeFixture,
+) -> None:
+    conn.execute("UPDATE tasks SET status = 'review' WHERE id = ?", (task_id,))
+
+
+def _wrong_task_route(
+    conn: sqlite3.Connection,
+    task_id: str,
+    _attachments: dict[str, str],
+    _fixture: RuntimeFixture,
+) -> None:
+    conn.execute("UPDATE tasks SET assignee = 'wrong-agent' WHERE id = ?", (task_id,))
+
+
+def _wrong_frozen_handoff_binding(
+    _conn: sqlite3.Connection,
+    _task_id: str,
+    attachments: dict[str, str],
+    fixture: RuntimeFixture,
+) -> str:
+    handoff = replace(_handoff(fixture), allowed_paths=("different-path.txt",))
+    Path(attachments["handoff"]).write_bytes(encode_artifact(handoff))
+    return handoff.digest()
 
 
 def _issue_current_turn_claim(
@@ -480,6 +717,46 @@ def _issue_current_turn_claim(
             return issue_current_turn_change_gate_release()
     finally:
         clear_session_vars(tokens)
+
+
+def _issue_discord_thread_parent_claim(
+    *,
+    statement: str,
+    session_id: str,
+    thread_id: str = "1544895587403694090",
+    parent_chat_id: str = "1494022092918882356",
+    turn_id: str = "discord-parent-claim-turn",
+    active_turn_override: tuple[str, str, str] | None = None,
+):
+    runner = object.__new__(GatewayRunner)
+    context = SessionContext(
+        source=SessionSource(
+            platform=Platform.DISCORD,
+            chat_id=thread_id,
+            chat_type="thread",
+            thread_id=thread_id,
+            parent_chat_id=parent_chat_id,
+            user_id="discord-user",
+            user_name="operator",
+        ),
+        connected_platforms=[],
+        home_channels={},
+        session_key=f"agent:main:discord:thread:{thread_id}",
+        session_id=session_id,
+    )
+    tokens = runner._set_session_env(context)
+    try:
+        with _scoped_test_current_turn_user_authority(
+            statement,
+            session_id=session_id,
+            turn_id=turn_id,
+            platform_scope="discord",
+        ):
+            if active_turn_override is not None:
+                workflow_authority._ACTIVE_TURN.set(active_turn_override)
+            return issue_current_turn_change_gate_release()
+    finally:
+        runner._clear_session_env(tokens)
 
 
 def _claim_and_converge_normal_review(
@@ -2848,6 +3125,345 @@ def test_current_turn_resolver_notify_fallback_never_overrides_task_session(
         ).fetchone()[0] == 0
 
 
+def test_discord_prepare_canary_parent_claim_shape_releases_once(
+    tmp_path: Path,
+    isolated_home: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    db_path = tmp_path / "kanban.db"
+    monkeypatch.setenv("HERMES_KANBAN_DB", str(db_path))
+    with _connect(db_path) as conn:
+        capture = _install_terminal_prepare_canary_output(conn, tmp_path, monkeypatch)
+        prepare = capture["prepare_canary_output"]
+        notify_row = capture["notify_row"]
+        assert isinstance(prepare, dict)
+        assert isinstance(notify_row, dict)
+        task_id = str(prepare["parent_task_id"])
+        statement = str(prepare["parent_claim_statement"])
+
+        result = _issue_discord_thread_parent_claim(
+            statement=statement,
+            session_id="session-discord-parent",
+            thread_id=str(notify_row["thread_id"]),
+            parent_chat_id=str(notify_row["chat_id"]),
+        )
+
+        assert result.ok
+        assert result.status == "issued"
+        assert result.task_id == task_id
+        assert result.purpose == ReleasePurpose.CLAIM.value
+        assert _current_turn_release_count(conn, task_id) == 1
+        receipt = result.as_dict()["eligibility_diagnostic"]
+        assert isinstance(receipt, dict)
+        assert receipt["candidate_count"] == 1
+        assert receipt["eligible_candidate_count"] == 1
+        assert receipt["release_candidate_count"] == 1
+        candidate = receipt["candidates"][0]
+        assert candidate["verdict"] == "PASS"
+        assert candidate["task_id"] == "t_eb3f0935"
+        origin = candidate["subpredicates"]["session_or_notify_origin"]
+        assert origin["notify_rows"][0]["discord_parent_chat_id"]["verdict"] == "PASS"
+
+
+@pytest.mark.parametrize(
+    ("case", "mutate", "issue_kwargs", "expected_path", "expected_value"),
+    [
+        (
+            "wrong_thread",
+            lambda conn, task_id, attachments, fixture: None,
+            {"thread_id": "wrong-thread"},
+            (
+                "candidates",
+                0,
+                "subpredicates",
+                "session_or_notify_origin",
+                "notify_rows",
+                0,
+                "thread_id",
+                "verdict",
+            ),
+            "FAIL",
+        ),
+        (
+            "wrong_parent_origin",
+            lambda conn, task_id, attachments, fixture: None,
+            {"parent_chat_id": "wrong-parent"},
+            (
+                "candidates",
+                0,
+                "subpredicates",
+                "session_or_notify_origin",
+                "notify_rows",
+                0,
+                "discord_parent_chat_id",
+                "verdict",
+            ),
+            "FAIL",
+        ),
+        (
+            "wrong_task_state",
+            _wrong_claim_task_state,
+            {},
+            ("candidates", 0, "status"),
+            "review",
+        ),
+        (
+            "wrong_role_route",
+            _wrong_task_route,
+            {},
+            (
+                "candidates",
+                0,
+                "subpredicates",
+                "change_gate_adapter.pre_release",
+                "actual",
+                "reason",
+            ),
+            ChangeGateReason.ROUTE_PROJECTION_MISMATCH.value,
+        ),
+        (
+            "wrong_evidence_task_binding",
+            _wrong_evidence_task_binding,
+            {},
+            (
+                "candidates",
+                0,
+                "subpredicates",
+                "change_gate_adapter.pre_release",
+                "actual",
+                "reason",
+            ),
+            ChangeGateReason.TASK_ID_MISMATCH.value,
+        ),
+        (
+            "wrong_handoff_binding",
+            _wrong_frozen_handoff_binding,
+            {},
+            (
+                "candidates",
+                0,
+                "subpredicates",
+                "change_gate_adapter.pre_release",
+                "actual",
+                "reason",
+            ),
+            ChangeGateReason.HANDOFF_BINDING_MISMATCH.value,
+        ),
+    ],
+)
+def test_discord_prepare_canary_parent_claim_fail_closed_with_diagnostic(
+    tmp_path: Path,
+    isolated_home: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    case,
+    mutate,
+    issue_kwargs,
+    expected_path,
+    expected_value,
+) -> None:
+    db_path = tmp_path / f"{case}.db"
+    monkeypatch.setenv("HERMES_KANBAN_DB", str(db_path))
+    with _connect(db_path) as conn:
+        task_id = _create_ready_task(conn)
+        fixture = _attach_runtime_artifacts(conn, tmp_path, task_id)
+        _add_discord_prepare_notify(conn, task_id)
+        attachment_rows = conn.execute(
+            "SELECT filename, stored_path FROM task_attachments "
+            "WHERE task_id = ? AND filename IN (?, ?)",
+            (
+                task_id,
+                "change-gate-evidence.json",
+                "change-gate-frozen-handoff.json",
+            ),
+        ).fetchall()
+        attachments = {row["filename"]: row["stored_path"] for row in attachment_rows}
+        handoff_sha256 = mutate(
+            conn,
+            task_id,
+            {
+                "evidence": attachments["change-gate-evidence.json"],
+                "handoff": attachments["change-gate-frozen-handoff.json"],
+            },
+            fixture,
+        )
+        _enable_runtime(monkeypatch, tmp_path / "inventory")
+        statement = expected_release_statement(
+            purpose=ReleasePurpose.CLAIM,
+            handoff_sha256=handoff_sha256 or fixture.handoff_sha256,
+        )
+
+        result = _issue_discord_thread_parent_claim(
+            statement=statement,
+            session_id=f"session-{case}",
+            turn_id=f"turn-{case}",
+            **issue_kwargs,
+        )
+
+        assert not result.ok
+        assert result.status == "zero_candidate"
+        assert _current_turn_release_count(conn, task_id) == 0
+        receipt = result.as_dict()["eligibility_diagnostic"]
+        assert receipt["eligible_candidate_count"] == 0
+        assert receipt["release_candidate_count"] == 0
+        assert set(receipt["candidates"][0]["subpredicates"]) == (
+            _ELIGIBILITY_SUBPREDICATES
+        )
+        value = receipt
+        for key in expected_path:
+            value = value[key]
+        assert value == expected_value
+        if case == "wrong_task_state":
+            candidate = receipt["candidates"][0]
+            assert candidate["purpose"] == ReleasePurpose.G4.value
+            assert (
+                candidate["subpredicates"]["task.purpose_for_authority"]["verdict"]
+                == "FAIL"
+            )
+            assert candidate["subpredicates"]["statement.exact"]["verdict"] == "FAIL"
+
+
+def test_discord_prepare_canary_parent_claim_expired_evidence_fails_closed(
+    tmp_path: Path,
+    isolated_home: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    db_path = tmp_path / "expired.db"
+    monkeypatch.setenv("HERMES_KANBAN_DB", str(db_path))
+    with _connect(db_path) as conn:
+        task_id = _create_ready_task(conn)
+        fixture = _attach_runtime_artifacts(conn, tmp_path, task_id)
+        _add_discord_prepare_notify(conn, task_id)
+        _enable_runtime(monkeypatch, tmp_path / "inventory")
+        statement = expected_release_statement(
+            purpose=ReleasePurpose.CLAIM,
+            handoff_sha256=fixture.handoff_sha256,
+        )
+        monkeypatch.setattr(time, "time", lambda: fixture.evidence.expires_at_epoch)
+
+        result = _issue_discord_thread_parent_claim(
+            statement=statement,
+            session_id="session-expired-evidence",
+            turn_id="turn-expired-evidence",
+        )
+
+        assert not result.ok
+        assert result.status == "zero_candidate"
+        assert _current_turn_release_count(conn, task_id) == 0
+        receipt = result.as_dict()["eligibility_diagnostic"]
+        assert receipt["eligible_candidate_count"] == 0
+        assert (
+            receipt["candidates"][0]["subpredicates"]["evidence.task_ttl"]["verdict"]
+            == "FAIL"
+        )
+        assert (
+            receipt["candidates"][0]["subpredicates"]
+            ["change_gate_adapter.pre_release"]["actual"]["reason"]
+            == ChangeGateReason.EVIDENCE_EXPIRED.value
+        )
+
+
+def test_discord_prepare_canary_parent_claim_replayed_turn_fails_closed(
+    tmp_path: Path,
+    isolated_home: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    db_path = tmp_path / "replayed-turn.db"
+    monkeypatch.setenv("HERMES_KANBAN_DB", str(db_path))
+    with _connect(db_path) as conn:
+        task_id = _create_ready_task(conn)
+        fixture = _attach_runtime_artifacts(conn, tmp_path, task_id)
+        _add_discord_prepare_notify(conn, task_id)
+        _enable_runtime(monkeypatch, tmp_path / "inventory")
+        statement = expected_release_statement(
+            purpose=ReleasePurpose.CLAIM,
+            handoff_sha256=fixture.handoff_sha256,
+        )
+
+        result = _issue_discord_thread_parent_claim(
+            statement=statement,
+            session_id="session-replayed-turn",
+            turn_id="stale-discord-turn",
+            active_turn_override=(
+                "newer-discord-turn",
+                "discord",
+                "session-replayed-turn",
+            ),
+        )
+
+        assert not result.ok
+        assert result.status == "ineligible"
+        assert result.reason == "current_turn_authority_invalid"
+        assert _current_turn_release_count(conn, task_id) == 0
+        receipt = result.as_dict()["eligibility_diagnostic"]
+        assert receipt["candidate_count"] == 0
+        assert receipt["eligible_candidate_count"] == 0
+        assert (
+            receipt["global_predicates"]["current_turn.active_exact_text"]["verdict"]
+            == "FAIL"
+        )
+
+
+def test_discord_prepare_canary_parent_claim_consumed_statement_does_not_reissue(
+    tmp_path: Path,
+    isolated_home: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    db_path = tmp_path / "consumed.db"
+    monkeypatch.setenv("HERMES_KANBAN_DB", str(db_path))
+    with _connect(db_path) as conn:
+        task_id = _create_ready_task(conn)
+        fixture = _attach_runtime_artifacts(conn, tmp_path, task_id)
+        _add_discord_prepare_notify(conn, task_id)
+        _enable_runtime(monkeypatch, tmp_path / "inventory")
+        statement = expected_release_statement(
+            purpose=ReleasePurpose.CLAIM,
+            handoff_sha256=fixture.handoff_sha256,
+        )
+        first = _issue_discord_thread_parent_claim(
+            statement=statement,
+            session_id="session-consumed-discord",
+            turn_id="turn-consumed-discord",
+        )
+        assert first.ok
+        assert first.release_id is not None
+        release = kb._load_change_gate_release(conn, first.release_id)
+        assert release is not None
+        assert kb._mark_change_gate_release_consumed(
+            conn,
+            release,
+            run_id=101,
+            event_id=202,
+            from_status="ready",
+            to_status="running",
+            now_epoch=(first.issued_at_epoch or int(time.time())) + 1,
+        )
+
+        second = _issue_discord_thread_parent_claim(
+            statement=statement,
+            session_id="session-consumed-discord",
+            turn_id="turn-consumed-discord",
+        )
+
+        assert not second.ok
+        assert second.status == "owner_failure"
+        assert _current_turn_release_count(conn, task_id) == 1
+        payload = second.as_dict()
+        assert payload["eligibility_diagnostic"]["eligible_candidate_count"] == 1
+        assert (
+            payload["eligibility_diagnostic"][
+                "pre_release_eligible_candidate_count"
+            ]
+            == 1
+        )
+        assert payload["eligibility_diagnostic"]["release_candidate_count"] == 0
+        assert payload["issue_reason"] == ChangeGateReason.RELEASE_REPLAY.value
+        assert payload["eligibility_diagnostic"]["release_issue"] == {
+            "verdict": "FAIL",
+            "actual": {"reason": ChangeGateReason.RELEASE_REPLAY.value},
+            "expected": ChangeGateReason.ALLOWED.value,
+        }
+
+
 def test_current_turn_malformed_authority_fails_closed_without_schema(
     tmp_path: Path,
     isolated_home: Path,
@@ -2910,7 +3526,7 @@ def test_current_turn_default_off_authority_fails_open_to_provider_without_schem
         assert not kb.change_gate_runtime_schema_exists(conn)
 
 
-def test_current_turn_ambiguous_authority_fails_closed_without_release_schema(
+def test_discord_prepare_canary_duplicate_parent_fails_closed_without_release_schema(
     tmp_path: Path,
     isolated_home: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -2921,10 +3537,8 @@ def test_current_turn_ambiguous_authority_fails_closed_without_release_schema(
         first_task = _create_ready_task(conn)
         fixture = _attach_runtime_artifacts(conn, tmp_path, first_task)
         second_task = _create_ready_task(conn)
-        conn.execute(
-            "UPDATE tasks SET session_id = ? WHERE id IN (?, ?)",
-            ("session-ambiguous", first_task, second_task),
-        )
+        _add_discord_prepare_notify(conn, first_task, created_at=20)
+        _add_discord_prepare_notify(conn, second_task, created_at=21)
         rows = conn.execute(
             "SELECT filename, stored_path, content_type FROM task_attachments "
             "WHERE task_id = ?",
@@ -2960,17 +3574,37 @@ def test_current_turn_ambiguous_authority_fails_closed_without_release_schema(
             handoff_sha256=fixture.handoff_sha256,
         )
 
-        with _scoped_test_current_turn_user_authority(
-            statement,
+        result = _issue_discord_thread_parent_claim(
+            statement=statement,
             session_id="session-ambiguous",
             turn_id="ambiguous-turn",
-            platform_scope="manual",
-        ):
-            result = issue_current_turn_change_gate_release()
+        )
 
         assert not result.ok
         assert result.status == "ambiguous"
         assert result.candidate_count == 2
+        receipt = result.as_dict()["eligibility_diagnostic"]
+        assert receipt["candidate_count"] == 2
+        assert receipt["eligible_candidate_count"] == 1
+        assert receipt["statement_candidate_count"] == 2
+        assert receipt["release_candidate_count"] == 0
+        assert receipt["suspicious_statement_duplicate_count"] == 1
+        assert (
+            receipt["global_predicates"]["candidate.duplicate_parent_guard"][
+                "verdict"
+            ]
+            == "FAIL"
+        )
+        copied = next(
+            candidate
+            for candidate in receipt["candidates"]
+            if candidate["task_id"] == second_task
+        )
+        assert (
+            copied["subpredicates"]["change_gate_adapter.pre_release"]["actual"]
+            ["reason"]
+            == ChangeGateReason.TASK_ID_MISMATCH.value
+        )
         assert result.terminal
         assert not kb.change_gate_runtime_schema_exists(conn)
 

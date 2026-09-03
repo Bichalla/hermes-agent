@@ -87,7 +87,7 @@ import time
 from contextvars import ContextVar, Token
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Iterable, Mapping, Optional
+from typing import Any, Iterable, Mapping, Optional, cast
 
 from hermes_cli.change_gate import (
     ARCHITECTURE_INVENTORY_SCHEMA,
@@ -143,12 +143,21 @@ class ChangeGateAuthorityResolution:
     task_id: str | None
     purpose: ReleasePurpose | None
     candidate_count: int
+    diagnostic: dict[str, object] | None = None
 
 
 @dataclass(frozen=True, slots=True)
 class ForegroundChangeGateReleasePersistence:
     release: DurableReleaseArtifact
     reused: bool
+
+
+class ChangeGateReleasePersistenceDenied(PermissionError):
+    """Typed fail-closed persistence result with a stable contract reason."""
+
+    def __init__(self, code: str, reason: ChangeGateReason) -> None:
+        super().__init__(code)
+        self.reason = reason
 
 
 # ---------------------------------------------------------------------------
@@ -5222,24 +5231,88 @@ def _canonical_change_gate_host_text(value: object) -> str | None:
     return value if type(value) is str and value and "\0" not in value else None
 
 
-def _session_origin_matches_current_turn(
+def _cg_bool(value: bool) -> str:
+    return "PASS" if value else "FAIL"
+
+
+def _cg_digest(value: object) -> str | None:
+    if type(value) is not str or not value:
+        return None
+    return canonical_sha256({"value": value})
+
+
+def _cg_not_evaluated(blocked_by: str) -> dict[str, object]:
+    return {
+        "verdict": "UNKNOWN",
+        "actual": {"evaluated": False, "blocked_by": blocked_by},
+        "expected": {"evaluated": True},
+    }
+
+
+def _session_origin_diagnostic(
     task_row: sqlite3.Row,
     notify_rows: Iterable[sqlite3.Row],
     *,
     authority: object,
-) -> bool:
+) -> dict[str, object]:
     from gateway.session_context import get_session_env
     from tools.workflow_authority import matches_active_workflow_turn
+
+    leaves: list[dict[str, object]] = []
+
+    def add(
+        name: str,
+        passed: bool,
+        *,
+        actual: object = None,
+        expected: object = None,
+    ) -> bool:
+        leaf: dict[str, object] = {
+            "name": name,
+            "verdict": _cg_bool(passed),
+            "actual": actual,
+            "expected": expected,
+        }
+        leaves.append(leaf)
+        return passed
 
     task_session_id = task_row["session_id"]
     authority_session = getattr(authority, "session_scope", "")
     authority_platform = getattr(authority, "platform_scope", "")
-    if type(authority_session) is not str or not authority_session:
-        return False
+    session_scope_ok = add(
+        "authority.session_scope.present",
+        type(authority_session) is str and bool(authority_session),
+        actual=(
+            type(authority_session).__name__
+            if type(authority_session) is not str
+            else bool(authority_session)
+        ),
+        expected=True,
+    )
     if type(task_session_id) is str and task_session_id.strip():
-        return matches_active_workflow_turn(authority, session_id=task_session_id)
+        active = bool(
+            session_scope_ok
+            and matches_active_workflow_turn(authority, session_id=task_session_id)
+        )
+        add(
+            "task.session_id.matches_current_turn",
+            active,
+            actual=task_session_id,
+            expected=authority_session if type(authority_session) is str else None,
+        )
+        return {
+            "ok": active,
+            "mode": "task_session_id",
+            "leaves": leaves,
+        }
     if task_session_id is not None and type(task_session_id) is not str:
-        return False
+        add(
+            "task.session_id.valid_type",
+            False,
+            actual=type(task_session_id).__name__,
+            expected="str|null",
+        )
+        return {"ok": False, "mode": "task_session_id", "leaves": leaves}
     current_platform = (
         get_session_env("HERMES_SESSION_PLATFORM", "").strip().casefold()
         or get_session_env("HERMES_SESSION_SOURCE", "").strip().casefold()
@@ -5247,19 +5320,101 @@ def _session_origin_matches_current_turn(
     )
     current_chat = get_session_env("HERMES_SESSION_CHAT_ID", "").strip()
     current_thread = get_session_env("HERMES_SESSION_THREAD_ID", "").strip()
-    if type(authority_platform) is not str or not authority_platform or not current_chat:
-        return False
-    for notify_row in notify_rows:
-        if (
-            type(notify_row["platform"]) is str
-            and notify_row["platform"].strip().casefold() == current_platform
-            and notify_row["platform"].strip().casefold() == authority_platform
-            and type(notify_row["chat_id"]) is str
-            and notify_row["chat_id"] == current_chat
-            and (notify_row["thread_id"] or "") == current_thread
-        ):
-            return True
-    return False
+    current_parent_chat = get_session_env("HERMES_SESSION_PARENT_CHAT_ID", "").strip()
+    platform_scope_ok = add(
+        "authority.platform_scope.present",
+        type(authority_platform) is str and bool(authority_platform),
+        actual=(
+            authority_platform
+            if type(authority_platform) is str
+            else type(authority_platform).__name__
+        ),
+        expected="non-empty-string",
+    )
+    chat_present = add(
+        "session.chat_id.present",
+        bool(current_chat),
+        actual=current_chat,
+        expected="non-empty-string",
+    )
+    rows: list[dict[str, object]] = []
+    matched = False
+    for index, notify_row in enumerate(notify_rows):
+        notify_platform_raw = notify_row["platform"]
+        notify_platform = (
+            notify_platform_raw.strip().casefold()
+            if type(notify_platform_raw) is str
+            else ""
+        )
+        notify_chat = notify_row["chat_id"] if type(notify_row["chat_id"]) is str else None
+        notify_thread = notify_row["thread_id"] or ""
+        platform_ok = (
+            type(notify_platform_raw) is str
+            and notify_platform == current_platform
+            and notify_platform == authority_platform
+        )
+        thread_ok = notify_thread == current_thread
+        canonical_chat_ok = notify_chat == current_chat
+        discord_parent_thread_ok = (
+            notify_platform == "discord"
+            and current_platform == "discord"
+            and authority_platform == "discord"
+            and bool(current_thread)
+            and current_chat == current_thread
+            and bool(current_parent_chat)
+            and notify_chat == current_parent_chat
+            and thread_ok
+        )
+        row_ok = bool(
+            session_scope_ok
+            and platform_scope_ok
+            and chat_present
+            and platform_ok
+            and thread_ok
+            and (canonical_chat_ok or discord_parent_thread_ok)
+        )
+        matched = matched or row_ok
+        rows.append(
+            {
+                "index": index,
+                "verdict": _cg_bool(row_ok),
+                "platform": {
+                    "verdict": _cg_bool(platform_ok),
+                    "actual": notify_platform_raw,
+                    "expected": current_platform,
+                    "authority": authority_platform,
+                },
+                "thread_id": {
+                    "verdict": _cg_bool(thread_ok),
+                    "actual": notify_thread,
+                    "expected": current_thread,
+                },
+                "chat_id": {
+                    "verdict": _cg_bool(canonical_chat_ok),
+                    "actual": notify_chat,
+                    "expected": current_chat,
+                },
+                "discord_parent_chat_id": {
+                    "verdict": _cg_bool(discord_parent_thread_ok),
+                    "actual": notify_chat,
+                    "expected": current_parent_chat,
+                    "current_chat_id": current_chat,
+                    "current_thread_id": current_thread,
+                },
+            }
+        )
+    return {
+        "ok": matched,
+        "mode": "notify_sub",
+        "current": {
+            "platform": current_platform,
+            "chat_id": current_chat,
+            "thread_id": current_thread,
+            "parent_chat_id": current_parent_chat,
+        },
+        "leaves": leaves,
+        "notify_rows": rows,
+    }
 
 
 def _change_gate_resolution_candidates(conn: sqlite3.Connection) -> list[sqlite3.Row]:
@@ -5288,27 +5443,179 @@ def resolve_current_turn_change_gate_target(
     """Read-only owner resolution for one current-turn Change Gate target."""
 
     from gateway.session_context import get_trusted_current_user_text
-    from hermes_cli.change_gate_runtime import load_task_gate_artifacts
+    from hermes_cli.change_gate_runtime import (
+        ChangeGateRuntimePolicy,
+        evaluate_loaded_release_candidate,
+        load_task_gate_artifacts,
+        project_upstream_reviews,
+    )
     from tools.workflow_authority import (
         get_current_turn_user_authority,
         matches_active_workflow_turn,
         matches_current_workflow_session,
     )
 
-    if getattr(policy, "enabled", None) is not True or getattr(policy, "valid", None) is not True:
-        return ChangeGateAuthorityResolution("zero_candidate", None, None, 0)
+    diagnostic: dict[str, object] = {
+        "schema": "change-gate-eligibility-diagnostic/v1",
+        "global_predicates": {},
+        "candidate_count": 0,
+        "eligible_candidate_count": 0,
+        "release_candidate_count": 0,
+        "candidates": [],
+    }
+    global_predicates = diagnostic["global_predicates"]
+    assert isinstance(global_predicates, dict)
+    policy_ok = getattr(policy, "enabled", None) is True and getattr(policy, "valid", None) is True
+    global_predicates["policy.enabled_valid"] = {
+        "verdict": _cg_bool(policy_ok),
+        "actual": {
+            "enabled": getattr(policy, "enabled", None),
+            "valid": getattr(policy, "valid", None),
+        },
+        "expected": {"enabled": True, "valid": True},
+    }
+    if not policy_ok:
+        return ChangeGateAuthorityResolution("zero_candidate", None, None, 0, diagnostic)
     trusted_text = _canonical_change_gate_host_text(get_trusted_current_user_text())
     authority = get_current_turn_user_authority()
-    if (
-        trusted_text is None
-        or authority is None
-        or not matches_active_workflow_turn(authority, user_message=trusted_text)
-        or not matches_current_workflow_session(authority)
-    ):
-        return ChangeGateAuthorityResolution("zero_candidate", None, None, 0)
+    trusted_text_ok = trusted_text is not None
+    authority_present = authority is not None
+    active_turn_ok = bool(
+        trusted_text_ok
+        and authority_present
+        and matches_active_workflow_turn(authority, user_message=trusted_text)
+    )
+    current_session_ok = bool(
+        authority_present and matches_current_workflow_session(authority)
+    )
+    global_predicates["trusted_text.canonical"] = {
+        "verdict": _cg_bool(trusted_text_ok),
+        "actual": {"trusted_text_digest": _cg_digest(trusted_text)},
+        "expected": "non-empty-nul-free-string",
+    }
+    global_predicates["authority.present"] = {
+        "verdict": _cg_bool(authority_present),
+        "actual": authority_present,
+        "expected": True,
+    }
+    global_predicates["current_turn.active_exact_text"] = {
+        "verdict": _cg_bool(active_turn_ok),
+        "actual": {
+            "trusted_text_digest": _cg_digest(trusted_text),
+            "session_scope": (
+                getattr(authority, "session_scope", None)
+                if authority is not None
+                else None
+            ),
+            "platform_scope": (
+                getattr(authority, "platform_scope", None)
+                if authority is not None
+                else None
+            ),
+        },
+        "expected": "host-signed-active-turn-and-exact-trusted-text",
+    }
+    global_predicates["current_session.matches"] = {
+        "verdict": _cg_bool(current_session_ok),
+        "actual": {
+            "session_scope": getattr(authority, "session_scope", None)
+            if authority is not None
+            else None,
+            "platform_scope": getattr(authority, "platform_scope", None)
+            if authority is not None
+            else None,
+        },
+        "expected": "active-foreground-session-and-platform",
+    }
+    if not (trusted_text_ok and authority_present and active_turn_ok and current_session_ok):
+        return ChangeGateAuthorityResolution("zero_candidate", None, None, 0, diagnostic)
+
+    requested_purpose = next(
+        (
+            candidate_purpose
+            for candidate_purpose in ReleasePurpose
+            if trusted_text.startswith(
+                f"AUTHORIZE_HERMES_CHANGE_GATE_{candidate_purpose.value} "
+            )
+        ),
+        None,
+    )
+    global_predicates["authority.requested_purpose"] = {
+        "verdict": _cg_bool(requested_purpose is not None),
+        "actual": requested_purpose.value if requested_purpose is not None else None,
+        "expected": [purpose.value for purpose in ReleasePurpose],
+    }
 
     matches: list[tuple[str, ReleasePurpose]] = []
-    for task_row in _change_gate_resolution_candidates(conn):
+    suspicious_statement_duplicates = 0
+    candidate_rows = _change_gate_resolution_candidates(conn)
+    diagnostic["candidate_count"] = len(candidate_rows)
+    global_predicates["candidate.selection"] = {
+        "verdict": _cg_bool(bool(candidate_rows)),
+        "actual": {"selected_count": len(candidate_rows)},
+        "expected": {
+            "current_run_id": None,
+            "ready_claim_lock": None,
+            "statuses": ["ready", "review"],
+        },
+    }
+    candidate_diagnostics = diagnostic["candidates"]
+    assert isinstance(candidate_diagnostics, list)
+    for task_row in candidate_rows:
+        task_id = task_row["id"]
+        task_status = task_row["status"]
+        purpose = ReleasePurpose.CLAIM if task_status == "ready" else ReleasePurpose.G4
+        subpredicates: dict[str, object] = {
+            "task.state_run_lock": {
+                "verdict": _cg_bool(
+                    task_row["current_run_id"] is None
+                    and (
+                        (task_status == "ready" and task_row["claim_lock"] is None)
+                        or task_status == "review"
+                    )
+                ),
+                "actual": {
+                    "status": task_status,
+                    "current_run_id": task_row["current_run_id"],
+                    "claim_lock": task_row["claim_lock"],
+                },
+                "expected": "ready-without-run-lock-or-review",
+            },
+            "task.purpose_for_authority": {
+                "verdict": _cg_bool(purpose is requested_purpose),
+                "actual": {"status": task_status, "purpose": purpose.value},
+                "expected": {
+                    "purpose": (
+                        requested_purpose.value
+                        if requested_purpose is not None
+                        else None
+                    )
+                },
+            },
+            "session_or_notify_origin": _cg_not_evaluated("candidate_not_started"),
+            "task_evidence_handoff_binding": _cg_not_evaluated(
+                "session_or_notify_origin"
+            ),
+            "evidence.task_ttl": _cg_not_evaluated(
+                "task_evidence_handoff_binding"
+            ),
+            "frozen_handoff.binding": _cg_not_evaluated(
+                "task_evidence_handoff_binding"
+            ),
+            "source.binding": _cg_not_evaluated("task_evidence_handoff_binding"),
+            "task.route_role": _cg_not_evaluated("task_evidence_handoff_binding"),
+            "reviews.binding": _cg_not_evaluated("task_evidence_handoff_binding"),
+            "change_gate_adapter.pre_release": _cg_not_evaluated(
+                "task_evidence_handoff_binding"
+            ),
+            "statement.exact": _cg_not_evaluated("task_evidence_handoff_binding"),
+        }
+        candidate: dict[str, object] = {
+            "task_id": task_id,
+            "status": task_status,
+            "purpose": purpose.value,
+            "subpredicates": subpredicates,
+        }
         notify_rows = conn.execute(
             """
             SELECT platform, chat_id, thread_id
@@ -5316,39 +5623,234 @@ def resolve_current_turn_change_gate_target(
             WHERE task_id = ?
             ORDER BY created_at DESC
             """,
-            (task_row["id"],),
+            (task_id,),
         ).fetchall()
-        if not _session_origin_matches_current_turn(
+        origin = _session_origin_diagnostic(
             task_row,
             notify_rows,
             authority=authority,
-        ):
+        )
+        subpredicates["session_or_notify_origin"] = origin
+        if not origin["ok"]:
+            candidate["verdict"] = "FAIL"
+            candidate_diagnostics.append(candidate)
             continue
         load = load_task_gate_artifacts(
             conn,
-            task_row["id"],
-            policy=policy,
-            attachment_root=task_attachments_dir(task_row["id"], board=board),
+            task_id,
+            policy=cast(ChangeGateRuntimePolicy, policy),
+            attachment_root=task_attachments_dir(task_id, board=board),
         )
+        load_reason = (
+            load.reason.value
+            if isinstance(load.reason, ChangeGateReason)
+            else str(load.reason)
+        )
+        subpredicates["task_evidence_handoff_binding"] = {
+            "verdict": _cg_bool(load.ok),
+            "actual": {
+                "applicable": load.applicable,
+                "reason": load_reason,
+                "has_artifacts": load.artifacts is not None,
+            },
+            "expected": ChangeGateReason.ALLOWED.value,
+        }
         if not load.ok or load.artifacts is None:
+            candidate["verdict"] = "FAIL"
+            candidate_diagnostics.append(candidate)
             continue
-        purpose = ReleasePurpose.CLAIM if task_row["status"] == "ready" else ReleasePurpose.G4
+        artifacts = load.artifacts
+        evidence = artifacts.evidence
+        handoff = artifacts.handoff
+        now_epoch = int(time.time())
+        evidence_task_ok = evidence.work.task_id == task_id
+        evidence_fresh = (
+            purpose is ReleasePurpose.G4
+            or evidence.created_at_epoch <= now_epoch < evidence.expires_at_epoch
+        )
+        handoff_binding_ok = (
+            handoff.evidence_sha256 == evidence.digest()
+            and handoff.source == evidence.source
+            and handoff.work == evidence.work
+            and handoff.allowed_paths == evidence.allowed_paths
+            and handoff.required_inputs == evidence.required_inputs
+            and handoff.produced_artifacts == evidence.produced_artifacts
+            and handoff.route == evidence.route
+            and handoff.inventory_id == evidence.inventory_id
+        )
+        source_binding_ok = artifacts.actual_source == evidence.source
+        route_binding_ok = artifacts.actual_route == handoff.route.executor
+        subpredicates["evidence.task_ttl"] = {
+            "verdict": _cg_bool(evidence_task_ok and evidence_fresh),
+            "actual": {
+                "task_id": evidence.work.task_id,
+                "created_at_epoch": evidence.created_at_epoch,
+                "expires_at_epoch": evidence.expires_at_epoch,
+                "now_epoch": now_epoch,
+            },
+            "expected": {
+                "task_id": task_id,
+                "fresh_for_claim": purpose is ReleasePurpose.CLAIM,
+            },
+        }
+        subpredicates["frozen_handoff.binding"] = {
+            "verdict": _cg_bool(handoff_binding_ok),
+            "actual": {
+                "evidence_sha256": handoff.evidence_sha256,
+                "evidence_digest": evidence.digest(),
+                "route_sha256": canonical_sha256(handoff.route),
+                "evidence_route_sha256": canonical_sha256(evidence.route),
+                "source_sha256": canonical_sha256(handoff.source),
+                "evidence_source_sha256": canonical_sha256(evidence.source),
+                "work_sha256": canonical_sha256(handoff.work),
+                "evidence_work_sha256": canonical_sha256(evidence.work),
+                "allowed_paths_sha256": canonical_sha256(handoff.allowed_paths),
+                "evidence_allowed_paths_sha256": canonical_sha256(
+                    evidence.allowed_paths
+                ),
+                "required_inputs_sha256": canonical_sha256(
+                    handoff.required_inputs
+                ),
+                "evidence_required_inputs_sha256": canonical_sha256(
+                    evidence.required_inputs
+                ),
+                "produced_artifacts_sha256": canonical_sha256(
+                    handoff.produced_artifacts
+                ),
+                "evidence_produced_artifacts_sha256": canonical_sha256(
+                    evidence.produced_artifacts
+                ),
+                "inventory_id": handoff.inventory_id,
+                "evidence_inventory_id": evidence.inventory_id,
+            },
+            "expected": "complete-frozen-handoff-to-evidence-equality",
+        }
+        subpredicates["source.binding"] = {
+            "verdict": _cg_bool(source_binding_ok),
+            "actual": canonical_sha256(artifacts.actual_source),
+            "expected": canonical_sha256(evidence.source),
+        }
+        subpredicates["task.route_role"] = {
+            "verdict": _cg_bool(route_binding_ok),
+            "actual": canonical_sha256(artifacts.actual_route),
+            "expected": canonical_sha256(handoff.route.executor),
+        }
+        reviews = ()
+        review_reason = ChangeGateReason.ALLOWED
+        if purpose is ReleasePurpose.G4:
+            projection = project_upstream_reviews(
+                conn,
+                task_id,
+                handoff=handoff,
+            )
+            review_reason = projection.reason
+            reviews = projection.reviews if projection.ok else ()
+        subpredicates["reviews.binding"] = {
+            "verdict": _cg_bool(review_reason is ChangeGateReason.ALLOWED),
+            "actual": {
+                "applicable": purpose is ReleasePurpose.G4,
+                "reason": review_reason.value,
+                "review_count": len(reviews),
+            },
+            "expected": ChangeGateReason.ALLOWED.value,
+        }
+        preflight = evaluate_loaded_release_candidate(
+            load,
+            task_id=task_id,
+            purpose=purpose,
+            now_epoch=now_epoch,
+            reviews=reviews,
+        )
+        preflight_ok = (
+            review_reason is ChangeGateReason.ALLOWED
+            and preflight.result.decision is GateDecision.DENY
+            and preflight.result.reason is ChangeGateReason.RELEASE_RECEIPT_MISSING
+        )
+        subpredicates["change_gate_adapter.pre_release"] = {
+            "verdict": _cg_bool(preflight_ok),
+            "actual": {
+                "decision": preflight.result.decision.value,
+                "reason": preflight.result.reason.value,
+                "phase": preflight.result.phase.value,
+            },
+            "expected": {
+                "decision": GateDecision.DENY.value,
+                "reason": ChangeGateReason.RELEASE_RECEIPT_MISSING.value,
+                "phase": (
+                    GatePhase.G2_CLAIM.value
+                    if purpose is ReleasePurpose.CLAIM
+                    else GatePhase.G4_RELEASE.value
+                ),
+            },
+        }
         try:
             expected = expected_release_statement(
                 purpose=purpose,
-                handoff_sha256=load.artifacts.handoff.digest(),
+                handoff_sha256=handoff.digest(),
             )
         except (TypeError, ValueError):
+            subpredicates["statement.exact"] = {
+                "verdict": "FAIL",
+                "actual": {"trusted_text_digest": _cg_digest(trusted_text)},
+                "expected": "valid-expected-statement",
+            }
+            candidate["verdict"] = "FAIL"
+            candidate_diagnostics.append(candidate)
             continue
-        if trusted_text == expected:
-            matches.append((task_row["id"], purpose))
+        statement_matches = trusted_text == expected
+        statement_ok = statement_matches and preflight_ok
+        subpredicates["statement.exact"] = {
+            "verdict": _cg_bool(statement_matches),
+            "actual": {
+                "trusted_text_digest": _cg_digest(trusted_text),
+                "purpose": purpose.value,
+            },
+            "expected": {
+                "expected_statement_digest": _cg_digest(expected),
+                "purpose": purpose.value,
+                "handoff_sha256": handoff.digest(),
+            },
+        }
+        candidate["verdict"] = _cg_bool(statement_ok)
+        candidate_diagnostics.append(candidate)
+        if statement_ok:
+            matches.append((task_id, purpose))
+        elif statement_matches:
+            suspicious_statement_duplicates += 1
 
+    diagnostic["eligible_candidate_count"] = len(matches)
+    diagnostic["suspicious_statement_duplicate_count"] = suspicious_statement_duplicates
+    statement_candidate_count = len(matches) + suspicious_statement_duplicates
+    diagnostic["statement_candidate_count"] = statement_candidate_count
+    duplicate_guard_ok = suspicious_statement_duplicates == 0
+    cardinality_ok = len(matches) == 1 and duplicate_guard_ok
+    global_predicates["candidate.duplicate_parent_guard"] = {
+        "verdict": _cg_bool(duplicate_guard_ok),
+        "actual": {
+            "suspicious_statement_duplicate_count": suspicious_statement_duplicates,
+        },
+        "expected": {"suspicious_statement_duplicate_count": 0},
+    }
+    global_predicates["candidate.release_cardinality"] = {
+        "verdict": _cg_bool(len(matches) == 1),
+        "actual": {"eligible_candidate_count": len(matches)},
+        "expected": {"eligible_candidate_count": 1},
+    }
+    diagnostic["release_candidate_count"] = 1 if cardinality_ok else 0
     if len(matches) == 1:
+        if suspicious_statement_duplicates:
+            return ChangeGateAuthorityResolution(
+                "ambiguous",
+                None,
+                None,
+                statement_candidate_count,
+                diagnostic,
+            )
         task_id, purpose = matches[0]
-        return ChangeGateAuthorityResolution("resolved", task_id, purpose, 1)
+        return ChangeGateAuthorityResolution("resolved", task_id, purpose, 1, diagnostic)
     if matches:
-        return ChangeGateAuthorityResolution("ambiguous", None, None, len(matches))
-    return ChangeGateAuthorityResolution("zero_candidate", None, None, 0)
+        return ChangeGateAuthorityResolution("ambiguous", None, None, len(matches), diagnostic)
+    return ChangeGateAuthorityResolution("zero_candidate", None, None, 0, diagnostic)
 
 
 def _store_change_gate_release(
@@ -5561,11 +6063,20 @@ def persist_or_reuse_foreground_change_gate_release(
         if existing is not None and reason is ChangeGateReason.ALLOWED:
             if _same_foreground_release_authority(existing, release):
                 return ForegroundChangeGateReleasePersistence(existing, True)
-            raise PermissionError("change_gate_live_release_authority_mismatch")
+            raise ChangeGateReleasePersistenceDenied(
+                "change_gate_live_release_authority_mismatch",
+                ChangeGateReason.RELEASE_REPLAY,
+            )
         if _change_gate_release_authority_receipt_already_persisted(conn, release):
-            raise PermissionError("change_gate_terminal_release_authority_reuse")
+            raise ChangeGateReleasePersistenceDenied(
+                "change_gate_terminal_release_authority_reuse",
+                reason,
+            )
         if reason not in _CHANGE_GATE_REISSUABLE_REASONS:
-            raise PermissionError("change_gate_existing_release_state_not_reissuable")
+            raise ChangeGateReleasePersistenceDenied(
+                "change_gate_existing_release_state_not_reissuable",
+                reason,
+            )
         stored_release_id = _store_change_gate_release(conn, release, _allow_nested=True)
         stored = _load_change_gate_release(conn, stored_release_id)
         if stored is None:

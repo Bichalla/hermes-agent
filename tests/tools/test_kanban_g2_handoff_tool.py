@@ -13,9 +13,7 @@ from hermes_cli.change_gate import (
     ArtifactBinding,
     ArchitectureInventoryRecord,
     ChangeGateReason,
-    DurableReleaseArtifact,
     EvidencePacket,
-    HumanReleaseReceipt,
     ReleasePurpose,
     ReviewRoute,
     ReviewerClass,
@@ -24,7 +22,6 @@ from hermes_cli.change_gate import (
     SourceIdentity,
     UpstreamRouteSelector,
     WorkIdentity,
-    canonical_sha256,
     expected_release_statement,
     freeze_handoff,
 )
@@ -208,13 +205,14 @@ def _active_planner(
     risk: RiskLevel = RiskLevel.NORMAL,
     *,
     claimer: str = "claim-g2",
+    evidence_age_seconds: int = 1,
 ) -> str:
     from hermes_cli.change_gate_runtime import (
         load_runtime_policy,
         load_task_gate_artifacts,
         read_current_source_identity,
     )
-    from tools.workflow_authority import fingerprint_user_action
+    from tools.workflow_authority import _scoped_test_current_turn_user_authority
 
     planner_route = UpstreamRouteSelector(
         assignee="change-gate-high",
@@ -273,8 +271,8 @@ def _active_planner(
         required_inputs=(),
         produced_artifacts=(produced,),
         inventory_id="inv-normal",
-        created_at_epoch=now - 1,
-        expires_at_epoch=now + 599,
+        created_at_epoch=now - evidence_age_seconds,
+        expires_at_epoch=now - evidence_age_seconds + 3600,
     )
     inventory_read = decode_artifact(
         (Path(os.environ["HERMES_HOME"]) / "inventory" / "inv-normal.json").read_bytes(),
@@ -322,38 +320,15 @@ def _active_planner(
         purpose=ReleasePurpose.CLAIM,
         handoff_sha256=handoff.digest(),
     )
-    release = DurableReleaseArtifact(
-        release_id="cgr_" + "a" * 64,
-        purpose=ReleasePurpose.CLAIM,
-        handoff_sha256=handoff.digest(),
-        evidence_sha256=evidence.digest(),
-        inventory_sha256=handoff.inventory_sha256,
-        artifact_set_sha256=canonical_sha256(
-            {
-                "allowed_paths": handoff.allowed_paths,
-                "required_inputs": handoff.required_inputs,
-                "produced_artifacts": handoff.produced_artifacts,
-            }
-        ),
-        route_sha256=canonical_sha256(handoff.route),
-        task_id=parent_id,
-        work_id=evidence.work.work_id,
-        source=source,
-        authority_receipt=HumanReleaseReceipt(
-            purpose=ReleasePurpose.CLAIM,
-            handoff_sha256=handoff.digest(),
-            action_fingerprint=fingerprint_user_action(statement),
-            turn_id_sha256="1" * 64,
-            session_scope_sha256="2" * 64,
-            platform_scope_sha256="3" * 64,
-            user_message_index=1,
-            source_role="user",
-        ),
-        transition_anchor=transition_anchor,
-        issued_at_epoch=now,
-        expires_at_epoch=now + 300,
-    )
-    kb._store_change_gate_release(conn, release)
+    with _scoped_test_current_turn_user_authority(
+        statement,
+        session_id="g2-parent-session",
+        turn_id=f"g2-parent-{parent_id}",
+        platform_scope="manual",
+    ):
+        release = _issue_foreground_change_gate_release(parent_id, ReleasePurpose.CLAIM)
+    assert release.ok, release.reason
+    assert release.release_id is not None
     claimed = kb.claim_task(conn, parent_id, claimer=claimer)
     assert claimed is not None
     state = kb.change_gate_release_state(conn, release.release_id)
@@ -382,8 +357,41 @@ def _args(binding: dict[str, str], repo: Path, risk: str = "NORMAL") -> dict:
         "inventory_consumer": "kanban_g2_handoff_test",
         "scope": ["SOURCE_CHANGE"],
         "forbidden_effects": ["LIVE_SERVICE_MUTATION"],
-        "expires_at_epoch": int(time.time()) + 300,
+        "evidence_ttl_seconds": 3600,
     }
+
+
+def _legacy_abs_args(binding: dict[str, str], repo: Path, risk: str = "NORMAL") -> dict:
+    args = _args(binding, repo, risk)
+    args.pop("evidence_ttl_seconds")
+    args["expires_at_epoch"] = int(time.time()) + 600
+    return args
+
+
+def _issue_foreground_change_gate_release(task_id: str, purpose: ReleasePurpose):
+    from hermes_cli.change_gate_release import issue_change_gate_release
+
+    saved_worker_env = {
+        key: os.environ.get(key)
+        for key in (
+            "HERMES_KANBAN_TASK",
+            "HERMES_KANBAN_RUN_ID",
+            "HERMES_KANBAN_CLAIM_LOCK",
+        )
+    }
+    for key in saved_worker_env:
+        os.environ.pop(key, None)
+    try:
+        return issue_change_gate_release(
+            task_id=task_id,
+            purpose=purpose.value,
+        )
+    finally:
+        for key, value in saved_worker_env.items():
+            if value is None:
+                os.environ.pop(key, None)
+            else:
+                os.environ[key] = value
 
 
 def _store_task_release(conn, kb, task_id: str, purpose: ReleasePurpose, suffix: str):
@@ -392,7 +400,7 @@ def _store_task_release(conn, kb, task_id: str, purpose: ReleasePurpose, suffix:
         load_task_gate_artifacts,
         project_upstream_reviews,
     )
-    from tools.workflow_authority import fingerprint_user_action
+    from tools.workflow_authority import _scoped_test_current_turn_user_authority
 
     load = load_task_gate_artifacts(
         conn,
@@ -424,38 +432,18 @@ def _store_task_release(conn, kb, task_id: str, purpose: ReleasePurpose, suffix:
         purpose=purpose,
         handoff_sha256=artifacts.handoff.digest(),
     )
-    release = DurableReleaseArtifact(
-        release_id="cgr_" + suffix * 64,
-        purpose=purpose,
-        handoff_sha256=artifacts.handoff.digest(),
-        evidence_sha256=artifacts.evidence.digest(),
-        inventory_sha256=artifacts.inventory.digest(),
-        artifact_set_sha256=canonical_sha256(
-            {
-                "allowed_paths": artifacts.handoff.allowed_paths,
-                "required_inputs": artifacts.handoff.required_inputs,
-                "produced_artifacts": artifacts.handoff.produced_artifacts,
-            }
-        ),
-        route_sha256=canonical_sha256(artifacts.handoff.route),
-        task_id=task_id,
-        work_id=artifacts.evidence.work.work_id,
-        source=artifacts.actual_source,
-        authority_receipt=HumanReleaseReceipt(
-            purpose=purpose,
-            handoff_sha256=artifacts.handoff.digest(),
-            action_fingerprint=fingerprint_user_action(statement),
-            turn_id_sha256=suffix * 64,
-            session_scope_sha256="2" * 64,
-            platform_scope_sha256="3" * 64,
-            user_message_index=1,
-            source_role="user",
-        ),
-        transition_anchor=transition_anchor,
-        issued_at_epoch=now - 1,
-        expires_at_epoch=now + 300,
-    )
-    kb._store_change_gate_release(conn, release)
+    with _scoped_test_current_turn_user_authority(
+        statement,
+        session_id=f"g2-{purpose.value.lower()}-session",
+        turn_id=f"g2-{purpose.value.lower()}-{suffix}",
+        platform_scope="manual",
+    ):
+        release = _issue_foreground_change_gate_release(task_id, purpose)
+    assert release.ok, release.reason
+    assert release.release_id is not None
+    assert release.issued_at_epoch == now
+    assert release.expires_at_epoch is not None
+    assert release.expires_at_epoch - release.issued_at_epoch <= 600
     return release
 
 
@@ -728,6 +716,265 @@ def test_kanban_g2_handoff_creates_child_and_frozen_artifacts(monkeypatch, tmp_p
         conn.close()
 
 
+def test_kanban_g2_handoff_uses_relative_ttl_from_child_creation_time(
+    monkeypatch,
+    tmp_path,
+):
+    from tools.kanban_tools import _handle_g2_handoff
+
+    kb, conn = _setup_env(monkeypatch, tmp_path)
+    repo, binding = _git_repo(tmp_path)
+    parent_id = _active_planner(conn, kb, monkeypatch, repo)
+    stamped_now = int(time.time()) + 100
+    monkeypatch.setattr(time, "time", lambda: stamped_now)
+    try:
+        args = _args(binding, repo)
+        args["evidence_ttl_seconds"] = 3600
+        result = json.loads(_handle_g2_handoff(args))
+        assert result["ok"] is True
+
+        attachments = {a.filename: a for a in kb.list_attachments(conn, result["task_id"])}
+        evidence_data = Path(attachments[EVIDENCE_ATTACHMENT_FILENAME].stored_path).read_bytes()
+        assert "evidence_ttl_seconds" not in json.loads(evidence_data)
+        evidence = decode_artifact(evidence_data, expected_schema=EVIDENCE_PACKET_SCHEMA)
+        assert evidence.ok
+        assert evidence.value.created_at_epoch == stamped_now
+        assert evidence.value.expires_at_epoch == stamped_now + 3600
+    finally:
+        conn.close()
+
+
+def test_kanban_g2_handoff_parent_near_expiry_gets_fresh_relative_hour(
+    monkeypatch,
+    tmp_path,
+):
+    from tools.kanban_tools import _handle_g2_handoff
+
+    kb, conn = _setup_env(monkeypatch, tmp_path)
+    repo, binding = _git_repo(tmp_path)
+    fake_now = int(time.time()) + 100
+    monkeypatch.setattr(time, "time", lambda: fake_now)
+    parent_id = _active_planner(
+        conn,
+        kb,
+        monkeypatch,
+        repo,
+        evidence_age_seconds=3590,
+    )
+    try:
+        parent_attachments = {
+            attachment.filename: attachment
+            for attachment in kb.list_attachments(conn, parent_id)
+        }
+        parent_read = decode_artifact(
+            Path(
+                parent_attachments[EVIDENCE_ATTACHMENT_FILENAME].stored_path
+            ).read_bytes(),
+            expected_schema=EVIDENCE_PACKET_SCHEMA,
+        )
+        assert parent_read.ok
+        assert parent_read.value.expires_at_epoch - fake_now == 10
+
+        result = json.loads(_handle_g2_handoff(_args(binding, repo)))
+        assert result["ok"] is True
+        child_attachments = {
+            attachment.filename: attachment
+            for attachment in kb.list_attachments(conn, result["task_id"])
+        }
+        child_read = decode_artifact(
+            Path(
+                child_attachments[EVIDENCE_ATTACHMENT_FILENAME].stored_path
+            ).read_bytes(),
+            expected_schema=EVIDENCE_PACKET_SCHEMA,
+        )
+        assert child_read.ok
+        assert child_read.value.created_at_epoch == fake_now
+        assert child_read.value.expires_at_epoch == fake_now + 3600
+    finally:
+        conn.close()
+
+
+def test_kanban_g2_handoff_accepts_legacy_absolute_expiry(monkeypatch, tmp_path):
+    from tools.kanban_tools import _handle_g2_handoff
+
+    kb, conn = _setup_env(monkeypatch, tmp_path)
+    repo, binding = _git_repo(tmp_path)
+    fake_now = int(time.time()) + 100
+    monkeypatch.setattr(time, "time", lambda: fake_now)
+    _active_planner(conn, kb, monkeypatch, repo)
+    try:
+        result = json.loads(_handle_g2_handoff(_legacy_abs_args(binding, repo)))
+        assert result["ok"] is True
+        child = kb.get_task(conn, result["task_id"])
+        assert child is not None and child.status == "ready"
+        attachments = {
+            attachment.filename: attachment
+            for attachment in kb.list_attachments(conn, result["task_id"])
+        }
+        evidence = decode_artifact(
+            Path(attachments[EVIDENCE_ATTACHMENT_FILENAME].stored_path).read_bytes(),
+            expected_schema=EVIDENCE_PACKET_SCHEMA,
+        )
+        assert evidence.ok
+        assert evidence.value.created_at_epoch == fake_now
+        assert evidence.value.expires_at_epoch == fake_now + 600
+    finally:
+        conn.close()
+
+
+@pytest.mark.parametrize(
+    ("case", "mutate", "message"),
+    [
+        (
+            "conflict",
+            lambda args: args.update({"expires_at_epoch": int(time.time()) + 300}),
+            "exactly one of expires_at_epoch or evidence_ttl_seconds is required",
+        ),
+        (
+            "missing",
+            lambda args: args.pop("evidence_ttl_seconds"),
+            "exactly one of expires_at_epoch or evidence_ttl_seconds is required",
+        ),
+        (
+            "bool",
+            lambda args: args.update({"evidence_ttl_seconds": True}),
+            "evidence_ttl_seconds must be an integer",
+        ),
+        (
+            "negative",
+            lambda args: args.update({"evidence_ttl_seconds": -1}),
+            "evidence_ttl_seconds must be between 1 and 3600",
+        ),
+        (
+            "too-small",
+            lambda args: args.update({"evidence_ttl_seconds": 0}),
+            "evidence_ttl_seconds must be between 1 and 3600",
+        ),
+        (
+            "too-large",
+            lambda args: args.update({"evidence_ttl_seconds": 3601}),
+            "evidence_ttl_seconds must be between 1 and 3600",
+        ),
+        (
+            "absolute-bool",
+            lambda args: (
+                args.pop("evidence_ttl_seconds"),
+                args.update({"expires_at_epoch": True}),
+            ),
+            "expires_at_epoch must be an integer",
+        ),
+        (
+            "absolute-too-large",
+            lambda args: (
+                args.pop("evidence_ttl_seconds"),
+                args.update({"expires_at_epoch": int(time.time()) + 601}),
+            ),
+            "expires_at_epoch must be within 600 seconds",
+        ),
+    ],
+)
+def test_kanban_g2_handoff_rejects_bad_relative_timing_without_material_delta(
+    monkeypatch,
+    tmp_path,
+    case,
+    mutate,
+    message,
+):
+    from tools.kanban_tools import _handle_g2_handoff
+
+    kb, conn = _setup_env(monkeypatch, tmp_path)
+    repo, binding = _git_repo(tmp_path)
+    _active_planner(conn, kb, monkeypatch, repo)
+    validation_now = int(time.time())
+    monkeypatch.setattr(time, "time", lambda: validation_now)
+    args = _args(binding, repo)
+    mutate(args)
+    before = _g2_material_state(conn, repo)
+    try:
+        result = json.loads(_handle_g2_handoff(args))
+        assert "error" in result, case
+        assert message in result["error"]
+        _assert_no_g2_material_delta(conn, before, repo)
+    finally:
+        conn.close()
+
+
+def test_kanban_g2_handoff_schema_and_runtime_timing_validation_agree():
+    jsonschema = pytest.importorskip("jsonschema")
+    from hermes_cli import kanban_db as kb
+    from tools.schema_sanitizer import sanitize_tool_schemas
+    from tools.kanban_tools import KANBAN_G2_HANDOFF_SCHEMA
+
+    published = sanitize_tool_schemas(
+        [
+            {
+                "type": "function",
+                "function": KANBAN_G2_HANDOFF_SCHEMA,
+            }
+        ]
+    )[0]["function"]
+    schema = published["parameters"]
+    assert "oneOf" not in schema
+    assert "not" not in schema
+    assert schema["properties"]["evidence_ttl_seconds"]["maximum"] == 3600
+    assert schema["properties"]["expires_at_epoch"]["type"] == "integer"
+    validator = jsonschema.Draft202012Validator(schema)
+    base = {
+        "title": "execute bounded source candidate",
+        "risk": "NORMAL",
+        "repository": "Bichalla/hermes-agent",
+        "run_id": "preclaim-run",
+        "work_id": "work-g2",
+        "operation": "apply-source-candidate",
+        "effect": "SOURCE_CHANGE",
+        "allowed_paths": ["gate-artifact.txt"],
+        "required_inputs": [],
+        "produced_artifacts": [{"path": "gate-artifact.txt", "sha256": "a" * 64, "role": "produced"}],
+        "inventory_id": "inv-normal",
+        "inventory_consumer": "kanban_g2_handoff_test",
+        "scope": ["SOURCE_CHANGE"],
+        "forbidden_effects": ["LIVE_SERVICE_MUTATION"],
+    }
+
+    valid_relative = {**base, "evidence_ttl_seconds": 3600}
+    assert list(validator.iter_errors(valid_relative)) == []
+    assert kb._resolve_g2_evidence_timing(
+        expires_at_epoch=None,
+        evidence_ttl_seconds=3600,
+    ) == ("relative", 3600)
+
+    valid_absolute = {**base, "expires_at_epoch": int(time.time()) + 300}
+    assert list(validator.iter_errors(valid_absolute)) == []
+    assert kb._resolve_g2_evidence_timing(
+        expires_at_epoch=valid_absolute["expires_at_epoch"],
+        evidence_ttl_seconds=None,
+    ) == ("absolute", valid_absolute["expires_at_epoch"])
+
+    both = {**valid_relative, "expires_at_epoch": int(time.time()) + 300}
+    assert list(validator.iter_errors(both)) == []
+    with pytest.raises(ValueError, match="exactly one"):
+        kb._resolve_g2_evidence_timing(
+            expires_at_epoch=both["expires_at_epoch"],
+            evidence_ttl_seconds=both["evidence_ttl_seconds"],
+        )
+
+    missing = dict(base)
+    assert list(validator.iter_errors(missing)) == []
+    with pytest.raises(ValueError, match="exactly one"):
+        kb._resolve_g2_evidence_timing(
+            expires_at_epoch=None,
+            evidence_ttl_seconds=None,
+        )
+
+    too_large = {**base, "evidence_ttl_seconds": 3601}
+    assert list(validator.iter_errors(too_large))
+    with pytest.raises(ValueError, match="between 1 and 3600"):
+        kb._resolve_g2_evidence_timing(
+            expires_at_epoch=None,
+            evidence_ttl_seconds=3601,
+        )
+
+
 def test_g2_terminal_planner_to_child_full_lifecycle_has_two_claims_one_g4(
     monkeypatch,
     tmp_path,
@@ -740,12 +987,48 @@ def test_g2_terminal_planner_to_child_full_lifecycle_has_two_claims_one_g4(
 
     kb, conn = _setup_env(monkeypatch, tmp_path)
     repo, binding = _git_repo(tmp_path)
+    fake_clock = {"now": int(time.time()) + 1_000}
+    monkeypatch.setattr(time, "time", lambda: fake_clock["now"])
     parent_id = _active_planner(conn, kb, monkeypatch, repo)
     try:
+        parent_attachments = {
+            attachment.filename: attachment
+            for attachment in kb.list_attachments(conn, parent_id)
+        }
+        parent_evidence = decode_artifact(
+            Path(
+                parent_attachments[EVIDENCE_ATTACHMENT_FILENAME].stored_path
+            ).read_bytes(),
+            expected_schema=EVIDENCE_PACKET_SCHEMA,
+        )
+        assert parent_evidence.ok
+        assert (
+            parent_evidence.value.expires_at_epoch
+            - parent_evidence.value.created_at_epoch
+            == 3600
+        )
         assert json.loads(_handle_heartbeat({"task_id": parent_id}))["ok"] is True
+        fake_clock["now"] += 100
         handoff = json.loads(_handle_g2_handoff(_args(binding, repo)))
         assert handoff["ok"] is True
         child_id = handoff["task_id"]
+        child_attachments = {
+            attachment.filename: attachment
+            for attachment in kb.list_attachments(conn, child_id)
+        }
+        child_evidence = decode_artifact(
+            Path(
+                child_attachments[EVIDENCE_ATTACHMENT_FILENAME].stored_path
+            ).read_bytes(),
+            expected_schema=EVIDENCE_PACKET_SCHEMA,
+        )
+        assert child_evidence.ok
+        assert child_evidence.value.created_at_epoch == fake_clock["now"]
+        assert child_evidence.value.expires_at_epoch == fake_clock["now"] + 3600
+        assert (
+            child_evidence.value.expires_at_epoch
+            > parent_evidence.value.expires_at_epoch
+        )
         parent = kb.get_task(conn, parent_id)
         assert parent.status == "done"
         assert parent.current_run_id is None
@@ -761,6 +1044,7 @@ def test_g2_terminal_planner_to_child_full_lifecycle_has_two_claims_one_g4(
             "WHERE task_id = ? AND purpose = 'CLAIM'",
             (parent_id,),
         ).fetchone()
+        assert parent_claim is not None
         expected_terminal_payload = {
             "child_task_id": child_id,
             "claim_release_id": parent_claim["release_id"],
@@ -806,6 +1090,7 @@ def test_g2_terminal_planner_to_child_full_lifecycle_has_two_claims_one_g4(
         assert kb.claim_task(conn, child_id, claimer="parent-claim-reuse") is None
         _assert_no_g2_material_delta(conn, missing_child_claim, repo)
 
+        fake_clock["now"] += 100
         child_claim = _store_task_release(
             conn,
             kb,
@@ -815,10 +1100,11 @@ def test_g2_terminal_planner_to_child_full_lifecycle_has_two_claims_one_g4(
         )
         child = kb.claim_task(conn, child_id, claimer="child-claim")
         assert child is not None
+        fake_clock["now"] += 100
         _review_and_complete(conn, kb, child_id, "5")
 
         releases = conn.execute(
-            "SELECT task_id, purpose, state FROM change_gate_releases "
+            "SELECT task_id, purpose, state, issued_at, expires_at FROM change_gate_releases "
             "ORDER BY rowid"
         ).fetchall()
         assert [(row["task_id"], row["purpose"], row["state"]) for row in releases] == [
@@ -826,6 +1112,12 @@ def test_g2_terminal_planner_to_child_full_lifecycle_has_two_claims_one_g4(
             (child_id, "CLAIM", "CONSUMED"),
             (child_id, "G4", "CONSUMED"),
         ]
+        assert [row["issued_at"] for row in releases] == [
+            fake_clock["now"] - 300,
+            fake_clock["now"] - 100,
+            fake_clock["now"],
+        ]
+        assert all(row["expires_at"] - row["issued_at"] <= 600 for row in releases)
         assert child_claim.task_id == child_id
         assert kb.get_task(conn, parent_id).status == "done"
         assert kb.get_task(conn, child_id).status == "done"

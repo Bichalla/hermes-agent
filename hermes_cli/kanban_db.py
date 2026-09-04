@@ -4769,7 +4769,8 @@ def issue_change_gate_g2_handoff(
     inventory_consumer: object,
     scope: object,
     forbidden_effects: object,
-    expires_at_epoch: object,
+    expires_at_epoch: object = None,
+    evidence_ttl_seconds: object = None,
     priority: object = 0,
     body: object = None,
     board: Optional[str] = None,
@@ -4846,14 +4847,10 @@ def issue_change_gate_g2_handoff(
         forbidden_values = _required_g2_texts(forbidden_effects, "forbidden_effects")
         if effect_text not in scope_values or effect_text in forbidden_values:
             raise ValueError("effect must be in scope and outside forbidden_effects")
-        if type(expires_at_epoch) is not int:
-            raise ValueError("expires_at_epoch must be an integer")
-        expires = expires_at_epoch
-        now = int(time.time())
-        if expires <= now or expires - now > MAX_EVIDENCE_LIFETIME_SECONDS:
-            raise ValueError(
-                f"expires_at_epoch must be within {MAX_EVIDENCE_LIFETIME_SECONDS} seconds"
-            )
+        timing_kind, timing_value = _resolve_g2_evidence_timing(
+            expires_at_epoch=expires_at_epoch,
+            evidence_ttl_seconds=evidence_ttl_seconds,
+        )
         if type(priority) is bool or type(priority) is not int:
             raise ValueError("priority must be an integer")
 
@@ -4921,6 +4918,13 @@ def issue_change_gate_g2_handoff(
                 raise PermissionError(
                     "active planner run lacks exact consumed CLAIM provenance"
                 )
+            now = int(time.time())
+            if timing_kind == "relative":
+                expires = now + timing_value
+            else:
+                expires = timing_value
+                if expires <= now or expires - now > 600:
+                    raise ValueError("expires_at_epoch must be within 600 seconds")
 
             child_id = create_task(
                 conn,
@@ -5229,6 +5233,33 @@ def derive_change_gate_transition_anchor(
 
 def _canonical_change_gate_host_text(value: object) -> str | None:
     return value if type(value) is str and value and "\0" not in value else None
+
+
+def _resolve_g2_evidence_timing(
+    *,
+    expires_at_epoch: object,
+    evidence_ttl_seconds: object,
+) -> tuple[str, int]:
+    has_absolute = expires_at_epoch is not None
+    has_relative = evidence_ttl_seconds is not None
+    if has_absolute == has_relative:
+        raise ValueError(
+            "exactly one of expires_at_epoch or evidence_ttl_seconds is required"
+        )
+    if has_relative:
+        if type(evidence_ttl_seconds) is not int:
+            raise ValueError("evidence_ttl_seconds must be an integer")
+        if evidence_ttl_seconds < 1 or evidence_ttl_seconds > MAX_EVIDENCE_LIFETIME_SECONDS:
+            raise ValueError(
+                f"evidence_ttl_seconds must be between 1 and {MAX_EVIDENCE_LIFETIME_SECONDS}"
+            )
+        return ("relative", evidence_ttl_seconds)
+    if type(expires_at_epoch) is not int:
+        raise ValueError("expires_at_epoch must be an integer")
+    now = int(time.time())
+    if expires_at_epoch <= now or expires_at_epoch - now > 600:
+        raise ValueError("expires_at_epoch must be within 600 seconds")
+    return ("absolute", expires_at_epoch)
 
 
 def _cg_bool(value: bool) -> str:

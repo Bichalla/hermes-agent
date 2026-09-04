@@ -30,7 +30,7 @@ LEGACY_DURABLE_RELEASE_SCHEMA = "hermes.change-gate.durable-release/v1"
 DURABLE_RELEASE_SCHEMA = "hermes.change-gate.durable-release/v2"
 TRANSITION_ANCHOR_SCHEMA = "hermes.change-gate.transition-anchor/v1"
 CONVERGENCE_RULE = "exact-required-classes-pass-same-frozen-bundle/v1"
-MAX_EVIDENCE_LIFETIME_SECONDS = 600
+MAX_EVIDENCE_LIFETIME_SECONDS = 3600
 MAX_RELEASE_LIFETIME_SECONDS = 600
 MAX_RUNTIME_ARTIFACT_BYTES = 256 * 1024
 

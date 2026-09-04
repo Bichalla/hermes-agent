@@ -22,6 +22,8 @@ from hermes_cli.change_gate import (
     HumanReleaseReceipt,
     GateDecision,
     GatePhase,
+    MAX_EVIDENCE_LIFETIME_SECONDS,
+    MAX_RELEASE_LIFETIME_SECONDS,
     ReleasePurpose,
     ReviewResult,
     ReviewRoute,
@@ -474,6 +476,59 @@ def test_path_artifact_scope_and_freshness_fail_closed():
     assert scope_deviation.reason is ChangeGateReason.SCOPE_DEVIATION
 
 
+def test_evidence_lifetime_allows_exact_one_hour_but_rejects_longer():
+    case = _case()
+    one_hour = replace(
+        case.evidence,
+        created_at_epoch=NOW,
+        expires_at_epoch=NOW + MAX_EVIDENCE_LIFETIME_SECONDS,
+    )
+    one_hour_handoff = freeze_handoff(
+        one_hour,
+        inventory=case.inventory,
+        inventory_consumer="change-gate-claim-adapter",
+        scope=("SOURCE_CHANGE",),
+        forbidden_effects=("LIVE_SERVICE_MUTATION", "PRIVATE_STATE_READ"),
+    )
+    one_hour_case = SyntheticCase(
+        one_hour,
+        one_hour_handoff,
+        case.inventory,
+        case.adapter,
+    )
+    with _released_request(one_hour_case, ReleasePurpose.CLAIM) as (request, _receipt):
+        assert case.adapter.evaluate(
+            request,
+            actual_task_id=one_hour.work.task_id,
+            actual_route=one_hour.route.executor,
+        ).allowed
+
+    too_long = replace(
+        case.evidence,
+        created_at_epoch=NOW,
+        expires_at_epoch=NOW + MAX_EVIDENCE_LIFETIME_SECONDS + 1,
+    )
+    too_long_handoff = freeze_handoff(
+        too_long,
+        inventory=case.inventory,
+        inventory_consumer="change-gate-claim-adapter",
+        scope=("SOURCE_CHANGE",),
+        forbidden_effects=("LIVE_SERVICE_MUTATION", "PRIVATE_STATE_READ"),
+    )
+    too_long_case = SyntheticCase(
+        too_long,
+        too_long_handoff,
+        case.inventory,
+        case.adapter,
+    )
+    result = case.adapter.evaluate(
+        _request(too_long_case),
+        actual_task_id=too_long.work.task_id,
+        actual_route=too_long.route.executor,
+    )
+    assert result.reason is ChangeGateReason.EVIDENCE_MALFORMED
+
+
 def test_missing_or_wrong_inventory_binding_requires_replan():
     case = _case()
     request = _request(case)
@@ -715,6 +770,41 @@ def test_durable_claim_release_binds_exact_transition_anchor():
     )
     assert request is not None
     assert request.requested_paths == ()
+
+
+def test_durable_release_lifetime_stays_capped_at_ten_minutes():
+    case = _case()
+    anchor = _claim_transition_anchor(case)
+    statement = expected_release_statement(
+        purpose=ReleasePurpose.CLAIM,
+        handoff_sha256=case.handoff.digest(),
+    )
+    with _scoped_test_current_turn_user_authority(
+        statement,
+        session_id="session-change-gate",
+        turn_id="turn-durable-ttl",
+        platform_scope="manual",
+    ):
+        release = issue_durable_release_artifact(
+            purpose=ReleasePurpose.CLAIM,
+            handoff=case.handoff,
+            evidence=case.evidence,
+            transition_anchor=anchor,
+            ttl_seconds=MAX_RELEASE_LIFETIME_SECONDS,
+            clock=lambda: NOW,
+        )
+        too_long = issue_durable_release_artifact(
+            purpose=ReleasePurpose.CLAIM,
+            handoff=case.handoff,
+            evidence=case.evidence,
+            transition_anchor=anchor,
+            ttl_seconds=MAX_RELEASE_LIFETIME_SECONDS + 1,
+            clock=lambda: NOW,
+        )
+
+    assert release is not None
+    assert release.expires_at_epoch - release.issued_at_epoch == 600
+    assert too_long is None
 
 
 def test_durable_g4_release_requires_review_transition_anchor():

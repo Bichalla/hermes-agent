@@ -1634,6 +1634,7 @@ def _handle_g2_handoff(args: dict, **kw) -> str:
                 scope=args.get("scope"),
                 forbidden_effects=args.get("forbidden_effects"),
                 expires_at_epoch=args.get("expires_at_epoch"),
+                evidence_ttl_seconds=args.get("evidence_ttl_seconds"),
                 priority=args.get("priority", 0),
             )
             return _ok(**result)
@@ -2584,8 +2585,17 @@ KANBAN_G2_HANDOFF_SCHEMA = {
             "expires_at_epoch": {
                 "type": "integer",
                 "description": (
-                    "Exact EvidencePacket expiry epoch; must be in the future "
+                    "Legacy exact EvidencePacket expiry epoch; must be in the future "
                     "and no more than 600 seconds from issuance."
+                ),
+            },
+            "evidence_ttl_seconds": {
+                "type": "integer",
+                "minimum": 1,
+                "maximum": 3600,
+                "description": (
+                    "Relative EvidencePacket lifetime in seconds, stamped from "
+                    "trusted G2 child creation time."
                 ),
             },
             "priority": {"type": "integer"},
@@ -2605,7 +2615,6 @@ KANBAN_G2_HANDOFF_SCHEMA = {
             "inventory_consumer",
             "scope",
             "forbidden_effects",
-            "expires_at_epoch",
         ],
         "additionalProperties": False,
     },

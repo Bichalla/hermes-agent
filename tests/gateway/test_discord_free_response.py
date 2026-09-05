@@ -1,13 +1,21 @@
 """Tests for Discord free-response defaults and mention gating."""
 
+from collections import OrderedDict
 from datetime import datetime, timezone
+from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock
 import sys
+import time
+import types
 
 import pytest
 
-from gateway.config import PlatformConfig
+from gateway.config import GatewayConfig, Platform, PlatformConfig
+from gateway.run import GatewayRunner
+from gateway.session import SessionStore
+from hermes_cli import kanban_db as kb
+from hermes_cli.change_gate import ReleasePurpose, expected_release_statement
 
 
 def _ensure_discord_mock():
@@ -121,25 +129,219 @@ def adapter(monkeypatch):
 
     config = PlatformConfig(enabled=True, token="fake-token")
     adapter = DiscordAdapter(config)
-    adapter._client = SimpleNamespace(user=SimpleNamespace(id=999))
+    adapter._client = SimpleNamespace(user=SimpleNamespace(id=999, bot=True))
+    adapter._ready_event.set()  # tests model an already-connected adapter
     adapter._text_batch_delay_seconds = 0  # disable batching for tests
     adapter.handle_message = AsyncMock()
     return adapter
 
 
-def make_message(*, channel, content: str, mentions=None, msg_type=None):
-    author = SimpleNamespace(id=42, display_name="Jezza", name="Jezza")
+def make_message(*, channel, content: str, mentions=None, msg_type=None, webhook_id=None):
+    author = SimpleNamespace(id=42, display_name="Jezza", name="Jezza", bot=False)
     return SimpleNamespace(
         id=123,
         content=content,
         mentions=list(mentions or []),
         attachments=[],
         reference=None,
+        webhook_id=webhook_id,
         created_at=datetime.now(timezone.utc),
         channel=channel,
         author=author,
         type=msg_type if msg_type is not None else discord_platform.discord.MessageType.default,
     )
+
+
+def _reserved_control(purpose: str = "CLAIM", digest_char: str = "a") -> str:
+    return f"AUTHORIZE_HERMES_CHANGE_GATE_{purpose} {digest_char * 64}"
+
+
+def _install_host_only_agent(monkeypatch, *, provider_calls: list[str]) -> None:
+    """Install a run_agent module that exercises conversation_loop's host seam only."""
+    import agent.conversation_loop as conversation_loop
+
+    class HostOnlyAIAgent:
+        def __init__(self, **kwargs):
+            self.session_id = kwargs.get("session_id")
+            self.platform = kwargs.get("platform")
+            self.model = kwargs.get("model")
+            self.provider = kwargs.get("provider")
+            self.base_url = kwargs.get("base_url")
+            self.request_overrides = kwargs.get("request_overrides") or {}
+            self.tools = []
+            self._session_db = kwargs.get("session_db")
+            self._background_review_agent = None
+            self._memory_write_origin = ""
+            self._skip_mcp_refresh = False
+            self._last_compaction_in_place = False
+            self._last_compression_attempt_recorded = False
+            self._last_compression_attempt_in_place = None
+            self.context_compressor = SimpleNamespace(last_prompt_tokens=0)
+
+        def _try_refresh_env_client_credentials(self):
+            return None
+
+        def shutdown_memory_provider(self):
+            return None
+
+        def _persist_session(self, _messages, _conversation_history):
+            return None
+
+        def run_conversation(self, user_message, **kwargs):
+            result = conversation_loop._run_conversation_inner(
+                self,
+                user_message,
+                conversation_history=kwargs.get("conversation_history") or [],
+                task_id=kwargs.get("task_id"),
+                persist_user_message=kwargs.get("persist_user_message"),
+                persist_user_timestamp=kwargs.get("persist_user_timestamp"),
+                persist_user_display_kind=kwargs.get("persist_user_display_kind"),
+                host_raw_user_text=kwargs.get("host_raw_user_text"),
+            )
+            if not str(result.get("turn_exit_reason", "")).startswith("change_gate_host_adapter"):
+                provider_calls.append(str(user_message))
+            return result
+
+    monkeypatch.setitem(
+        sys.modules,
+        "run_agent",
+        types.SimpleNamespace(AIAgent=HostOnlyAIAgent),
+    )
+
+
+def _install_host_turn_context(monkeypatch) -> None:
+    import agent.conversation_loop as conversation_loop
+
+    def build_turn_context(
+        _agent,
+        user_message,
+        _system_message,
+        conversation_history,
+        task_id,
+        _stream_callback,
+        _persist_user_message,
+        _persist_user_timestamp,
+        *,
+        persist_user_display_kind=None,
+        persist_user_display_metadata=None,
+        **kwargs,
+    ):
+        del persist_user_display_kind, persist_user_display_metadata
+        messages = list(conversation_history or [])
+        messages.append({"role": "user", "content": user_message})
+        return SimpleNamespace(
+            user_message=user_message,
+            original_user_message=user_message,
+            messages=messages,
+            conversation_history=list(conversation_history or []),
+            active_system_prompt="system",
+            effective_task_id=task_id,
+            turn_id="discord-change-gate-turn",
+            current_turn_user_idx=len(messages) - 1,
+            should_review_memory=False,
+            plugin_user_context=None,
+            ext_prefetch_cache=None,
+            preflight_compression_blocked=False,
+            host_raw_user_text=kwargs.get("host_raw_user_text"),
+        )
+
+    monkeypatch.setattr(conversation_loop, "build_turn_context", build_turn_context)
+
+
+def _make_gateway_runner(tmp_path: Path, adapter: DiscordAdapter) -> GatewayRunner:
+    config = GatewayConfig()
+    config.sessions_dir = tmp_path / "sessions"
+    runner = object.__new__(GatewayRunner)
+    runner.config = config
+    runner.adapters = {Platform.DISCORD: adapter}
+    runner.session_store = SessionStore(config.sessions_dir, config)
+    runner._session_db = runner.session_store._db
+    runner._async_session_store = None
+    runner._startup_restore_in_progress = False
+    runner._draining = False
+    runner._session_sources = OrderedDict()
+    runner._session_sources_max = 512
+    runner._running_agents = {}
+    runner._running_agent_generations = {}
+    runner._running_agents_ts = {}
+    runner._running_agents_tasks = {}
+    runner._session_state_map = {}
+    runner._agent_cache = OrderedDict()
+    runner._agent_cache_lock = None
+    runner._provider_routing = {}
+    runner._fallback_model = None
+    runner._reasoning_config = None
+    runner._service_tier = None
+    runner._ephemeral_system_prompt = None
+    runner._prefill_messages = []
+    runner._executor = None
+    runner._executor_lock = None
+    runner._executor_closing = False
+    runner.hooks = SimpleNamespace(emit=AsyncMock(), loaded_hooks=False)
+
+    runner._scale_to_zero_note_real_inbound = lambda: None
+    runner._queue_startup_restore_event = lambda _event: None
+    runner._is_user_authorized = lambda _source: True
+    runner._get_unauthorized_dm_behavior = lambda *_args, **_kwargs: "ignore"
+    runner._pairing_store_for = lambda _source: None
+    runner._recover_telegram_topic_thread_id = lambda _source: None
+    runner._is_telegram_topic_lane = lambda _source: False
+    runner._cache_session_source = lambda *_args, **_kwargs: None
+    runner._clear_conversation_scope = lambda *_args, **_kwargs: None
+    runner._evict_cached_agent = lambda *_args, **_kwargs: None
+    runner._pinned_session_context_prompt = lambda *_args, **_kwargs: "system"
+    runner._pending_event_audio_paths = lambda _event: []
+    runner._prepare_clarify_reply_text = AsyncMock(return_value="")
+    runner._mark_durable_active_turn = AsyncMock(return_value=True)
+    runner._clear_durable_active_turn = AsyncMock(return_value=True)
+    runner._resolve_session_agent_runtime = lambda **_kwargs: (
+        "fixture-model",
+        {"provider": "fixture-provider", "api_key": "fixture-key"},
+    )
+    runner._resolve_turn_agent_config = lambda _message, model, runtime: {
+        "model": model,
+        "runtime": runtime,
+        "request_overrides": {},
+    }
+    runner._resolve_enabled_toolsets_for_source = lambda *_args, **_kwargs: []
+    runner._refresh_fallback_model = lambda: None
+    runner._current_max_iterations = lambda: 1
+    runner._adapter_for_source = lambda _source: adapter
+    runner._get_proxy_url = lambda: None
+    runner._should_send_voice_reply = lambda *_args, **_kwargs: False
+    runner._send_voice_reply = AsyncMock()
+    runner._thread_metadata_for_source = lambda source, reply_to_message_id=None: (
+        {"thread_id": source.thread_id} if source.thread_id else None
+    )
+    runner._reply_anchor_for_event = lambda event: getattr(event, "message_id", None)
+    runner._refresh_agent_cache_message_count = AsyncMock()
+    runner._cleanup_agent_resources = lambda _agent: None
+    runner._is_session_run_current = lambda *_args, **_kwargs: True
+    return runner
+
+
+def _discord_thread_source(adapter: DiscordAdapter, message, *, thread_id: str = "654"):
+    return adapter.build_source(
+        chat_id=thread_id,
+        chat_name="Hermes Server / #general / thread",
+        chat_type="thread",
+        user_id=str(message.author.id),
+        user_name=message.author.display_name,
+        thread_id=thread_id,
+        parent_chat_id="321",
+        message_id=str(message.id),
+    )
+
+
+def _bind_task_to_message_session(conn, task_id: str, runner: GatewayRunner, adapter: DiscordAdapter, message) -> None:
+    session_entry = runner.session_store.get_or_create_session(
+        _discord_thread_source(adapter, message)
+    )
+    conn.execute(
+        "UPDATE tasks SET session_id = ? WHERE id = ?",
+        (session_entry.session_id, task_id),
+    )
+    conn.commit()
 
 
 def make_history_message(
@@ -225,6 +427,844 @@ async def test_discord_accepts_and_strips_bot_mentions_when_required(adapter, mo
     adapter.handle_message.assert_awaited_once()
     event = adapter.handle_message.await_args.args[0]
     assert event.text == "hello with mention"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("purpose", ("CLAIM", "G4"))
+async def test_fresh_thread_reserved_change_gate_control_bypasses_mention_gate_without_opening_thread(
+    adapter,
+    monkeypatch,
+    purpose,
+):
+    monkeypatch.setenv("DISCORD_REQUIRE_MENTION", "true")
+    monkeypatch.delenv("DISCORD_FREE_RESPONSE_CHANNELS", raising=False)
+    monkeypatch.delenv("DISCORD_AUTO_THREAD", raising=False)
+
+    parent = FakeTextChannel(channel_id=321)
+    thread = FakeThread(channel_id=654, parent=parent)
+    adapter._auto_create_thread = AsyncMock()
+    raw_control = _reserved_control(purpose, "b")
+    message = make_message(channel=thread, content=raw_control)
+
+    accepted = await adapter._handle_message(message)
+
+    assert accepted is True
+    adapter._auto_create_thread.assert_not_awaited()
+    adapter.handle_message.assert_awaited_once()
+    event = adapter.handle_message.await_args.args[0]
+    assert event.text == raw_control
+    assert event.allow_gateway_control is True
+    assert event.source.chat_id == "654"
+    assert event.source.chat_type == "thread"
+    assert event.source.thread_id == "654"
+    assert "654" not in adapter._threads
+
+
+@pytest.mark.asyncio
+async def test_reserved_change_gate_control_in_channel_stays_behind_mention_gate(
+    adapter,
+    monkeypatch,
+):
+    monkeypatch.setenv("DISCORD_REQUIRE_MENTION", "true")
+    monkeypatch.delenv("DISCORD_FREE_RESPONSE_CHANNELS", raising=False)
+    monkeypatch.delenv("DISCORD_AUTO_THREAD", raising=False)
+
+    adapter._auto_create_thread = AsyncMock()
+    raw_control = _reserved_control("CLAIM", "c")
+    message = make_message(channel=FakeTextChannel(channel_id=321), content=raw_control)
+
+    accepted = await adapter._handle_message(message)
+
+    assert accepted is False
+    adapter._auto_create_thread.assert_not_awaited()
+    adapter.handle_message.assert_not_awaited()
+    assert not list(adapter._threads._threads)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("purpose", ("CLAIM", "G4"))
+@pytest.mark.parametrize("channel_kind", ("dm", "free_channel"))
+async def test_existing_admitted_nonthread_control_keeps_current_raw_trust(
+    adapter, monkeypatch, purpose, channel_kind,
+):
+    monkeypatch.setenv("DISCORD_REQUIRE_MENTION", "true")
+    adapter._allowed_user_ids = {"42"}
+    if channel_kind == "dm":
+        channel = FakeDMChannel(channel_id=321)
+    else:
+        channel = FakeTextChannel(channel_id=321)
+        monkeypatch.setenv("DISCORD_FREE_RESPONSE_CHANNELS", "321")
+    adapter._auto_create_thread = AsyncMock()
+    statement = _reserved_control(purpose)
+
+    assert await adapter._dispatch_discord_message(
+        make_message(channel=channel, content=statement)
+    ) is True
+
+    event = adapter.handle_message.await_args.args[0]
+    assert event.text == statement
+    assert event.allow_gateway_control is True
+    adapter._auto_create_thread.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_reserved_change_gate_control_respects_allowed_channel_gate(
+    adapter,
+    monkeypatch,
+):
+    monkeypatch.setenv("DISCORD_REQUIRE_MENTION", "true")
+    monkeypatch.setenv("DISCORD_ALLOWED_CHANNELS", "999")
+
+    parent = FakeTextChannel(channel_id=321)
+    thread = FakeThread(channel_id=654, parent=parent)
+    message = make_message(channel=thread, content=_reserved_control("CLAIM", "c"))
+
+    accepted = await adapter._handle_message(message)
+
+    assert accepted is False
+    adapter.handle_message.assert_not_awaited()
+    assert "654" not in adapter._threads
+
+
+@pytest.mark.asyncio
+async def test_reserved_change_gate_control_respects_ignored_channel_gate(
+    adapter,
+    monkeypatch,
+):
+    monkeypatch.setenv("DISCORD_REQUIRE_MENTION", "true")
+    monkeypatch.setenv("DISCORD_IGNORED_CHANNELS", "321")
+
+    parent = FakeTextChannel(channel_id=321)
+    thread = FakeThread(channel_id=654, parent=parent)
+    message = make_message(channel=thread, content=_reserved_control("CLAIM", "c"))
+
+    accepted = await adapter._handle_message(message)
+
+    assert accepted is False
+    adapter.handle_message.assert_not_awaited()
+    assert "654" not in adapter._threads
+
+
+@pytest.mark.asyncio
+async def test_mention_stripped_reserved_change_gate_control_is_not_trusted_authority(
+    adapter,
+    monkeypatch,
+):
+    monkeypatch.setenv("DISCORD_REQUIRE_MENTION", "true")
+    monkeypatch.delenv("DISCORD_FREE_RESPONSE_CHANNELS", raising=False)
+    monkeypatch.delenv("DISCORD_AUTO_THREAD", raising=False)
+
+    bot_user = adapter._client.user
+    parent = FakeTextChannel(channel_id=321)
+    thread = FakeThread(channel_id=654, parent=parent)
+    raw_control = _reserved_control("CLAIM", "c")
+    message = make_message(
+        channel=thread,
+        content=f"<@{bot_user.id}> {raw_control}",
+        mentions=[bot_user],
+    )
+
+    accepted = await adapter._handle_message(message)
+
+    assert accepted is True
+    adapter.handle_message.assert_awaited_once()
+    event = adapter.handle_message.await_args.args[0]
+    assert event.text == raw_control
+    assert event.allow_gateway_control is False
+    assert "654" not in adapter._threads
+
+
+@pytest.mark.asyncio
+async def test_recovered_reserved_change_gate_control_still_requires_live_mention(adapter, monkeypatch):
+    monkeypatch.setenv("DISCORD_REQUIRE_MENTION", "true")
+    monkeypatch.delenv("DISCORD_FREE_RESPONSE_CHANNELS", raising=False)
+
+    parent = FakeTextChannel(channel_id=321)
+    thread = FakeThread(channel_id=654, parent=parent)
+    message = make_message(channel=thread, content=_reserved_control("CLAIM", "d"))
+
+    accepted = await adapter._dispatch_recovered_message(message)
+
+    assert accepted is False
+    adapter.handle_message.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_recovered_mention_stripped_reserved_control_dispatches_untrusted(adapter, monkeypatch):
+    monkeypatch.setenv("DISCORD_REQUIRE_MENTION", "true")
+    monkeypatch.setenv("DISCORD_ALLOW_ALL_USERS", "true")
+    monkeypatch.delenv("DISCORD_FREE_RESPONSE_CHANNELS", raising=False)
+
+    bot_user = adapter._client.user
+    parent = FakeTextChannel(channel_id=321)
+    thread = FakeThread(channel_id=654, parent=parent)
+    raw_control = _reserved_control("CLAIM", "d")
+    message = make_message(
+        channel=thread,
+        content=f"<@{bot_user.id}> {raw_control}",
+        mentions=[bot_user],
+    )
+
+    accepted = await adapter._dispatch_recovered_message(message)
+
+    assert accepted is True
+    adapter.handle_message.assert_awaited_once()
+    event = adapter.handle_message.await_args.args[0]
+    assert event.text == raw_control
+    assert event.allow_gateway_control is False
+    assert "654" not in adapter._threads
+
+
+@pytest.mark.asyncio
+async def test_snapshot_reserved_change_gate_control_does_not_supply_trusted_raw_text(
+    adapter,
+    monkeypatch,
+):
+    monkeypatch.setenv("DISCORD_REQUIRE_MENTION", "true")
+    monkeypatch.delenv("DISCORD_FREE_RESPONSE_CHANNELS", raising=False)
+
+    parent = FakeTextChannel(channel_id=321)
+    thread = FakeThread(channel_id=654, parent=parent)
+    message = make_message(channel=thread, content="")
+    message.message_snapshots = [SimpleNamespace(content=_reserved_control("CLAIM", "e"), attachments=[])]
+
+    accepted = await adapter._handle_message(message)
+
+    assert accepted is False
+    adapter.handle_message.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_mentioned_snapshot_reserved_change_gate_control_dispatches_untrusted(
+    adapter,
+    monkeypatch,
+):
+    monkeypatch.setenv("DISCORD_REQUIRE_MENTION", "true")
+    monkeypatch.delenv("DISCORD_FREE_RESPONSE_CHANNELS", raising=False)
+
+    bot_user = adapter._client.user
+    parent = FakeTextChannel(channel_id=321)
+    thread = FakeThread(channel_id=654, parent=parent)
+    message = make_message(channel=thread, content="", mentions=[bot_user])
+    message.message_snapshots = [SimpleNamespace(content=_reserved_control("CLAIM", "e"), attachments=[])]
+
+    accepted = await adapter._handle_message(message)
+
+    assert accepted is True
+    adapter.handle_message.assert_awaited_once()
+    event = adapter.handle_message.await_args.args[0]
+    assert event.text == _reserved_control("CLAIM", "e")
+    assert event.allow_gateway_control is False
+    assert "654" not in adapter._threads
+
+
+@pytest.mark.asyncio
+async def test_reply_context_reserved_change_gate_text_does_not_replace_current_raw_text(
+    adapter,
+    monkeypatch,
+):
+    monkeypatch.setenv("DISCORD_REQUIRE_MENTION", "true")
+    monkeypatch.delenv("DISCORD_FREE_RESPONSE_CHANNELS", raising=False)
+
+    bot_user = adapter._client.user
+    parent = FakeTextChannel(channel_id=321)
+    thread = FakeThread(channel_id=654, parent=parent)
+    message = make_message(
+        channel=thread,
+        content=f"<@{bot_user.id}> please review this quote",
+        mentions=[bot_user],
+    )
+    message.reference = SimpleNamespace(
+        message_id=777,
+        resolved=SimpleNamespace(content=_reserved_control("CLAIM", "e")),
+    )
+
+    accepted = await adapter._handle_message(message)
+
+    assert accepted is True
+    adapter.handle_message.assert_awaited_once()
+    event = adapter.handle_message.await_args.args[0]
+    assert event.text == "please review this quote"
+    assert event.reply_to_text == _reserved_control("CLAIM", "e")
+    assert event.allow_gateway_control is True
+
+
+@pytest.mark.asyncio
+async def test_attachment_text_reserved_change_gate_content_does_not_replace_current_raw_text(
+    adapter,
+    monkeypatch,
+):
+    monkeypatch.setenv("DISCORD_REQUIRE_MENTION", "true")
+    monkeypatch.delenv("DISCORD_FREE_RESPONSE_CHANNELS", raising=False)
+    adapter._cache_discord_document = AsyncMock(
+        return_value=_reserved_control("CLAIM", "e").encode("utf-8")
+    )
+
+    bot_user = adapter._client.user
+    parent = FakeTextChannel(channel_id=321)
+    thread = FakeThread(channel_id=654, parent=parent)
+    message = make_message(
+        channel=thread,
+        content=f"<@{bot_user.id}>",
+        mentions=[bot_user],
+    )
+    message.attachments = [
+        SimpleNamespace(
+            content_type="text/plain",
+            filename="control.txt",
+            size=80,
+            url="https://cdn.example.invalid/control.txt",
+        )
+    ]
+
+    accepted = await adapter._handle_message(message)
+
+    assert accepted is True
+    adapter.handle_message.assert_awaited_once()
+    event = adapter.handle_message.await_args.args[0]
+    assert event.text.startswith("[Content of control.txt]:")
+    assert _reserved_control("CLAIM", "e") in event.text
+    assert event.allow_gateway_control is True
+
+
+@pytest.mark.asyncio
+async def test_malformed_reserved_change_gate_control_is_admitted_for_runner_fail_closed(
+    adapter,
+    monkeypatch,
+):
+    monkeypatch.setenv("DISCORD_REQUIRE_MENTION", "true")
+    monkeypatch.delenv("DISCORD_FREE_RESPONSE_CHANNELS", raising=False)
+
+    parent = FakeTextChannel(channel_id=321)
+    thread = FakeThread(channel_id=654, parent=parent)
+    malformed = "AUTHORIZE_HERMES_CHANGE_GATE_CLAIM not-a-sha"
+    message = make_message(channel=thread, content=malformed)
+
+    accepted = await adapter._handle_message(message)
+
+    assert accepted is True
+    adapter.handle_message.assert_awaited_once()
+    event = adapter.handle_message.await_args.args[0]
+    assert event.text == malformed
+    assert event.allow_gateway_control is True
+    assert "654" not in adapter._threads
+
+
+@pytest.mark.asyncio
+async def test_reserved_change_gate_control_bypasses_discord_text_batching(
+    adapter,
+    monkeypatch,
+):
+    monkeypatch.setenv("DISCORD_REQUIRE_MENTION", "true")
+    monkeypatch.delenv("DISCORD_FREE_RESPONSE_CHANNELS", raising=False)
+    adapter._text_batch_delay_seconds = 10
+    adapter._enqueue_text_event = MagicMock()
+
+    parent = FakeTextChannel(channel_id=321)
+    thread = FakeThread(channel_id=654, parent=parent)
+    message = make_message(channel=thread, content=_reserved_control("CLAIM", "f"))
+
+    accepted = await adapter._handle_message(message)
+
+    assert accepted is True
+    adapter._enqueue_text_event.assert_not_called()
+    adapter.handle_message.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_reserved_change_gate_control_does_not_fetch_history_backfill(
+    adapter,
+    monkeypatch,
+):
+    monkeypatch.setenv("DISCORD_REQUIRE_MENTION", "true")
+    monkeypatch.setenv("DISCORD_HISTORY_BACKFILL", "true")
+    monkeypatch.setenv("DISCORD_HISTORY_BACKFILL_LIMIT", "5")
+    adapter._fetch_channel_context = AsyncMock(return_value="[history]")
+
+    parent = FakeTextChannel(channel_id=321)
+    thread = FakeThread(channel_id=654, parent=parent)
+    message = make_message(channel=thread, content=_reserved_control("CLAIM", "f"))
+
+    accepted = await adapter._handle_message(message)
+
+    assert accepted is True
+    adapter._fetch_channel_context.assert_not_awaited()
+    event = adapter.handle_message.await_args.args[0]
+    assert event.channel_context is None
+
+
+@pytest.mark.asyncio
+async def test_bot_reserved_change_gate_control_still_respects_discord_admission(
+    adapter,
+    monkeypatch,
+):
+    monkeypatch.setenv("DISCORD_REQUIRE_MENTION", "true")
+    monkeypatch.setenv("DISCORD_ALLOW_BOTS", "none")
+
+    parent = FakeTextChannel(channel_id=321)
+    thread = FakeThread(channel_id=654, parent=parent)
+    message = make_message(channel=thread, content=_reserved_control("CLAIM", "f"))
+    message.author.bot = True
+
+    accepted = await adapter._dispatch_discord_message(message)
+
+    assert accepted is False
+    adapter.handle_message.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_bot_allowed_all_reserved_change_gate_control_does_not_bypass_mention_gate(
+    adapter,
+    monkeypatch,
+):
+    monkeypatch.setenv("DISCORD_REQUIRE_MENTION", "true")
+    monkeypatch.setenv("DISCORD_ALLOW_BOTS", "all")
+
+    parent = FakeTextChannel(channel_id=321)
+    thread = FakeThread(channel_id=654, parent=parent)
+    message = make_message(channel=thread, content=_reserved_control("CLAIM", "f"))
+    message.author.bot = True
+
+    accepted = await adapter._dispatch_discord_message(message)
+
+    assert accepted is False
+    adapter.handle_message.assert_not_awaited()
+    assert "654" not in adapter._threads
+
+
+@pytest.mark.asyncio
+async def test_webhook_reserved_change_gate_control_does_not_bypass_mention_gate(
+    adapter,
+    monkeypatch,
+):
+    monkeypatch.setenv("DISCORD_REQUIRE_MENTION", "true")
+
+    parent = FakeTextChannel(channel_id=321)
+    thread = FakeThread(channel_id=654, parent=parent)
+    message = make_message(
+        channel=thread,
+        content=_reserved_control("CLAIM", "f"),
+        webhook_id=777,
+    )
+
+    accepted = await adapter._handle_message(message)
+
+    assert accepted is False
+    adapter.handle_message.assert_not_awaited()
+    assert "654" not in adapter._threads
+
+
+@pytest.mark.asyncio
+async def test_trailing_space_change_gate_control_preserves_raw_for_owner_validation(
+    adapter,
+    monkeypatch,
+):
+    monkeypatch.setenv("DISCORD_REQUIRE_MENTION", "true")
+    monkeypatch.delenv("DISCORD_FREE_RESPONSE_CHANNELS", raising=False)
+
+    parent = FakeTextChannel(channel_id=321)
+    thread = FakeThread(channel_id=654, parent=parent)
+    raw_control = _reserved_control("CLAIM", "f") + " "
+    message = make_message(channel=thread, content=raw_control)
+
+    accepted = await adapter._handle_message(message)
+
+    assert accepted is True
+    adapter.handle_message.assert_awaited_once()
+    event = adapter.handle_message.await_args.args[0]
+    assert event.text == raw_control
+    assert event.allow_gateway_control is True
+    assert "654" not in adapter._threads
+
+
+@pytest.mark.asyncio
+async def test_discord_fresh_thread_claim_reaches_existing_gateway_change_gate_owner(
+    adapter,
+    tmp_path,
+    monkeypatch,
+):
+    from agent import delegation_context
+    from tests.hermes_cli.test_change_gate_runtime_integration import (
+        _attach_runtime_artifacts,
+        _connect,
+        _create_ready_task,
+        _current_turn_release_count,
+        _enable_runtime,
+    )
+    import hermes_cli.profiles as profiles
+
+    isolated_home = tmp_path / ".hermes"
+    isolated_home.mkdir()
+    db_path = tmp_path / "kanban.db"
+    monkeypatch.setenv("HERMES_HOME", str(isolated_home))
+    monkeypatch.setenv("HERMES_KANBAN_DB", str(db_path))
+    monkeypatch.setattr(Path, "home", lambda: tmp_path)
+    monkeypatch.setattr(profiles, "profile_exists", lambda _name: True)
+    monkeypatch.setattr(delegation_context, "is_delegated_child_context", lambda: False)
+    monkeypatch.setenv("DISCORD_REQUIRE_MENTION", "true")
+    monkeypatch.setenv("DISCORD_ALLOWED_USERS", "42")
+    adapter._allowed_user_ids = {"42"}
+    monkeypatch.delenv("DISCORD_FREE_RESPONSE_CHANNELS", raising=False)
+    monkeypatch.delenv("DISCORD_AUTO_THREAD", raising=False)
+
+    with _connect(db_path) as conn:
+        task_id = _create_ready_task(conn)
+        fixture = _attach_runtime_artifacts(conn, tmp_path, task_id)
+        _enable_runtime(monkeypatch, tmp_path / "inventory")
+        statement = expected_release_statement(
+            purpose=ReleasePurpose.CLAIM,
+            handoff_sha256=fixture.handoff_sha256,
+        )
+        provider_calls: list[str] = []
+        _install_host_turn_context(monkeypatch)
+        _install_host_only_agent(monkeypatch, provider_calls=provider_calls)
+        runner = _make_gateway_runner(tmp_path, adapter)
+        adapter.handle_message = runner._handle_message
+        adapter.send = AsyncMock()
+
+        parent = FakeTextChannel(channel_id=321)
+        thread = FakeThread(channel_id=654, parent=parent)
+        message = make_message(channel=thread, content=statement)
+        _bind_task_to_message_session(conn, task_id, runner, adapter, message)
+
+        accepted = await adapter._dispatch_discord_message(message)
+
+        assert accepted is True
+        assert provider_calls == []
+        assert _current_turn_release_count(conn, task_id) == 1
+        release = conn.execute(
+            "SELECT purpose, handoff_sha256, state FROM change_gate_releases WHERE task_id = ?",
+            (task_id,),
+        ).fetchone()
+        assert tuple(release) == ("CLAIM", fixture.handoff_sha256, "ISSUED")
+        assert "654" not in adapter._threads
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("binding_mode", ("none", "wrong"))
+async def test_discord_fresh_thread_claim_requires_existing_session_binding(
+    adapter,
+    tmp_path,
+    monkeypatch,
+    binding_mode,
+):
+    from agent import delegation_context
+    from tests.hermes_cli.test_change_gate_runtime_integration import (
+        _attach_runtime_artifacts,
+        _connect,
+        _create_ready_task,
+        _current_turn_release_count,
+        _enable_runtime,
+    )
+    import hermes_cli.profiles as profiles
+
+    isolated_home = tmp_path / ".hermes"
+    isolated_home.mkdir()
+    db_path = tmp_path / "kanban.db"
+    monkeypatch.setenv("HERMES_HOME", str(isolated_home))
+    monkeypatch.setenv("HERMES_KANBAN_DB", str(db_path))
+    monkeypatch.setattr(Path, "home", lambda: tmp_path)
+    monkeypatch.setattr(profiles, "profile_exists", lambda _name: True)
+    monkeypatch.setattr(delegation_context, "is_delegated_child_context", lambda: False)
+    monkeypatch.setenv("DISCORD_REQUIRE_MENTION", "true")
+    monkeypatch.setenv("DISCORD_ALLOWED_USERS", "42")
+    adapter._allowed_user_ids = {"42"}
+    monkeypatch.delenv("DISCORD_FREE_RESPONSE_CHANNELS", raising=False)
+    monkeypatch.delenv("DISCORD_AUTO_THREAD", raising=False)
+
+    with _connect(db_path) as conn:
+        task_id = _create_ready_task(conn)
+        fixture = _attach_runtime_artifacts(conn, tmp_path, task_id)
+        _enable_runtime(monkeypatch, tmp_path / "inventory")
+        statement = expected_release_statement(
+            purpose=ReleasePurpose.CLAIM,
+            handoff_sha256=fixture.handoff_sha256,
+        )
+        if binding_mode == "wrong":
+            conn.execute(
+                "UPDATE tasks SET session_id = ? WHERE id = ?",
+                ("wrong-discord-session", task_id),
+            )
+            conn.commit()
+
+        provider_calls: list[str] = []
+        _install_host_turn_context(monkeypatch)
+        _install_host_only_agent(monkeypatch, provider_calls=provider_calls)
+        runner = _make_gateway_runner(tmp_path, adapter)
+        adapter.handle_message = runner._handle_message
+        adapter.send = AsyncMock()
+
+        parent = FakeTextChannel(channel_id=321)
+        thread = FakeThread(channel_id=654, parent=parent)
+        message = make_message(channel=thread, content=statement)
+
+        accepted = await adapter._dispatch_discord_message(message)
+
+        assert accepted is True
+        assert provider_calls == []
+        assert _current_turn_release_count(conn, task_id) == 0
+        assert not kb.change_gate_runtime_schema_exists(conn)
+        assert "654" not in adapter._threads
+
+
+@pytest.mark.asyncio
+async def test_discord_fresh_thread_claim_replay_after_expiry_does_not_reissue(
+    adapter,
+    tmp_path,
+    monkeypatch,
+):
+    from agent import delegation_context
+    from tests.hermes_cli.test_change_gate_runtime_integration import (
+        _attach_runtime_artifacts,
+        _connect,
+        _create_ready_task,
+        _current_turn_release_count,
+        _enable_runtime,
+    )
+    import hermes_cli.profiles as profiles
+
+    isolated_home = tmp_path / ".hermes"
+    isolated_home.mkdir()
+    db_path = tmp_path / "kanban.db"
+    monkeypatch.setenv("HERMES_HOME", str(isolated_home))
+    monkeypatch.setenv("HERMES_KANBAN_DB", str(db_path))
+    monkeypatch.setattr(Path, "home", lambda: tmp_path)
+    monkeypatch.setattr(profiles, "profile_exists", lambda _name: True)
+    monkeypatch.setattr(delegation_context, "is_delegated_child_context", lambda: False)
+    monkeypatch.setenv("DISCORD_REQUIRE_MENTION", "true")
+    monkeypatch.setenv("DISCORD_ALLOWED_USERS", "42")
+    adapter._allowed_user_ids = {"42"}
+    monkeypatch.delenv("DISCORD_FREE_RESPONSE_CHANNELS", raising=False)
+    monkeypatch.delenv("DISCORD_AUTO_THREAD", raising=False)
+
+    with _connect(db_path) as conn:
+        task_id = _create_ready_task(conn)
+        fixture = _attach_runtime_artifacts(conn, tmp_path, task_id)
+        _enable_runtime(monkeypatch, tmp_path / "inventory")
+        statement = expected_release_statement(
+            purpose=ReleasePurpose.CLAIM,
+            handoff_sha256=fixture.handoff_sha256,
+        )
+
+        provider_calls: list[str] = []
+        _install_host_turn_context(monkeypatch)
+        _install_host_only_agent(monkeypatch, provider_calls=provider_calls)
+        runner = _make_gateway_runner(tmp_path, adapter)
+        adapter.handle_message = runner._handle_message
+        adapter.send = AsyncMock()
+
+        parent = FakeTextChannel(channel_id=321)
+        thread = FakeThread(channel_id=654, parent=parent)
+        first = make_message(channel=thread, content=statement)
+        _bind_task_to_message_session(conn, task_id, runner, adapter, first)
+
+        assert await adapter._dispatch_discord_message(first) is True
+        assert provider_calls == []
+        assert _current_turn_release_count(conn, task_id) == 1
+        expires_at = conn.execute(
+            "SELECT expires_at FROM change_gate_releases WHERE task_id = ?",
+            (task_id,),
+        ).fetchone()[0]
+
+        monkeypatch.setattr(time, "time", lambda: int(expires_at) + 1)
+        replay = make_message(channel=thread, content=statement)
+        replay.id = 124
+
+        assert await adapter._dispatch_discord_message(replay) is True
+        assert provider_calls == []
+        assert _current_turn_release_count(conn, task_id) == 1
+        assert "654" not in adapter._threads
+
+
+@pytest.mark.asyncio
+async def test_discord_fresh_thread_g4_reaches_existing_gateway_change_gate_owner(
+    adapter,
+    tmp_path,
+    monkeypatch,
+):
+    from agent import delegation_context
+    from tests.hermes_cli.test_change_gate_runtime_integration import (
+        _attach_runtime_artifacts,
+        _claim_and_converge_normal_review,
+        _connect,
+        _create_ready_task,
+        _current_turn_release_count,
+        _enable_runtime,
+    )
+    import hermes_cli.profiles as profiles
+
+    isolated_home = tmp_path / ".hermes"
+    isolated_home.mkdir()
+    db_path = tmp_path / "kanban.db"
+    monkeypatch.setenv("HERMES_HOME", str(isolated_home))
+    monkeypatch.setenv("HERMES_KANBAN_DB", str(db_path))
+    monkeypatch.setattr(Path, "home", lambda: tmp_path)
+    monkeypatch.setattr(profiles, "profile_exists", lambda _name: True)
+    monkeypatch.setattr(delegation_context, "is_delegated_child_context", lambda: False)
+    monkeypatch.setenv("DISCORD_REQUIRE_MENTION", "true")
+    monkeypatch.setenv("DISCORD_ALLOWED_USERS", "42")
+    adapter._allowed_user_ids = {"42"}
+    monkeypatch.delenv("DISCORD_FREE_RESPONSE_CHANNELS", raising=False)
+    monkeypatch.delenv("DISCORD_AUTO_THREAD", raising=False)
+
+    with _connect(db_path) as conn:
+        task_id = _create_ready_task(conn)
+        fixture = _attach_runtime_artifacts(conn, tmp_path, task_id)
+        _enable_runtime(monkeypatch, tmp_path / "inventory")
+        _claim_and_converge_normal_review(conn, fixture, claim_suffix="d")
+        g4_statement = expected_release_statement(
+            purpose=ReleasePurpose.G4,
+            handoff_sha256=fixture.handoff_sha256,
+        )
+
+        provider_calls: list[str] = []
+        _install_host_turn_context(monkeypatch)
+        _install_host_only_agent(monkeypatch, provider_calls=provider_calls)
+        runner = _make_gateway_runner(tmp_path, adapter)
+        adapter.handle_message = runner._handle_message
+        adapter.send = AsyncMock()
+
+        parent = FakeTextChannel(channel_id=321)
+        thread = FakeThread(channel_id=654, parent=parent)
+        message = make_message(channel=thread, content=g4_statement)
+        _bind_task_to_message_session(conn, task_id, runner, adapter, message)
+
+        accepted = await adapter._dispatch_discord_message(message)
+
+        assert accepted is True
+        assert provider_calls == []
+        assert _current_turn_release_count(conn, task_id) == 2
+        release = conn.execute(
+            "SELECT purpose, handoff_sha256, state FROM change_gate_releases "
+            "WHERE task_id = ? AND purpose = 'G4'",
+            (task_id,),
+        ).fetchone()
+        assert tuple(release) == ("G4", fixture.handoff_sha256, "ISSUED")
+        assert "654" not in adapter._threads
+
+
+@pytest.mark.asyncio
+async def test_discord_trailing_space_claim_reaches_gateway_fail_closed_without_provider(
+    adapter,
+    tmp_path,
+    monkeypatch,
+):
+    from agent import delegation_context
+    from tests.hermes_cli.test_change_gate_runtime_integration import (
+        _attach_runtime_artifacts,
+        _connect,
+        _create_ready_task,
+        _current_turn_release_count,
+        _enable_runtime,
+    )
+    import hermes_cli.profiles as profiles
+
+    isolated_home = tmp_path / ".hermes"
+    isolated_home.mkdir()
+    db_path = tmp_path / "kanban.db"
+    monkeypatch.setenv("HERMES_HOME", str(isolated_home))
+    monkeypatch.setenv("HERMES_KANBAN_DB", str(db_path))
+    monkeypatch.setattr(Path, "home", lambda: tmp_path)
+    monkeypatch.setattr(profiles, "profile_exists", lambda _name: True)
+    monkeypatch.setattr(delegation_context, "is_delegated_child_context", lambda: False)
+    monkeypatch.setenv("DISCORD_REQUIRE_MENTION", "true")
+    monkeypatch.setenv("DISCORD_ALLOWED_USERS", "42")
+    adapter._allowed_user_ids = {"42"}
+    monkeypatch.delenv("DISCORD_FREE_RESPONSE_CHANNELS", raising=False)
+    monkeypatch.delenv("DISCORD_AUTO_THREAD", raising=False)
+
+    with _connect(db_path) as conn:
+        task_id = _create_ready_task(conn)
+        fixture = _attach_runtime_artifacts(conn, tmp_path, task_id)
+        _enable_runtime(monkeypatch, tmp_path / "inventory")
+        statement = expected_release_statement(
+            purpose=ReleasePurpose.CLAIM,
+            handoff_sha256=fixture.handoff_sha256,
+        ) + " "
+
+        provider_calls: list[str] = []
+        _install_host_turn_context(monkeypatch)
+        _install_host_only_agent(monkeypatch, provider_calls=provider_calls)
+        runner = _make_gateway_runner(tmp_path, adapter)
+        adapter.handle_message = runner._handle_message
+        adapter.send = AsyncMock()
+
+        parent = FakeTextChannel(channel_id=321)
+        thread = FakeThread(channel_id=654, parent=parent)
+        message = make_message(channel=thread, content=statement)
+        _bind_task_to_message_session(conn, task_id, runner, adapter, message)
+
+        accepted = await adapter._dispatch_discord_message(message)
+
+        assert accepted is True
+        assert provider_calls == []
+        assert _current_turn_release_count(conn, task_id) == 0
+        assert not kb.change_gate_runtime_schema_exists(conn)
+        assert "654" not in adapter._threads
+
+
+@pytest.mark.asyncio
+async def test_discord_mention_stripped_claim_reaches_gateway_fail_closed_without_provider(
+    adapter,
+    tmp_path,
+    monkeypatch,
+):
+    from agent import delegation_context
+    from tests.hermes_cli.test_change_gate_runtime_integration import (
+        _attach_runtime_artifacts,
+        _connect,
+        _create_ready_task,
+        _current_turn_release_count,
+        _enable_runtime,
+    )
+    import hermes_cli.profiles as profiles
+
+    isolated_home = tmp_path / ".hermes"
+    isolated_home.mkdir()
+    db_path = tmp_path / "kanban.db"
+    monkeypatch.setenv("HERMES_HOME", str(isolated_home))
+    monkeypatch.setenv("HERMES_KANBAN_DB", str(db_path))
+    monkeypatch.setattr(Path, "home", lambda: tmp_path)
+    monkeypatch.setattr(profiles, "profile_exists", lambda _name: True)
+    monkeypatch.setattr(delegation_context, "is_delegated_child_context", lambda: False)
+    monkeypatch.setenv("DISCORD_REQUIRE_MENTION", "true")
+    monkeypatch.setenv("DISCORD_ALLOWED_USERS", "42")
+    adapter._allowed_user_ids = {"42"}
+    monkeypatch.delenv("DISCORD_FREE_RESPONSE_CHANNELS", raising=False)
+    monkeypatch.delenv("DISCORD_AUTO_THREAD", raising=False)
+
+    with _connect(db_path) as conn:
+        task_id = _create_ready_task(conn)
+        fixture = _attach_runtime_artifacts(conn, tmp_path, task_id)
+        _enable_runtime(monkeypatch, tmp_path / "inventory")
+        statement = expected_release_statement(
+            purpose=ReleasePurpose.CLAIM,
+            handoff_sha256=fixture.handoff_sha256,
+        )
+
+        provider_calls: list[str] = []
+        _install_host_turn_context(monkeypatch)
+        _install_host_only_agent(monkeypatch, provider_calls=provider_calls)
+        runner = _make_gateway_runner(tmp_path, adapter)
+        adapter.handle_message = runner._handle_message
+        adapter.send = AsyncMock()
+
+        parent = FakeTextChannel(channel_id=321)
+        thread = FakeThread(channel_id=654, parent=parent)
+        message = make_message(
+            channel=thread,
+            content=f"<@{adapter._client.user.id}> {statement}",
+            mentions=[adapter._client.user],
+        )
+        _bind_task_to_message_session(conn, task_id, runner, adapter, message)
+
+        accepted = await adapter._dispatch_discord_message(message)
+
+        assert accepted is True
+        assert provider_calls == []
+        assert _current_turn_release_count(conn, task_id) == 0
+        assert not kb.change_gate_runtime_schema_exists(conn)
+        assert "654" not in adapter._threads
 
 
 @pytest.mark.asyncio
@@ -825,5 +1865,3 @@ async def test_discord_reply_in_free_channel_triggers_backfill(adapter, monkeypa
     assert event.channel_context == (
         "[Context around the replied-to message]\n[Hermes [bot]] earlier answer"
     )
-
-

@@ -141,6 +141,7 @@ except ImportError:
     from ffmpeg_utils import resolve_ffmpeg_executable
 
 from gateway.config import Platform, PlatformConfig
+from hermes_cli.change_gate_release import is_change_gate_host_control_text
 
 from gateway.platforms.helpers import (
     MessageDeduplicator,
@@ -8083,11 +8084,21 @@ class DiscordAdapter(BasePlatformAdapter):
 
         is_voice_linked_channel = False
 
-        # Save mention-stripped text before auto-threading since create_thread()
-        # can clobber message.content, breaking /command detection in channels.
-        raw_content = message.content.strip()
+        # Keep current raw authority text separate from ordinary-message
+        # normalization; mention stripping and create_thread() mutate content.
+        original_raw_content = message.content or ""
+        raw_content = original_raw_content.strip()
         normalized_content = raw_content
         mention_prefix = False
+        current_human_message = (
+            not getattr(message.author, "bot", False)
+            and not getattr(message, "webhook_id", None)
+        )
+        live_change_gate_control = (
+            not recovered
+            and current_human_message
+            and is_change_gate_host_control_text(original_raw_content)
+        )
 
         snapshot_attachments = []
         if hasattr(message, "message_snapshots") and message.message_snapshots:
@@ -8105,6 +8116,10 @@ class DiscordAdapter(BasePlatformAdapter):
                 normalized_content = normalized_content.replace(f"<@{self._client.user.id}>", "").strip()
                 normalized_content = normalized_content.replace(f"<@!{self._client.user.id}>", "").strip()
             message.content = normalized_content
+        change_gate_control_attempt = (
+            live_change_gate_control
+            or is_change_gate_host_control_text(normalized_content)
+        )
         if not isinstance(message.channel, discord.DMChannel):
             channel_ids = {str(message.channel.id)}
             if parent_channel_id:
@@ -8149,7 +8164,12 @@ class DiscordAdapter(BasePlatformAdapter):
                 and not self._discord_thread_require_mention()
             )
 
-            if require_mention and not is_free_channel and not in_bot_thread:
+            if (
+                require_mention
+                and not is_free_channel
+                and not in_bot_thread
+                and not (is_thread and live_change_gate_control)
+            ):
                 if not self._self_is_explicitly_mentioned(message) and not mention_prefix:
                     return False
         # Auto-thread: when enabled, automatically create a thread for every
@@ -8159,7 +8179,11 @@ class DiscordAdapter(BasePlatformAdapter):
         auto_threaded_channel = None
         if not is_thread and not isinstance(message.channel, discord.DMChannel):
             no_thread_channels = self._get_no_thread_channels()
-            skip_thread = bool(channel_keys & no_thread_channels) or is_free_channel
+            skip_thread = (
+                bool(channel_keys & no_thread_channels)
+                or is_free_channel
+                or change_gate_control_attempt
+            )
             auto_thread = os.getenv("DISCORD_AUTO_THREAD", "true").lower() in {"true", "1", "yes"}
             is_reply_message = getattr(message, "type", None) == discord.MessageType.reply
             if auto_thread and not skip_thread and not is_voice_linked_channel and not is_reply_message:
@@ -8401,8 +8425,8 @@ class DiscordAdapter(BasePlatformAdapter):
 
         # Use normalized_content (saved before auto-threading) instead of message.content,
         # to detect /slash commands in channel messages.
-        event_text = normalized_content
-        if pending_text_injection:
+        event_text = original_raw_content if live_change_gate_control else normalized_content
+        if pending_text_injection and not live_change_gate_control:
             event_text = f"{pending_text_injection}\n\n{event_text}" if event_text else pending_text_injection
 
         # ── History backfill ─────────────────────────────────────────
@@ -8430,7 +8454,11 @@ class DiscordAdapter(BasePlatformAdapter):
         # to keep the partition rule clean.
         _channel_context = None
         _is_dm = isinstance(message.channel, discord.DMChannel)
-        if not _is_dm and self._discord_history_backfill():
+        if (
+            not _is_dm
+            and not change_gate_control_attempt
+            and self._discord_history_backfill()
+        ):
             # Run backfill when there's a real gap to fill:
             #   - mention-gated channels with no free-response override
             #     (messages between bot turns aren't in the transcript)
@@ -8526,11 +8554,12 @@ class DiscordAdapter(BasePlatformAdapter):
             auto_skill=_skills,
             channel_prompt=_channel_prompt,
             channel_context=_channel_context,
+            allow_gateway_control=live_change_gate_control or not change_gate_control_attempt,
         )
 
         # Track thread participation so the bot won't require @mention for
         # follow-up messages in threads it has already engaged in.
-        if thread_id:
+        if thread_id and not change_gate_control_attempt:
             self._threads.mark(thread_id)
 
         # Only live plain text messages use split-message batching. Recovery
@@ -8538,6 +8567,7 @@ class DiscordAdapter(BasePlatformAdapter):
         # would lose constituent IDs and make later restarts replay them.
         if (
             not recovered
+            and not change_gate_control_attempt
             and msg_type == MessageType.TEXT
             and self._text_batch_delay_seconds > 0
         ):

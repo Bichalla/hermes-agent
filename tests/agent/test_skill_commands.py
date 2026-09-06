@@ -6,6 +6,7 @@ from unittest.mock import patch
 
 import pytest
 
+import agent.skill_commands as skill_commands
 import tools.skills_tool as skills_tool_module
 from agent.skill_commands import (
     build_preloaded_skills_prompt,
@@ -427,6 +428,227 @@ class TestBuildPreloadedSkillsPrompt:
         assert missing == ["disabled-skill"]
         assert "SECRET DISABLED CONTENT." not in prompt
         assert "enabled-skill" in prompt
+
+    def test_builtin_sdlc_review_loads_from_repo_root_even_with_profile_shadow(
+        self, tmp_path, monkeypatch
+    ):
+        repo_root = Path(skill_commands.__file__).resolve().parents[1]
+        builtin_path = repo_root / "skills" / "devops" / "sdlc-review" / "SKILL.md"
+        shadow_home = tmp_path / "shadow-home"
+        shadow_external = tmp_path / "shadow-external"
+        shadow_skill = shadow_external / "sdlc-review"
+        shadow_skill.mkdir(parents=True)
+        (shadow_skill / "SKILL.md").write_text(
+            """\
+---
+name: sdlc-review
+description: Shadowed profile skill.
+---
+
+# Shadowed SDLC Review
+
+This body must never win over the source-owned builtin.
+""",
+            encoding="utf-8",
+        )
+        shadow_home.mkdir()
+        (shadow_home / "config.yaml").write_text(
+            f"skills:\n  external_dirs:\n    - {shadow_external}\n",
+            encoding="utf-8",
+        )
+
+        from hermes_constants import reset_hermes_home_override, set_hermes_home_override
+
+        token = set_hermes_home_override(shadow_home)
+        try:
+            prompt, loaded, missing, sources = build_preloaded_skills_prompt(
+                ["hermes-builtin:sdlc-review"],
+                return_metadata=True,
+            )
+        finally:
+            reset_hermes_home_override(token)
+
+        assert loaded == ["sdlc-review"]
+        assert missing == []
+        assert "Shadowed profile skill" not in prompt
+        assert "This body must never win" not in prompt
+        assert "SDLC Review Skill" in prompt
+        assert sources[0]["source_id"] == "hermes-builtin:sdlc-review"
+        assert sources[0]["source_kind"] == "builtin"
+        assert sources[0]["status"] == "loaded"
+        assert sources[0]["source_path"] == str(builtin_path)
+        assert sources[0]["frontmatter_name"] == "sdlc-review"
+        assert sources[0]["source_hash"] == (
+            "sha256:ce90e8a3e145cce69c62880dc85921700110879f9290952d6cec28218503155f"
+        )
+
+    @pytest.mark.parametrize(
+        "mode",
+        ["missing", "disabled", "symlink", "tampered", "platform", "config_failure"],
+    )
+    def test_builtin_sdlc_review_failure_modes_are_recorded_as_failures(
+        self, tmp_path, monkeypatch, mode
+    ):
+        repo_root = tmp_path / "repo"
+        builtin_rel = Path("skills") / "devops" / "sdlc-review" / "SKILL.md"
+        builtin_path = repo_root / builtin_rel
+        builtin_path.parent.mkdir(parents=True, exist_ok=True)
+
+        if mode == "symlink":
+            real_root = tmp_path / "real-skill-root"
+            real_skill = real_root / "skills" / "devops" / "sdlc-review"
+            real_skill.mkdir(parents=True, exist_ok=True)
+            (real_skill / "SKILL.md").write_text(
+                """\
+---
+name: sdlc-review
+description: Symlinked skill.
+---
+
+# Symlinked
+""",
+                encoding="utf-8",
+            )
+            try:
+                builtin_path.symlink_to(real_skill / "SKILL.md")
+            except (OSError, NotImplementedError) as exc:
+                pytest.skip(f"symlinks unavailable in test environment: {exc}")
+        elif mode == "tampered":
+            builtin_path.write_text(
+                """\
+---
+name: sdlc-review
+description: Tampered skill.
+---
+
+# Tampered body
+
+This body change must be detected even though the name stays the same.
+""",
+                encoding="utf-8",
+            )
+        elif mode == "platform":
+            builtin_path.write_text(
+                """\
+---
+name: sdlc-review
+description: Platform-limited builtin.
+platforms: [plan9]
+---
+
+# SDLC Review Skill
+
+Platform mismatch body.
+""",
+                encoding="utf-8",
+            )
+        elif mode == "config_failure":
+            builtin_path.write_text(
+                """\
+---
+name: sdlc-review
+description: Config failure builtin.
+---
+
+# SDLC Review Skill
+
+Config failure body.
+""",
+                encoding="utf-8",
+            )
+        elif mode != "missing":
+            builtin_path.write_text(
+                """\
+---
+name: sdlc-review
+description: Valid builtin skill.
+---
+
+# SDLC Review Skill
+
+Valid body.
+""",
+                encoding="utf-8",
+            )
+
+        monkeypatch.setattr(skill_commands, "_repo_root", lambda: repo_root)
+        monkeypatch.setattr(
+            skill_commands,
+            "_BUILTIN_PRELOAD_SKILLS",
+            {
+                "hermes-builtin:sdlc-review": {
+                    "skill_name": "sdlc-review",
+                    "relative_path": builtin_rel,
+                }
+            },
+        )
+
+        if mode == "disabled":
+            import agent.skill_utils as skill_utils_mod
+
+            monkeypatch.setattr(
+                skill_utils_mod,
+                "get_disabled_skill_names",
+                lambda platform=None: {"sdlc-review"},
+            )
+        elif mode == "config_failure":
+            import agent.skill_utils as skill_utils_mod
+
+            def _raise_disabled(*args, **kwargs):
+                raise RuntimeError("config unavailable")
+
+            monkeypatch.setattr(
+                skill_utils_mod,
+                "get_disabled_skill_names",
+                _raise_disabled,
+            )
+        else:
+            import agent.skill_utils as skill_utils_mod
+
+            monkeypatch.setattr(
+                skill_utils_mod,
+                "get_disabled_skill_names",
+                lambda platform=None: set(),
+            )
+
+        prompt, loaded, missing, sources = build_preloaded_skills_prompt(
+            ["hermes-builtin:sdlc-review"],
+            return_metadata=True,
+        )
+
+        assert prompt == ""
+        assert loaded == []
+        assert missing == ["hermes-builtin:sdlc-review"]
+        assert sources[0]["source_id"] == "hermes-builtin:sdlc-review"
+        assert sources[0]["source_kind"] == "builtin"
+        assert sources[0]["status"] in {"missing", "disabled", "rejected"}
+        if mode == "missing":
+            assert sources[0]["status"] == "missing"
+        elif mode == "disabled":
+            assert sources[0]["status"] == "rejected"
+        else:
+            assert sources[0]["status"] == "rejected"
+        assert sources[0]["source_path"] == str(builtin_path)
+        if mode == "config_failure":
+            assert "disabled skill configuration" in sources[0]["reason"]
+        if mode == "platform":
+            assert "not supported on this platform" in sources[0]["reason"]
+        if mode == "tampered":
+            assert "hash mismatch" in sources[0]["reason"]
+
+    def test_unknown_reserved_builtin_identifier_fails_closed(self):
+        prompt, loaded, missing, sources = build_preloaded_skills_prompt(
+            ["hermes-builtin:does-not-exist"],
+            return_metadata=True,
+        )
+
+        assert prompt == ""
+        assert loaded == []
+        assert missing == ["hermes-builtin:does-not-exist"]
+        assert sources[0]["source_id"] == "hermes-builtin:does-not-exist"
+        assert sources[0]["source_kind"] == "builtin"
+        assert sources[0]["status"] == "missing"
+        assert sources[0]["reason"] == "unsupported builtin identifier"
 
 
 

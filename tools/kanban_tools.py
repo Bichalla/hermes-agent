@@ -1612,6 +1612,16 @@ def _handle_g2_handoff(args: dict, **kw) -> str:
     try:
         kb, conn = _connect()
         try:
+            max_retries = args.get("max_retries") if "max_retries" in args else None
+            if (
+                "max_retries" in args
+                and (
+                    type(max_retries) is bool
+                    or type(max_retries) is not int
+                    or max_retries < 1
+                )
+            ):
+                return tool_error("kanban_g2_handoff: max_retries must be an integer >= 1")
             result = kb.issue_change_gate_g2_handoff(
                 conn,
                 parent_task_id=worker.task_id,
@@ -1636,6 +1646,7 @@ def _handle_g2_handoff(args: dict, **kw) -> str:
                 expires_at_epoch=args.get("expires_at_epoch"),
                 evidence_ttl_seconds=args.get("evidence_ttl_seconds"),
                 priority=args.get("priority", 0),
+                **({"max_retries": max_retries} if max_retries is not None else {}),
             )
             return _ok(**result)
         finally:
@@ -2596,6 +2607,14 @@ KANBAN_G2_HANDOFF_SCHEMA = {
                 "description": (
                     "Relative EvidencePacket lifetime in seconds, stamped from "
                     "trusted G2 child creation time."
+                ),
+            },
+            "max_retries": {
+                "type": "integer",
+                "minimum": 1,
+                "description": (
+                    "Optional per-child failure ceiling. When omitted, the "
+                    "existing default behavior is preserved."
                 ),
             },
             "priority": {"type": "integer"},

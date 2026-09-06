@@ -87,7 +87,10 @@ import time
 from contextvars import ContextVar, Token
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Iterable, Mapping, Optional, cast
+from typing import TYPE_CHECKING, Any, Iterable, Mapping, Optional, cast
+
+if TYPE_CHECKING:
+    from hermes_cli.change_gate import ArtifactBinding
 
 from hermes_cli.change_gate import (
     ARCHITECTURE_INVENTORY_SCHEMA,
@@ -4772,6 +4775,7 @@ def issue_change_gate_g2_handoff(
     expires_at_epoch: object = None,
     evidence_ttl_seconds: object = None,
     priority: object = 0,
+    max_retries: object = None,
     body: object = None,
     board: Optional[str] = None,
 ) -> dict[str, object]:
@@ -4853,6 +4857,12 @@ def issue_change_gate_g2_handoff(
         )
         if type(priority) is bool or type(priority) is not int:
             raise ValueError("priority must be an integer")
+        if max_retries is None:
+            max_retries_value = None
+        elif type(max_retries) is int and max_retries >= 1:
+            max_retries_value = max_retries
+        else:
+            raise ValueError("max_retries must be an integer >= 1")
 
         required_bindings = _artifact_bindings_from_list(required_inputs, "required_inputs")
         produced_bindings = _artifact_bindings_from_list(produced_artifacts, "produced_artifacts")
@@ -4941,6 +4951,7 @@ def issue_change_gate_g2_handoff(
                 model_override=route.executor.model_override,
                 provider_override=route.executor.provider_override,
                 reasoning_effort=route.executor.reasoning_effort,
+                max_retries=max_retries_value,
                 initial_status="blocked",
                 created_by=planner_profile,
                 board=board,
@@ -6694,6 +6705,891 @@ def _end_run(
         "UPDATE tasks SET current_run_id = NULL WHERE id = ?", (task_id,),
     )
     return run_id
+
+
+_STOPPED_REVIEW_RECOVERY_EVENT_KIND = "stopped_review_terminalized"
+FORCED_REVIEW_SKILL_IDENTIFIER = "hermes-builtin:sdlc-review"
+
+
+def _terminalize_stopped_review_reject(
+    reason: str,
+    *,
+    task_id: object = None,
+    run_id: object = None,
+) -> dict[str, Any]:
+    result: dict[str, Any] = {"ok": False, "reason": reason}
+    if isinstance(task_id, str) and task_id:
+        result["task_id"] = task_id
+    if isinstance(run_id, int):
+        result["run_id"] = run_id
+    return result
+
+
+def _stopped_review_required_text(binding: Mapping[str, Any], key: str) -> str | None:
+    value = binding.get(key)
+    if type(value) is str and value and "\0" not in value:
+        return value
+    return None
+
+
+def _stopped_review_required_int(binding: Mapping[str, Any], key: str) -> int | None:
+    value = binding.get(key)
+    if type(value) is int and value > 0:
+        return int(value)
+    return None
+
+
+def _task_row_projection(row: sqlite3.Row | None) -> dict[str, Any] | None:
+    if row is None:
+        return None
+    keys = set(row.keys())
+    return {
+        key: row[key]
+        for key in (
+            "id",
+            "status",
+            "assignee",
+            "current_run_id",
+            "claim_lock",
+            "claim_expires",
+            "worker_pid",
+            "last_failure_error",
+            "block_kind",
+            "block_recurrences",
+        )
+        if key in keys
+    }
+
+
+def _run_row_projection(row: sqlite3.Row | None) -> dict[str, Any] | None:
+    if row is None:
+        return None
+    keys = set(row.keys())
+    return {
+        key: row[key]
+        for key in (
+            "id",
+            "task_id",
+            "profile",
+            "status",
+            "outcome",
+            "claim_lock",
+            "claim_expires",
+            "worker_pid",
+            "ended_at",
+            "metadata",
+            "error",
+        )
+        if key in keys
+    }
+
+
+def _stopped_review_state_projection(
+    conn: sqlite3.Connection,
+    *,
+    task_id: str,
+    run_id: int,
+) -> dict[str, Any]:
+    task = conn.execute(
+        "SELECT id, status, assignee, current_run_id, claim_lock, "
+        "claim_expires, worker_pid, last_failure_error, block_kind, "
+        "block_recurrences FROM tasks WHERE id = ?",
+        (task_id,),
+    ).fetchone()
+    run = conn.execute(
+        "SELECT id, task_id, profile, status, outcome, claim_lock, "
+        "claim_expires, worker_pid, ended_at, metadata, error "
+        "FROM task_runs WHERE id = ? AND task_id = ?",
+        (run_id, task_id),
+    ).fetchone()
+    return {
+        "task": _task_row_projection(task),
+        "run": _run_row_projection(run),
+    }
+
+
+def _stopped_review_database_projection(
+    conn: sqlite3.Connection,
+    *,
+    task_id: str | None = None,
+    run_id: int | None = None,
+    event_id: int | None = None,
+) -> tuple[dict[str, Any], dict[str, int]]:
+    def typed(value: object) -> list[object]:
+        if value is None:
+            return ["null"]
+        if isinstance(value, bytes):
+            return ["blob", value.hex()]
+        if type(value) is int:
+            return ["integer", str(value)]
+        if type(value) is float:
+            return ["real", value.hex()]
+        if type(value) is str:
+            return ["text", value]
+        raise TypeError("stopped_review_sqlite_value_type_unsupported")
+
+    schema = [dict(row) for row in conn.execute(
+        "SELECT type,name,tbl_name,sql FROM sqlite_master ORDER BY type,name,tbl_name,sql"
+    ).fetchall()]
+    projection: dict[str, Any] = {"schema": schema, "rows": {}}
+    counts: dict[str, int] = {}
+    for table in schema:
+        if table["type"] != "table":
+            continue
+        name = table["name"]
+        quoted = '"' + name.replace('"', '""') + '"'
+        rows = []
+        for record in conn.execute(f"SELECT * FROM {quoted}").fetchall():
+            row = dict(record)
+            if task_id is not None and (
+                (name == "tasks" and row.get("id") == task_id)
+                or (name == "task_runs" and row.get("id") == run_id)
+                or (name == "task_events" and event_id is not None and row.get("id") == event_id)
+                or (name == "sqlite_sequence" and row.get("name") == "task_events")
+            ):
+                continue
+            rows.append({key: typed(value) for key, value in row.items()})
+        rows.sort(key=lambda row: json.dumps(row, sort_keys=True, separators=(",", ":")))
+        projection["rows"][name] = rows
+        counts[name] = len(rows)
+    return projection, counts
+
+
+def stopped_review_database_identity(conn: sqlite3.Connection) -> dict[str, Any]:
+    """Return a deterministic read-only identity for stopped-review recovery.
+
+    The projection includes user table schemas, rows, and sqlite_sequence when
+    present.  Callers that need a post-recovery identity should keep it outside
+    the audit event payload; this helper hashes rows as stored.
+    """
+
+    projection, counts = _stopped_review_database_projection(conn)
+    return {
+        "schema": "hermes.kanban.stopped-review-recovery.db-identity/v1",
+        "counts": counts,
+        "sha256": canonical_sha256(projection),
+    }
+
+
+def _stopped_review_db_digest(conn: sqlite3.Connection) -> dict[str, Any]:
+    """Compatibility wrapper for compact recovery audit proof."""
+
+    return stopped_review_database_identity(conn)
+
+
+def _stopped_review_foreign_db_digest(
+    conn: sqlite3.Connection,
+    *,
+    task_id: str,
+    run_id: int,
+    event_id: int | None = None,
+) -> str:
+    """Hash every row except the stopped-review recovery mutation surface."""
+
+    projection, _ = _stopped_review_database_projection(
+        conn, task_id=task_id, run_id=run_id, event_id=event_id,
+    )
+    return canonical_sha256(projection)
+
+
+def _load_stopped_review_event_payload(
+    conn: sqlite3.Connection,
+    *,
+    task_id: str,
+) -> dict[str, Any] | None:
+    row = conn.execute(
+        "SELECT payload FROM task_events WHERE task_id = ? AND kind = ? "
+        "ORDER BY id DESC LIMIT 1",
+        (task_id, _STOPPED_REVIEW_RECOVERY_EVENT_KIND),
+    ).fetchone()
+    if row is None or not row["payload"]:
+        return None
+    try:
+        payload = json.loads(row["payload"])
+    except (TypeError, json.JSONDecodeError):
+        return None
+    return payload if isinstance(payload, dict) else None
+
+
+def terminalize_stopped_review_run(
+    conn: sqlite3.Connection,
+    *,
+    binding: dict,
+) -> dict[str, Any]:
+    """Atomically park a proven-stopped review worker without respawning it.
+
+    This is an owner API for external recovery controllers that have already
+    proved the material/live-process boundary.  The DB owner still validates the
+    live rows and Change Gate provenance inside one ``BEGIN IMMEDIATE``
+    transaction, closes the current review run with existing ``blocked``
+    vocabulary, and writes one audit event.  It deliberately does not call
+    ``block_task`` or any hook/notification/workspace cleanup path.
+    """
+
+    if type(binding) is not dict:
+        return _terminalize_stopped_review_reject("binding_required")
+
+    task_id = _stopped_review_required_text(binding, "task_id")
+    run_id = _stopped_review_required_int(binding, "run_id")
+    child_task_id = _stopped_review_required_text(binding, "child_task_id")
+    parent_task_id = _stopped_review_required_text(binding, "parent_task_id")
+    g2_task_id = _stopped_review_required_text(binding, "g2_task_id")
+    parent_g2_run_id = _stopped_review_required_int(binding, "parent_g2_run_id")
+    parent_g2_event_id = _stopped_review_required_int(binding, "parent_g2_event_id")
+    parent_claim_release_id = _stopped_review_required_text(
+        binding, "parent_claim_release_id"
+    )
+    parent_claim_consumed_event_id = _stopped_review_required_int(
+        binding, "parent_claim_consumed_event_id"
+    )
+    claim_lock = _stopped_review_required_text(binding, "claim_lock")
+    task_assignee = _stopped_review_required_text(binding, "task_assignee")
+    reviewer_profile = _stopped_review_required_text(binding, "reviewer_profile")
+    executor_assignee = _stopped_review_required_text(binding, "executor_assignee")
+    review_reviewer_class = _stopped_review_required_text(
+        binding, "review_reviewer_class"
+    )
+    review_bundle_sha256 = _stopped_review_required_text(binding, "review_bundle_sha256")
+    review_route_sha256 = _stopped_review_required_text(binding, "review_route_sha256")
+    frozen_handoff_sha256 = _stopped_review_required_text(
+        binding, "frozen_handoff_sha256"
+    )
+    operation_id = _stopped_review_required_text(binding, "operation_id")
+    operation_failure_sha256 = _stopped_review_required_text(
+        binding, "operation_failure_sha256"
+    )
+    operation_terminalizer_sha256 = _stopped_review_required_text(
+        binding, "operation_terminalizer_sha256"
+    )
+    db_semantic_preimage_sha256 = _stopped_review_required_text(
+        binding, "db_semantic_preimage_sha256"
+    )
+    db_semantic_schema = _stopped_review_required_text(binding, "db_semantic_schema")
+    executor_release_handoff_sha256 = _stopped_review_required_text(
+        binding, "executor_release_handoff_sha256"
+    )
+    executor_release_artifact_sha256 = _stopped_review_required_text(
+        binding, "executor_release_artifact_sha256"
+    )
+    executor_release_evidence_sha256 = _stopped_review_required_text(
+        binding, "executor_release_evidence_sha256"
+    )
+    executor_release_inventory_sha256 = _stopped_review_required_text(
+        binding, "executor_release_inventory_sha256"
+    )
+    executor_release_artifact_set_sha256 = _stopped_review_required_text(
+        binding, "executor_release_artifact_set_sha256"
+    )
+    executor_release_route_sha256 = _stopped_review_required_text(
+        binding, "executor_release_route_sha256"
+    )
+    executor_release_authority_receipt_sha256 = _stopped_review_required_text(
+        binding, "executor_release_authority_receipt_sha256"
+    )
+    worker_pid = _stopped_review_required_int(binding, "worker_pid")
+    gateway_pid = _stopped_review_required_int(binding, "gateway_pid")
+    executor_run_id = _stopped_review_required_int(binding, "executor_run_id")
+    executor_claim_lock = _stopped_review_required_text(binding, "executor_claim_lock")
+    executor_claim_event_id = _stopped_review_required_int(
+        binding, "executor_claim_event_id"
+    )
+    executor_claim_release_id = _stopped_review_required_text(
+        binding, "executor_claim_release_id"
+    )
+    executor_release_event_id = _stopped_review_required_int(
+        binding, "executor_release_event_id"
+    )
+    if None in (
+        task_id,
+        run_id,
+        child_task_id,
+        parent_task_id,
+        g2_task_id,
+        parent_g2_run_id,
+        parent_g2_event_id,
+        parent_claim_release_id,
+        parent_claim_consumed_event_id,
+        claim_lock,
+        task_assignee,
+        reviewer_profile,
+        executor_assignee,
+        review_reviewer_class,
+        review_bundle_sha256,
+        review_route_sha256,
+        frozen_handoff_sha256,
+        operation_id,
+        operation_failure_sha256,
+        operation_terminalizer_sha256,
+        db_semantic_preimage_sha256,
+        db_semantic_schema,
+        executor_release_handoff_sha256,
+        worker_pid,
+        gateway_pid,
+        executor_run_id,
+        executor_claim_lock,
+        executor_claim_event_id,
+        executor_claim_release_id,
+        executor_release_event_id,
+        executor_release_artifact_sha256,
+        executor_release_evidence_sha256,
+        executor_release_inventory_sha256,
+        executor_release_artifact_set_sha256,
+        executor_release_route_sha256,
+        executor_release_authority_receipt_sha256,
+    ):
+        return _terminalize_stopped_review_reject(
+            "binding_missing_or_invalid", task_id=task_id, run_id=run_id
+        )
+    if task_id != child_task_id:
+        return _terminalize_stopped_review_reject(
+            "task_child_mismatch", task_id=task_id, run_id=run_id
+        )
+    if binding.get("worker_absent") is not True or binding.get("gateway_absent") is not True:
+        return _terminalize_stopped_review_reject(
+            "process_absence_not_proven", task_id=task_id, run_id=run_id
+        )
+    if _pid_alive(worker_pid):
+        return _terminalize_stopped_review_reject(
+            "worker_pid_alive", task_id=task_id, run_id=run_id
+        )
+    if _pid_alive(gateway_pid):
+        return _terminalize_stopped_review_reject(
+            "gateway_pid_alive", task_id=task_id, run_id=run_id
+        )
+
+    binding_projection = {
+        "schema": "hermes.kanban.stopped-review-recovery.binding/v1",
+        "task_id": task_id,
+        "run_id": run_id,
+        "child_task_id": child_task_id,
+        "parent_task_id": parent_task_id,
+        "g2_task_id": g2_task_id,
+        "parent_g2_run_id": parent_g2_run_id,
+        "parent_g2_event_id": parent_g2_event_id,
+        "parent_claim_release_id": parent_claim_release_id,
+        "parent_claim_consumed_event_id": parent_claim_consumed_event_id,
+        "claim_lock": claim_lock,
+        "task_assignee": task_assignee,
+        "reviewer_profile": reviewer_profile,
+        "executor_assignee": executor_assignee,
+        "review_reviewer_class": review_reviewer_class,
+        "review_bundle_sha256": review_bundle_sha256,
+        "review_route_sha256": review_route_sha256,
+        "frozen_handoff_sha256": frozen_handoff_sha256,
+        "worker_pid": worker_pid,
+        "gateway_pid": gateway_pid,
+        "executor_run_id": executor_run_id,
+        "executor_claim_lock": executor_claim_lock,
+        "executor_claim_event_id": executor_claim_event_id,
+        "executor_claim_release_id": executor_claim_release_id,
+        "executor_release_event_id": executor_release_event_id,
+        "executor_release_handoff_sha256": executor_release_handoff_sha256,
+        "executor_release_artifact_sha256": executor_release_artifact_sha256,
+        "executor_release_evidence_sha256": executor_release_evidence_sha256,
+        "executor_release_inventory_sha256": executor_release_inventory_sha256,
+        "executor_release_artifact_set_sha256": executor_release_artifact_set_sha256,
+        "executor_release_route_sha256": executor_release_route_sha256,
+        "executor_release_authority_receipt_sha256": executor_release_authority_receipt_sha256,
+        "operation_id": operation_id,
+        "operation_failure_sha256": operation_failure_sha256,
+        "operation_terminalizer_sha256": operation_terminalizer_sha256,
+        "db_semantic_preimage_sha256": db_semantic_preimage_sha256,
+        "db_semantic_schema": db_semantic_schema,
+    }
+    binding_sha256 = canonical_sha256(binding_projection)
+
+    with write_txn(conn):
+        existing_payload = _load_stopped_review_event_payload(conn, task_id=task_id)
+        if existing_payload is not None:
+            if existing_payload.get("binding_sha256") != binding_sha256:
+                return _terminalize_stopped_review_reject(
+                    "existing_recovery_binding_mismatch",
+                    task_id=task_id,
+                    run_id=run_id,
+                )
+            state = _stopped_review_state_projection(
+                conn, task_id=task_id, run_id=run_id
+            )
+            if (
+                (state.get("task") or {}).get("status") == "blocked"
+                and (state.get("task") or {}).get("current_run_id") is None
+                and (state.get("run") or {}).get("outcome") == "blocked"
+                and (state.get("run") or {}).get("ended_at") is not None
+            ):
+                post_state_sha256 = canonical_sha256(state)
+                if existing_payload.get("post_state_sha256") != post_state_sha256:
+                    return _terminalize_stopped_review_reject(
+                        "existing_recovery_target_state_mismatch",
+                        task_id=task_id,
+                        run_id=run_id,
+                    )
+                foreign_digest = _stopped_review_foreign_db_digest(
+                    conn, task_id=task_id, run_id=run_id,
+                    event_id=existing_payload.get("event_id"),
+                )
+                if existing_payload.get("foreign_db_digest") != foreign_digest:
+                    return _terminalize_stopped_review_reject(
+                        "existing_recovery_foreign_state_mismatch",
+                        task_id=task_id,
+                        run_id=run_id,
+                    )
+                post_db_digest = _stopped_review_db_digest(conn)
+                return {
+                    "ok": True,
+                    "task_id": task_id,
+                    "run_id": run_id,
+                    "event_id": existing_payload.get("event_id"),
+                    "status": "blocked",
+                    "run_status": "stopped_review_terminalized",
+                    "idempotent": True,
+                    "binding_sha256": binding_sha256,
+                    "before": existing_payload.get("before"),
+                    "after": state,
+                    "pre_db_digest": existing_payload.get("pre_db_digest"),
+                    "post_db_digest": post_db_digest,
+                    "pre_state_sha256": existing_payload.get("pre_state_sha256"),
+                    "post_state_sha256": post_state_sha256,
+                    "db_semantic_preimage_sha256": db_semantic_preimage_sha256,
+                    "db_semantic_schema": db_semantic_schema,
+                }
+            return _terminalize_stopped_review_reject(
+                "existing_recovery_incomplete",
+                task_id=task_id,
+                run_id=run_id,
+            )
+
+        if not change_gate_runtime_schema_exists(conn):
+            return _terminalize_stopped_review_reject(
+                "change_gate_schema_missing", task_id=task_id, run_id=run_id
+            )
+        from hermes_cli.change_gate_runtime import (
+            REVIEW_CLAIM_KEY,
+            load_runtime_policy,
+            load_task_gate_artifacts,
+        )
+
+        load = load_task_gate_artifacts(
+            conn,
+            task_id,
+            policy=load_runtime_policy(),
+            attachment_root=task_attachments_dir(task_id),
+        )
+        if not load.ok or load.artifacts is None:
+            return _terminalize_stopped_review_reject(
+                "change_gate_artifacts_invalid", task_id=task_id, run_id=run_id
+            )
+        if (
+            load.artifacts.handoff.digest() != frozen_handoff_sha256
+            or load.artifacts.handoff.review_bundle_sha256() != review_bundle_sha256
+            or canonical_sha256(load.artifacts.actual_route) != review_route_sha256
+        ):
+            return _terminalize_stopped_review_reject(
+                "change_gate_artifact_binding_mismatch",
+                task_id=task_id,
+                run_id=run_id,
+            )
+        parent_load = load_task_gate_artifacts(
+            conn,
+            parent_task_id,
+            policy=load_runtime_policy(),
+            attachment_root=task_attachments_dir(parent_task_id),
+        )
+        parent_claim_artifact = _load_change_gate_release(
+            conn, parent_claim_release_id
+        )
+        executor_claim_artifact = _load_change_gate_release(
+            conn, executor_claim_release_id
+        )
+        if (
+            not parent_load.ok
+            or parent_load.artifacts is None
+            or parent_claim_artifact is None
+            or executor_claim_artifact is None
+        ):
+            return _terminalize_stopped_review_reject(
+                "change_gate_release_artifact_invalid",
+                task_id=task_id,
+                run_id=run_id,
+            )
+        try:
+            parent_release_reason = validate_durable_release_artifact(
+                parent_claim_artifact,
+                purpose=ReleasePurpose.CLAIM,
+                evidence=parent_load.artifacts.evidence,
+                handoff=parent_load.artifacts.handoff,
+                now_epoch=parent_claim_artifact.issued_at_epoch,
+                require_unexpired=False,
+                expected_transition_anchor=parent_claim_artifact.transition_anchor,
+            )
+            executor_release_reason = validate_durable_release_artifact(
+                executor_claim_artifact,
+                purpose=ReleasePurpose.CLAIM,
+                evidence=load.artifacts.evidence,
+                handoff=load.artifacts.handoff,
+                now_epoch=executor_claim_artifact.issued_at_epoch,
+                require_unexpired=False,
+                expected_transition_anchor=executor_claim_artifact.transition_anchor,
+            )
+        except (TypeError, ValueError):
+            return _terminalize_stopped_review_reject(
+                "change_gate_release_artifact_invalid",
+                task_id=task_id,
+                run_id=run_id,
+            )
+        if (
+            parent_release_reason is not ChangeGateReason.ALLOWED
+            or executor_release_reason is not ChangeGateReason.ALLOWED
+        ):
+            return _terminalize_stopped_review_reject(
+                "change_gate_release_artifact_invalid",
+                task_id=task_id,
+                run_id=run_id,
+            )
+        parent_run = conn.execute(
+            "SELECT outcome, metadata FROM task_runs WHERE id = ? AND task_id = ?",
+            (parent_g2_run_id, parent_task_id),
+        ).fetchone()
+        parent_g2_event = conn.execute(
+            "SELECT payload FROM task_events WHERE id = ? AND task_id = ? "
+            "AND run_id = ? AND kind = 'g2_handoff_completed'",
+            (parent_g2_event_id, parent_task_id, parent_g2_run_id),
+        ).fetchone()
+        if parent_run is None or parent_g2_event is None or parent_run["outcome"] != "g2_handoff":
+            return _terminalize_stopped_review_reject(
+                "parent_g2_provenance_missing", task_id=task_id, run_id=run_id
+            )
+        try:
+            parent_metadata = (
+                json.loads(parent_run["metadata"]) if parent_run["metadata"] else {}
+            )
+            parent_g2_payload = (
+                json.loads(parent_g2_event["payload"])
+                if parent_g2_event["payload"]
+                else {}
+            )
+        except (TypeError, json.JSONDecodeError):
+            return _terminalize_stopped_review_reject(
+                "parent_g2_provenance_malformed", task_id=task_id, run_id=run_id
+            )
+        if (
+            not isinstance(parent_metadata, dict)
+            or not isinstance(parent_g2_payload, dict)
+            or parent_metadata != parent_g2_payload
+            or parent_g2_payload.get("child_task_id") != child_task_id
+            or parent_g2_payload.get("claim_release_id") != parent_claim_release_id
+            or parent_g2_payload.get("claim_consumed_event_id")
+            != parent_claim_consumed_event_id
+        ):
+            return _terminalize_stopped_review_reject(
+                "parent_g2_provenance_mismatch", task_id=task_id, run_id=run_id
+            )
+        task = conn.execute(
+            "SELECT id, status, assignee, current_run_id, claim_lock, "
+            "claim_expires, worker_pid, last_failure_error, block_kind, "
+            "block_recurrences FROM tasks WHERE id = ?",
+            (task_id,),
+        ).fetchone()
+        run = conn.execute(
+            "SELECT id, task_id, profile, status, outcome, claim_lock, "
+            "claim_expires, worker_pid, ended_at, metadata, error "
+            "FROM task_runs WHERE id = ? AND task_id = ?",
+            (run_id, task_id),
+        ).fetchone()
+        before = {
+            "task": _task_row_projection(task),
+            "run": _run_row_projection(run),
+        }
+        pre_db_digest = _stopped_review_db_digest(conn)
+        foreign_pre_digest = _stopped_review_foreign_db_digest(
+            conn, task_id=task_id, run_id=run_id
+        )
+        if (
+            pre_db_digest.get("sha256") != db_semantic_preimage_sha256
+            or pre_db_digest.get("schema") != db_semantic_schema
+        ):
+            return _terminalize_stopped_review_reject(
+                "db_semantic_preimage_mismatch",
+                task_id=task_id,
+                run_id=run_id,
+            )
+        if task is None or run is None:
+            return _terminalize_stopped_review_reject(
+                "task_or_run_missing", task_id=task_id, run_id=run_id
+            )
+        if (
+            task["status"] != "running"
+            or task["current_run_id"] != run_id
+            or task["claim_lock"] != claim_lock
+            or task["worker_pid"] != worker_pid
+            or task["assignee"] != task_assignee
+        ):
+            return _terminalize_stopped_review_reject(
+                "active_review_task_mismatch", task_id=task_id, run_id=run_id
+            )
+        if (
+            run["status"] != "running"
+            or run["outcome"] is not None
+            or run["ended_at"] is not None
+            or run["claim_lock"] != claim_lock
+            or run["worker_pid"] != worker_pid
+            or run["profile"] != reviewer_profile
+        ):
+            return _terminalize_stopped_review_reject(
+                "active_review_run_mismatch", task_id=task_id, run_id=run_id
+            )
+        executor_claim = conn.execute(
+            "SELECT payload FROM task_events WHERE id = ? AND task_id = ? "
+            "AND run_id = ? AND kind = 'claimed'",
+            (executor_claim_event_id, child_task_id, executor_run_id),
+        ).fetchone()
+        if executor_claim is None:
+            return _terminalize_stopped_review_reject(
+                "executor_claim_event_missing", task_id=task_id, run_id=run_id
+            )
+        try:
+            executor_claim_payload = (
+                json.loads(executor_claim["payload"])
+                if executor_claim["payload"]
+                else {}
+            )
+        except (TypeError, json.JSONDecodeError):
+            executor_claim_payload = {}
+        if (
+            not isinstance(executor_claim_payload, dict)
+            or executor_claim_payload.get("lock") != executor_claim_lock
+            or executor_claim_payload.get("run_id") != executor_run_id
+        ):
+            return _terminalize_stopped_review_reject(
+                "executor_claim_event_mismatch", task_id=task_id, run_id=run_id
+            )
+        current_claim = conn.execute(
+            "SELECT payload FROM task_events WHERE task_id = ? AND run_id = ? "
+            "AND kind = 'claimed' ORDER BY id DESC LIMIT 1",
+            (task_id, run_id),
+        ).fetchone()
+        try:
+            current_claim_payload = (
+                json.loads(current_claim["payload"])
+                if current_claim is not None and current_claim["payload"]
+                else {}
+            )
+        except (TypeError, json.JSONDecodeError):
+            current_claim_payload = {}
+        if (
+            not isinstance(current_claim_payload, dict)
+            or current_claim_payload.get("source_status") != "review"
+            or current_claim_payload.get("lock") != claim_lock
+            or current_claim_payload.get("run_id") != run_id
+            or current_claim_payload.get(REVIEW_CLAIM_KEY) != "v1"
+            or current_claim_payload.get("bundle_sha256") != review_bundle_sha256
+            or current_claim_payload.get("reviewer_class") != review_reviewer_class
+            or current_claim_payload.get("route_sha256") != review_route_sha256
+        ):
+            return _terminalize_stopped_review_reject(
+                "review_claim_event_mismatch", task_id=task_id, run_id=run_id
+            )
+        release_event = conn.execute(
+            "SELECT payload FROM task_events WHERE id = ? AND task_id = ? "
+            "AND run_id = ? AND kind = 'review_requested'",
+            (executor_release_event_id, child_task_id, executor_run_id),
+        ).fetchone()
+        if release_event is None:
+            return _terminalize_stopped_review_reject(
+                "executor_release_event_missing", task_id=task_id, run_id=run_id
+            )
+        try:
+            release_event_payload = (
+                json.loads(release_event["payload"])
+                if release_event["payload"]
+                else {}
+            )
+        except (TypeError, json.JSONDecodeError):
+            release_event_payload = {}
+        if (
+            not isinstance(release_event_payload, dict)
+            or release_event_payload.get("implementer") != executor_assignee
+            or release_event_payload.get("reviewer") != reviewer_profile
+        ):
+            return _terminalize_stopped_review_reject(
+                "executor_release_event_mismatch", task_id=task_id, run_id=run_id
+            )
+        rows = conn.execute(
+            "SELECT release_id, handoff_sha256, consumed_event_id, consumed_run_id, "
+            "consumed_from_status, consumed_to_status, state, artifact_sha256, "
+            "evidence_sha256, inventory_sha256, artifact_set_sha256, "
+            "route_sha256, authority_receipt_sha256, max_consumptions "
+            "FROM change_gate_releases WHERE task_id = ? AND purpose = 'CLAIM' "
+            "AND state = 'CONSUMED'",
+            (child_task_id,),
+        ).fetchall()
+        if len(rows) != 1:
+            return _terminalize_stopped_review_reject(
+                "executor_claim_release_not_unique", task_id=task_id, run_id=run_id
+            )
+        release = rows[0]
+        if (
+            release["release_id"] != executor_claim_release_id
+            or release["handoff_sha256"] != executor_release_handoff_sha256
+            or release["consumed_event_id"] != executor_claim_event_id
+            or release["consumed_run_id"] != executor_run_id
+            or release["consumed_from_status"] != "ready"
+            or release["consumed_to_status"] != "running"
+            or release["max_consumptions"] != 1
+        ):
+            return _terminalize_stopped_review_reject(
+                "executor_claim_release_mismatch", task_id=task_id, run_id=run_id
+            )
+        for expected_hash, column_name in (
+            (executor_release_artifact_sha256, "artifact_sha256"),
+            (executor_release_evidence_sha256, "evidence_sha256"),
+            (executor_release_inventory_sha256, "inventory_sha256"),
+            (executor_release_artifact_set_sha256, "artifact_set_sha256"),
+            (executor_release_route_sha256, "route_sha256"),
+            (executor_release_authority_receipt_sha256, "authority_receipt_sha256"),
+        ):
+            if release[column_name] != expected_hash:
+                return _terminalize_stopped_review_reject(
+                    "executor_claim_release_mismatch",
+                    task_id=task_id,
+                    run_id=run_id,
+                )
+        if conn.execute(
+            "SELECT 1 FROM change_gate_releases WHERE task_id = ? "
+            "AND purpose = 'G4' LIMIT 1",
+            (child_task_id,),
+        ).fetchone() is not None:
+            return _terminalize_stopped_review_reject(
+                "g4_release_present", task_id=task_id, run_id=run_id
+            )
+        graph_edges = (
+            ((parent_task_id, child_task_id),)
+            if parent_task_id == g2_task_id
+            else ((parent_task_id, g2_task_id), (g2_task_id, child_task_id))
+        )
+        for expected_parent, expected_child in graph_edges:
+            if expected_parent == expected_child:
+                continue
+            if conn.execute(
+                "SELECT 1 FROM task_links WHERE parent_id = ? AND child_id = ?",
+                (expected_parent, expected_child),
+            ).fetchone() is None:
+                return _terminalize_stopped_review_reject(
+                    "task_graph_mismatch", task_id=task_id, run_id=run_id
+                )
+
+        now = int(time.time())
+        result_text = (
+            "Stopped review worker recovery terminalized; held for operator review"
+        )
+        try:
+            metadata = json.loads(run["metadata"]) if run["metadata"] else {}
+        except (TypeError, json.JSONDecodeError):
+            metadata = {}
+        if not isinstance(metadata, dict):
+            metadata = {}
+        metadata.update(
+            {
+                "stopped_review_recovery_schema": (
+                    "hermes.kanban.stopped-review-recovery.run-metadata/v1"
+                ),
+                "run_status": "stopped_review_terminalized",
+                "stopped_review_recovery_binding": binding_projection,
+                "stopped_review_recovery_binding_sha256": binding_sha256,
+                "stopped_review_recovery_pre_state_sha256": canonical_sha256(before),
+            }
+        )
+        cur = conn.execute(
+            """
+            UPDATE tasks
+               SET status = 'blocked',
+                   result = ?,
+                   completed_at = NULL,
+                   claim_lock = NULL,
+                   claim_expires = NULL,
+                   worker_pid = NULL,
+                   last_failure_error = ?,
+                   block_kind = 'capability'
+             WHERE id = ?
+               AND status = 'running'
+               AND current_run_id = ?
+               AND claim_lock = ?
+               AND worker_pid = ?
+            """,
+            (
+                result_text,
+                "stopped_review_worker_recovered",
+                task_id,
+                run_id,
+                claim_lock,
+                worker_pid,
+            ),
+        )
+        if cur.rowcount != 1:
+            return _terminalize_stopped_review_reject(
+                "active_review_task_lost", task_id=task_id, run_id=run_id
+            )
+        closed_run_id = _end_run(
+            conn,
+            task_id,
+            outcome="blocked",
+            status="blocked",
+            summary=result_text,
+            error="stopped_review_worker_recovered",
+            metadata=metadata,
+            ended_at=now,
+        )
+        if closed_run_id != run_id:
+            raise RuntimeError("stopped_review_run_closure_lost")
+        after = _stopped_review_state_projection(conn, task_id=task_id, run_id=run_id)
+        event_payload = {
+            "schema": "hermes.kanban.stopped-review-recovery.event/v1",
+            "binding_sha256": binding_sha256,
+            "binding": binding_projection,
+            "before": before,
+            "after": after,
+            "pre_db_digest": pre_db_digest,
+            "foreign_db_digest": foreign_pre_digest,
+            "pre_state_sha256": canonical_sha256(before),
+            "post_state_sha256": canonical_sha256(after),
+            "db_semantic_preimage_sha256": db_semantic_preimage_sha256,
+            "db_semantic_schema": db_semantic_schema,
+        }
+        event_id = _append_event(
+            conn,
+            task_id,
+            _STOPPED_REVIEW_RECOVERY_EVENT_KIND,
+            event_payload,
+            run_id=run_id,
+        )
+        event_payload["event_id"] = event_id
+        conn.execute(
+            "UPDATE task_events SET payload = ? WHERE id = ?",
+            (json.dumps(event_payload, ensure_ascii=False), event_id),
+        )
+        foreign_post_digest = _stopped_review_foreign_db_digest(
+            conn, task_id=task_id, run_id=run_id, event_id=event_id,
+        )
+        if foreign_post_digest != foreign_pre_digest:
+            raise RuntimeError("stopped_review_foreign_state_drift")
+        post_db_digest = _stopped_review_db_digest(conn)
+        return {
+            "ok": True,
+            "task_id": task_id,
+            "run_id": run_id,
+            "event_id": event_id,
+            "status": "blocked",
+            "run_status": "stopped_review_terminalized",
+            "idempotent": False,
+            "binding_sha256": binding_sha256,
+            "before": before,
+            "after": after,
+            "pre_db_digest": pre_db_digest,
+            "post_db_digest": post_db_digest,
+            "pre_state_sha256": event_payload["pre_state_sha256"],
+            "post_state_sha256": event_payload["post_state_sha256"],
+            "db_semantic_preimage_sha256": db_semantic_preimage_sha256,
+            "db_semantic_schema": db_semantic_schema,
+        }
 
 
 def _current_run_id(conn: sqlite3.Connection, task_id: str) -> Optional[int]:
@@ -13522,13 +14418,14 @@ def _dispatch_once_locked(
         if claimed.workspace_kind == "worktree":
             set_branch_name(conn, claimed.id, resolved_branch_name or (claimed.branch_name or "").strip() or f"wt/{claimed.id}")
         _maybe_emit_scratch_tip(conn, claimed.id, claimed.workspace_kind)
-        # Force-load the sdlc-review skill for review agents — it carries
-        # the review logic (AC verification, merge, etc.). The mandatory
-        # kanban lifecycle is already injected into every worker's system
-        # prompt via KANBAN_GUIDANCE, so this is the only extra skill the
-        # review agent needs.
+        # Force-load the reserved built-in review skill for review agents.
+        # Ordinary user-supplied skills keep the normal namespace; the
+        # hermes-builtin identifier is resolved by the CLI/skill owner and
+        # carries no Change Gate authority by itself.
         claimed.skills = list(
-            dict.fromkeys([*(claimed.skills or []), "sdlc-review"])
+            dict.fromkeys(
+                [*(claimed.skills or []), FORCED_REVIEW_SKILL_IDENTIFIER]
+            )
         )
         try:
             if spawn_fn is None:

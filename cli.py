@@ -5401,6 +5401,7 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
         self._preload_skills_result: Optional[tuple] = None
         self._preload_skills_error: Optional[BaseException] = None
         self._preload_skills_requested: list = []
+        self.preloaded_skill_sources: list[dict[str, Any]] = []
         self._preload_skills_finalized = False
         self._active_session_lease = None
 
@@ -8189,10 +8190,49 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
         err = getattr(self, "_preload_skills_error", None)
         if err is not None:
             raise err
+        required_builtin_requested = [
+            skill
+            for skill in getattr(self, "_preload_skills_requested", [])
+            if str(skill or "").startswith("hermes-builtin:")
+        ]
+        if thread.is_alive() and required_builtin_requested:
+            raise TimeoutError(
+                "Required builtin skill preload timed out: "
+                + ", ".join(s.replace("hermes-builtin:", "") for s in required_builtin_requested)
+            )
         result = getattr(self, "_preload_skills_result", None)
         if not result:
+            if required_builtin_requested:
+                raise ValueError(
+                    "Required builtin skill(s) unavailable: "
+                    + ", ".join(s.replace("hermes-builtin:", "") for s in required_builtin_requested)
+                )
             return
-        skills_prompt, loaded_skills, missing_skills = result
+        preload_sources: list[dict[str, Any]] = []
+        if len(result) == 4:
+            skills_prompt, loaded_skills, missing_skills, preload_sources = result
+        else:
+            skills_prompt, loaded_skills, missing_skills = result
+
+        self.preloaded_skill_sources = list(preload_sources)
+
+        builtin_failures = [
+            src
+            for src in preload_sources
+            if str(src.get("source_id") or "").startswith("hermes-builtin:")
+            and str(src.get("status") or "") != "loaded"
+        ]
+        if builtin_failures:
+            missing_required = ", ".join(
+                str(src.get("builtin_name") or src.get("requested_identifier") or src.get("source_id")).replace(
+                    "hermes-builtin:", ""
+                )
+                for src in builtin_failures
+            )
+            raise ValueError(
+                f"Required builtin skill(s) unavailable: {missing_required}"
+            )
+
         if missing_skills:
             missing_display = ", ".join(missing_skills)
             # If at least one skill loaded, degrade gracefully: skip the
@@ -20024,6 +20064,7 @@ def main(
                 cli._preload_skills_result = build_preloaded_skills_prompt(
                     parsed_skills,
                     task_id=cli.session_id,
+                    return_metadata=True,
                 )
             except Exception as exc:  # surfaced by finalize below
                 cli._preload_skills_error = exc

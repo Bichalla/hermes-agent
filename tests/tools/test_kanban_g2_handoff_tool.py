@@ -340,8 +340,14 @@ def _active_planner(
     return parent_id
 
 
-def _args(binding: dict[str, str], repo: Path, risk: str = "NORMAL") -> dict:
-    return {
+def _args(
+    binding: dict[str, str],
+    repo: Path,
+    risk: str = "NORMAL",
+    *,
+    max_retries: int | None = None,
+) -> dict:
+    args = {
         "title": "execute bounded source candidate",
         "body": "Use existing Change Gate contract only.",
         "risk": risk,
@@ -359,6 +365,9 @@ def _args(binding: dict[str, str], repo: Path, risk: str = "NORMAL") -> dict:
         "forbidden_effects": ["LIVE_SERVICE_MUTATION"],
         "evidence_ttl_seconds": 3600,
     }
+    if max_retries is not None:
+        args["max_retries"] = max_retries
+    return args
 
 
 def _legacy_abs_args(binding: dict[str, str], repo: Path, risk: str = "NORMAL") -> dict:
@@ -680,6 +689,7 @@ def test_kanban_g2_handoff_creates_child_and_frozen_artifacts(monkeypatch, tmp_p
         assert child.model_override == "gpt-5.6-luna"
         assert child.provider_override == "openai-codex"
         assert child.reasoning_effort == "xhigh"
+        assert child.max_retries is None
         assert kb.parent_ids(conn, child.id) == [parent_id]
         assert Path(child.workspace_path).name == child.id
         assert Path(child.workspace_path).is_dir()
@@ -712,6 +722,70 @@ def test_kanban_g2_handoff_creates_child_and_frozen_artifacts(monkeypatch, tmp_p
         duplicate = json.loads(_handle_g2_handoff(_args(binding, repo)))
         assert "active dispatcher worker run is required" in duplicate["error"]
         _assert_no_g2_material_delta(conn, duplicate_preimage, repo)
+    finally:
+        conn.close()
+
+
+def test_kanban_g2_handoff_omits_retry_budget_by_default(monkeypatch, tmp_path):
+    from tools.kanban_tools import _handle_g2_handoff
+
+    kb, conn = _setup_env(monkeypatch, tmp_path)
+    repo, binding = _git_repo(tmp_path)
+    _active_planner(conn, kb, monkeypatch, repo)
+    captured: dict[str, object] = {}
+
+    def fake_issue(conn, **kwargs):
+        captured.update(kwargs)
+        return {
+            "task_id": "child-1",
+            "parent_task_id": kwargs["parent_task_id"],
+            "status": "ready",
+            "assignee": "change-gate-xhigh",
+            "workspace_path": "/tmp/child-1",
+            "branch_name": "branch-1",
+            "evidence_attachment_id": 1,
+            "handoff_attachment_id": 2,
+            "evidence_sha256": "0" * 64,
+            "handoff_sha256": "1" * 64,
+            "parent_status": "done",
+            "parent_run_outcome": "g2_handoff",
+            "parent_terminal_event_id": 3,
+            "selected_rule": "selected-rule",
+            "route_key": "NORMAL",
+        }
+
+    monkeypatch.setattr(kb, "issue_change_gate_g2_handoff", fake_issue)
+    try:
+        result = json.loads(_handle_g2_handoff(_args(binding, repo)))
+        assert result["ok"] is True
+        assert "max_retries" not in captured
+    finally:
+        conn.close()
+
+
+def test_kanban_g2_handoff_forwards_retry_budget_and_does_not_retry_owner_error(
+    monkeypatch,
+    tmp_path,
+):
+    from tools.kanban_tools import _handle_g2_handoff
+
+    kb, conn = _setup_env(monkeypatch, tmp_path)
+    repo, binding = _git_repo(tmp_path)
+    parent_id = _active_planner(conn, kb, monkeypatch, repo)
+    calls: list[dict[str, object]] = []
+
+    def fake_issue(conn, **kwargs):
+        calls.append(kwargs)
+        raise RuntimeError("owner boom")
+
+    monkeypatch.setattr(kb, "issue_change_gate_g2_handoff", fake_issue)
+    try:
+        result = json.loads(_handle_g2_handoff(_args(binding, repo, max_retries=1)))
+        assert "error" in result
+        assert "owner boom" in result["error"]
+        assert len(calls) == 1
+        assert calls[0]["parent_task_id"] == parent_id
+        assert calls[0]["max_retries"] == 1
     finally:
         conn.close()
 
@@ -918,6 +992,9 @@ def test_kanban_g2_handoff_schema_and_runtime_timing_validation_agree():
     assert "not" not in schema
     assert schema["properties"]["evidence_ttl_seconds"]["maximum"] == 3600
     assert schema["properties"]["expires_at_epoch"]["type"] == "integer"
+    assert schema["properties"]["max_retries"]["type"] == "integer"
+    assert schema["properties"]["max_retries"]["minimum"] == 1
+    assert "max_retries" not in schema["required"]
     validator = jsonschema.Draft202012Validator(schema)
     base = {
         "title": "execute bounded source candidate",
@@ -938,6 +1015,7 @@ def test_kanban_g2_handoff_schema_and_runtime_timing_validation_agree():
 
     valid_relative = {**base, "evidence_ttl_seconds": 3600}
     assert list(validator.iter_errors(valid_relative)) == []
+    assert list(validator.iter_errors({**base, "max_retries": 1})) == []
     assert kb._resolve_g2_evidence_timing(
         expires_at_epoch=None,
         evidence_ttl_seconds=3600,
@@ -965,6 +1043,9 @@ def test_kanban_g2_handoff_schema_and_runtime_timing_validation_agree():
             expires_at_epoch=None,
             evidence_ttl_seconds=None,
         )
+
+    assert list(validator.iter_errors({**base, "max_retries": True}))
+    assert list(validator.iter_errors({**base, "max_retries": "1"}))
 
     too_large = {**base, "evidence_ttl_seconds": 3601}
     assert list(validator.iter_errors(too_large))

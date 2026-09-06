@@ -4,6 +4,7 @@ Shared between CLI (cli.py) and gateway (gateway/run.py) so both surfaces
 can invoke skills via /skill-name commands.
 """
 
+import hashlib
 import json
 import logging
 import os
@@ -24,6 +25,14 @@ logger = logging.getLogger(__name__)
 _skill_commands: Dict[str, Dict[str, Any]] = {}
 _skill_commands_platform: Optional[str] = None
 _skill_commands_home: Optional[str] = None
+_BUILTIN_PRELOAD_PREFIX = "hermes-builtin:"
+_BUILTIN_PRELOAD_SKILLS: dict[str, dict[str, Any]] = {
+    f"{_BUILTIN_PRELOAD_PREFIX}sdlc-review": {
+        "skill_name": "sdlc-review",
+        "relative_path": Path("skills") / "devops" / "sdlc-review" / "SKILL.md",
+        "source_hash": "ce90e8a3e145cce69c62880dc85921700110879f9290952d6cec28218503155f",
+    }
+}
 # Patterns for sanitizing skill names into clean hyphen-separated slugs.
 _SKILL_INVALID_CHARS = re.compile(r"[^a-z0-9-]")
 _SKILL_MULTI_HYPHEN = re.compile(r"-{2,}")
@@ -262,6 +271,189 @@ def _load_skill_payload(skill_identifier: str, task_id: str | None = None) -> tu
             skill_dir = None
 
     return loaded_skill, skill_dir, skill_name
+
+
+def validate_builtin_preload_skill(
+    identifier: str,
+    task_id: str | None = None,
+) -> tuple[tuple[dict[str, Any], Path | None, str] | None, dict[str, Any]]:
+    """Validate a reserved builtin preload skill without bumping usage."""
+    return _load_builtin_preload_skill(identifier, task_id=task_id)
+
+
+def _preload_source_event(
+    identifier: str,
+    *,
+    source_kind: str,
+    status: str,
+    **extra: Any,
+) -> dict[str, Any]:
+    event = {
+        "requested_identifier": identifier,
+        "source_id": identifier,
+        "source_kind": source_kind,
+        "status": status,
+    }
+    event.update(extra)
+    return event
+
+
+def _repo_root() -> Path:
+    return Path(__file__).resolve().parents[1]
+
+
+def _load_builtin_preload_skill(
+    identifier: str,
+    task_id: str | None = None,
+) -> tuple[tuple[dict[str, Any], Path | None, str] | None, dict[str, Any]]:
+    spec = _BUILTIN_PRELOAD_SKILLS.get(identifier)
+    if spec is None:
+        return None, _preload_source_event(
+            identifier,
+            source_kind="builtin",
+            status="missing",
+            reason="unsupported builtin identifier",
+        )
+
+    repo_root = _repo_root()
+    skill_md = repo_root / spec["relative_path"]
+    source_event = _preload_source_event(
+        identifier,
+        source_kind="builtin",
+        status="missing",
+        source_path=str(skill_md),
+        source_root=str(repo_root),
+        builtin_name=spec["skill_name"],
+    )
+
+    try:
+        from tools.path_security import validate_within_dir
+
+        path_error = validate_within_dir(skill_md, repo_root)
+        if path_error:
+            source_event.update(status="rejected", reason=path_error)
+            return None, source_event
+    except Exception as exc:
+        source_event.update(status="rejected", reason=f"path validation failed: {exc}")
+        return None, source_event
+
+    try:
+        cursor = repo_root
+        for part in spec["relative_path"].parts:
+            cursor = cursor / part
+            if cursor.is_symlink():
+                source_event.update(
+                    status="rejected",
+                    reason=f"symlinked builtin path component: {cursor}",
+                )
+                return None, source_event
+    except Exception as exc:
+        source_event.update(status="rejected", reason=f"symlink validation failed: {exc}")
+        return None, source_event
+
+    if not skill_md.is_file():
+        source_event.update(reason="builtin skill file is missing")
+        return None, source_event
+
+    try:
+        raw_bytes = skill_md.read_bytes()
+    except Exception as exc:
+        source_event.update(status="rejected", reason=f"failed to read builtin skill: {exc}")
+        return None, source_event
+
+    try:
+        from tools.skills_tool import _parse_frontmatter
+
+        raw_content = raw_bytes.decode("utf-8-sig", errors="replace")
+        frontmatter, _ = _parse_frontmatter(raw_content)
+    except Exception as exc:
+        source_event.update(status="rejected", reason=f"failed to parse frontmatter: {exc}")
+        return None, source_event
+
+    try:
+        from agent.skill_utils import skill_matches_platform
+
+        if not skill_matches_platform(frontmatter):
+            source_event.update(
+                status="rejected",
+                reason="builtin skill is not supported on this platform",
+            )
+            return None, source_event
+    except Exception as exc:
+        source_event.update(status="rejected", reason=f"platform validation failed: {exc}")
+        return None, source_event
+
+    try:
+        from agent.skill_utils import get_disabled_skill_names
+
+        disabled_names = get_disabled_skill_names()
+    except Exception as exc:
+        source_event.update(
+            status="rejected",
+            reason=f"failed to read disabled skill configuration: {exc}",
+        )
+        return None, source_event
+
+    skill_name = str(frontmatter.get("name") or "").strip()
+    if skill_name != spec["skill_name"]:
+        source_event.update(
+            status="rejected",
+            reason=(
+                f"frontmatter name {skill_name!r} does not match builtin "
+                f"{spec['skill_name']!r}"
+            ),
+            frontmatter_name=skill_name or None,
+        )
+        return None, source_event
+
+    if skill_name in disabled_names:
+        source_event.update(status="rejected", reason="builtin skill is disabled by config")
+        return None, source_event
+
+    actual_hash = hashlib.sha256(raw_bytes).hexdigest()
+    expected_hash = str(spec.get("source_hash") or "")
+    if actual_hash != expected_hash:
+        source_event.update(
+            status="rejected",
+            reason=(
+                "builtin skill content hash mismatch: "
+                f"expected {expected_hash}, got {actual_hash}"
+            ),
+            source_hash=f"sha256:{actual_hash}",
+            expected_source_hash=f"sha256:{expected_hash}",
+        )
+        return None, source_event
+
+    skill_dir = skill_md.parent
+    source_event.update(
+        status="loaded",
+        frontmatter_name=skill_name,
+        frontmatter_version=str(frontmatter.get("version") or "").strip() or None,
+        source_hash=f"sha256:{actual_hash}",
+        resolved_path=str(skill_md.resolve()),
+    )
+    loaded_skill = {
+        "success": True,
+        "name": skill_name,
+        "description": str(frontmatter.get("description") or ""),
+        "content": raw_content,
+        "raw_content": raw_content,
+        "path": str(skill_md.relative_to(repo_root)),
+        "skill_dir": str(skill_dir),
+        "tags": [],
+        "related_skills": [],
+        "linked_files": None,
+        "required_environment_variables": [],
+        "missing_required_environment_variables": [],
+        "required_commands": [],
+        "missing_required_commands": [],
+        "setup_needed": False,
+        "setup_skipped": False,
+        "setup_note": "",
+        "gateway_setup_hint": "",
+        "source_provenance": source_event,
+    }
+    return (loaded_skill, skill_dir, skill_name), source_event
 
 
 def _inject_skill_config(loaded_skill: dict[str, Any], parts: list[str]) -> None:
@@ -808,7 +1000,8 @@ def build_stacked_skill_invocation_message(
 def build_preloaded_skills_prompt(
     skill_identifiers: list[str],
     task_id: str | None = None,
-) -> tuple[str, list[str], list[str]]:
+    return_metadata: bool = False,
+) -> tuple[str, list[str], list[str]] | tuple[str, list[str], list[str], list[dict[str, Any]]]:
     """Load one or more skills for session-wide CLI/TUI preloading.
 
     Returns (prompt_text, loaded_skill_names, missing_identifiers).
@@ -823,6 +1016,7 @@ def build_preloaded_skills_prompt(
     prompt_parts: list[str] = []
     loaded_names: list[str] = []
     missing: list[str] = []
+    source_events: list[dict[str, Any]] = []
 
     try:
         from agent.skill_utils import get_disabled_skill_names
@@ -837,15 +1031,31 @@ def build_preloaded_skills_prompt(
             continue
         seen.add(identifier)
 
-        loaded = _load_skill_payload(identifier, task_id=task_id)
+        if identifier.startswith(_BUILTIN_PRELOAD_PREFIX):
+            loaded, source_event = validate_builtin_preload_skill(identifier, task_id=task_id)
+        else:
+            loaded = _load_skill_payload(identifier, task_id=task_id)
+            source_event = _preload_source_event(
+                identifier,
+                source_kind="ordinary",
+                status="missing",
+                source_path=None,
+            )
+
         if not loaded:
             missing.append(identifier)
+            source_events.append(source_event)
             continue
 
         loaded_skill, skill_dir, skill_name = loaded
 
         if skill_name in disabled_names or identifier in disabled_names:
+            source_event.update(
+                status="disabled",
+                reason="disabled by skills configuration",
+            )
             missing.append(identifier)
+            source_events.append(source_event)
             continue
 
         # Track active usage for Curator lifecycle management (#17782)
@@ -869,5 +1079,8 @@ def build_preloaded_skills_prompt(
             )
         )
         loaded_names.append(skill_name)
+        source_events.append(source_event)
 
+    if return_metadata:
+        return "\n\n".join(prompt_parts), loaded_names, missing, source_events
     return "\n\n".join(prompt_parts), loaded_names, missing

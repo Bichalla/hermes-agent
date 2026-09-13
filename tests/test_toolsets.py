@@ -337,7 +337,7 @@ class TestResolveToolsetMemo:
             f"got {get_toolset_calls['n']} calls"
         )
         assert (
-            "hermes-cli", True, registry_id, generation
+            "hermes-cli", True, registry_id, generation, registry.current_scope_key()
         ) in toolsets_mod._resolve_toolset_memo
 
     def test_generation_bump_invalidates_memo(self, monkeypatch):
@@ -373,3 +373,25 @@ class TestResolveToolsetMemo:
         assert first == second
         assert first  # non-empty sanity
 
+
+class TestProfileScopedToolsetMemo:
+    def test_profile_switch_keeps_overlay_membership_isolated(self, monkeypatch, tmp_path):
+        from hermes_constants import set_hermes_home_override, reset_hermes_home_override
+
+        reg = ToolRegistry()
+        monkeypatch.setattr(toolsets_mod, '_registry', lambda: reg)
+        monkeypatch.setattr(toolsets_mod, '_resolve_toolset_memo', {})
+        pm = str((tmp_path / 'pm').resolve())
+        worker = str((tmp_path / 'worker').resolve())
+        name = 'kanban_profile_fixture'
+        reg.register(name=name, toolset='kanban', schema=_make_schema(name),
+                     handler=_dummy_handler, scope=pm)
+        generation = reg._generation
+        for profile in (worker, pm, worker, pm):
+            token = set_hermes_home_override(profile)
+            try:
+                assert (name in resolve_toolset('kanban')) == (profile == pm)
+                assert name not in resolve_toolset('kanban', include_registry=False)
+            finally:
+                reset_hermes_home_override(token)
+        assert reg._generation == generation

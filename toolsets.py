@@ -258,9 +258,10 @@ def _registry_call(method: str, default):
         return default
 
 
-def _registry_generation() -> Tuple[int, int]:
+def _registry_generation() -> Tuple[int, int, Optional[str]]:
     reg = _registry()
-    return (id(reg), getattr(reg, "_generation", 0)) if reg is not None else (0, 0)
+    # Overlay membership changes with the profile even without a registry mutation.
+    return (id(reg), getattr(reg, "_generation", 0), reg.current_scope_key()) if reg is not None else (0, 0, None)
 
 
 def get_toolset(name: str, *, include_registry: bool = True) -> Optional[Dict[str, Any]]:

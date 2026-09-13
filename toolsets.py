@@ -328,7 +328,7 @@ def bundle_non_core_tools(toolset_name: str) -> Set[str]:
 
 # Memo keyed on (name, include_registry, id(registry), registry generation);
 # engages only at the public entry (visited is None).
-_resolve_toolset_memo: Dict[Tuple[str, bool, int, int], List[str]] = {}
+_resolve_toolset_memo: Dict[Tuple[str, bool, int, int, Optional[str]], List[str]] = {}
 
 
 def _plugin_platform_bundle(name: str) -> List[str]:

@@ -131,6 +131,7 @@ def _target_path(workspace: Path, target: str) -> Path:
     raw = Path(target)
     if raw.is_absolute() or any(part in ("", ".", "..") for part in raw.parts):
         raise SoftDeleteError("target must be a normal relative path")
+    _refuse_symlink_ancestors(workspace, raw)
     candidate = workspace.joinpath(raw)
     resolved_parent = candidate.parent.resolve(strict=True)
     if not _is_relative_to(resolved_parent, workspace):
@@ -138,6 +139,20 @@ def _target_path(workspace: Path, target: str) -> Path:
     if candidate.name == ".git" or ".git" in candidate.relative_to(workspace).parts:
         raise SoftDeleteError("refusing to soft-delete .git paths")
     return candidate
+
+
+def _refuse_symlink_ancestors(workspace: Path, raw: Path) -> None:
+    current = workspace
+    for part in raw.parts[:-1]:
+        current = current / part
+        try:
+            st = current.lstat()
+        except FileNotFoundError:
+            raise SoftDeleteError("target parent does not exist") from None
+        if stat.S_ISLNK(st.st_mode):
+            raise SoftDeleteError("refusing target with symlink ancestor")
+        if not stat.S_ISDIR(st.st_mode):
+            raise SoftDeleteError("target parent is not a directory")
 
 
 def _validate_target_tree(workspace: Path, target: Path) -> os.stat_result:

@@ -114,6 +114,14 @@ class SoftDeleteTests(unittest.TestCase):
             soft_delete(self.workspace, "dir", self.trash)
         self.assertTrue((self.workspace / "dir").exists())
 
+    def test_workspace_symlink_ancestor_is_refused(self):
+        (self.workspace / "real" / "nested").mkdir(parents=True)
+        (self.workspace / "real" / "nested" / "file.txt").write_text("x")
+        (self.workspace / "alias").symlink_to(self.workspace / "real")
+        with self.assertRaises(SoftDeleteError):
+            soft_delete(self.workspace, "alias/nested/file.txt", self.trash)
+        self.assertEqual((self.workspace / "real" / "nested" / "file.txt").read_text(), "x")
+
     def test_cross_device_rename_fails_without_copy_delete(self):
         target = self.workspace / "file.txt"
         target.write_text("x")

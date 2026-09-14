@@ -22,7 +22,7 @@ def load_config(path: Path) -> BridgeConfig:
     config = BridgeConfig(**json.loads(path.read_text()))
     if (not Path(config.db_path).is_absolute() or not Path(config.socket_path).is_absolute()
             or not config.owner_id.isdecimal() or not config.notifier_profile
-            or not config.worker_profile or not 0 < config.max_timeout <= 300):
+            or not config.worker_profiles or not 0 < config.max_timeout <= 300):
         raise ValueError("invalid bridge configuration")
     return config
 

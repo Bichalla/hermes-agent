@@ -14,6 +14,8 @@ import threading
 from .protocol import ProtocolError
 
 GUIDANCE = {
+    'task_scope_incomplete': 'The bounded task/PM history is incomplete. Restore a complete current scope before reviewing; this is not a request for a human to approve the command.',
+    'pm_history_unavailable': 'The configured PM history cannot be read. Restore the PM history source; comment author labels cannot substitute for verified handoffs.',
     'needs_evidence': 'PM could not establish effects from the bounded source evidence. Preserve the exact command and missing evidence; this is not a human denial or missing terminal capability.',
     'outside_task_scope': 'The command conflicts with this card scope. Follow the authorized scope; human approval of an unrelated operation is not a substitute.',
     'human_declined': 'The owner denied permanent deletion. Do not retry or use another route.',

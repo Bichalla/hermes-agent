@@ -20,11 +20,12 @@ def register(ctx) -> None:
     bridge_config = load_config(ROOT / ".local/config.json")
     from hermes_constants import get_hermes_home
     home = get_hermes_home()
+    identity = WorkerIdentity.from_env()
     if home.name == bridge_config.notifier_profile:
         from bridge.pm import bind_reviewer
         bind_reviewer(ctx.llm, home)
-        return
-    identity = WorkerIdentity.from_env()
+        if identity is None:
+            return  # Gateway reviewer; a Kanban work-pm worker also needs the transport.
     from bridge.execution import ExecutionBindings
     bindings = ExecutionBindings()
     if identity is not None:

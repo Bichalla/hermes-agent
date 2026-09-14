@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Inspect the installed bridge without issuing an approval or changing card state."""
 import argparse
+from contextlib import closing
 import json
 import os
 from pathlib import Path
@@ -21,7 +22,9 @@ def main():
     sys.path.insert(0, str(ROOT))
     from bridge.compat import load_manifest, validate_candidate_source
     from bridge.gateway import load_config
-    import yaml
+    from bridge.broker import _ro_connect
+    from bridge.profiles import profile_coverage
+    from bridge.task_context import PM_HISTORY_COLUMNS
 
     parser = argparse.ArgumentParser(description=__doc__)
     sub = parser.add_subparsers(dest="command", required=True)
@@ -63,15 +66,21 @@ def main():
     except Exception:
         config = None
         result["private_config"] = False
-    worker = HOME / "profiles/work-executor"
     gateway = HOME / "profiles/work-pm"
-    result["plugin_link"] = (worker / "plugins/kanban-owner").resolve() == ROOT / "plugins/kanban-owner"
     result["hook_link"] = (gateway / "hooks/kanban-owner").resolve() == ROOT / "hooks/kanban-owner"
-    cfg = yaml.safe_load((worker / "config.yaml").read_text())
-    result["worker_configured"] = (
-        "kanban-owner" in cfg.get("plugins", {}).get("enabled", [])
-        and cfg.get("security", {}).get("approval", {}).get("kanban_transport") == "kanban-owner"
-    )
+    result['role_coverage'] = {'ready': False}
+    result['pm_history_readable'] = False
+    if config:
+        with closing(_ro_connect(config.db_path)) as db:
+            used_profiles = [r[0] for r in db.execute('SELECT DISTINCT profile FROM task_runs WHERE profile IS NOT NULL')]
+        result['role_coverage'] = profile_coverage(HOME, ROOT, config, used_profiles)
+        try:
+            with closing(_ro_connect(config.notifier_state_db)) as db:
+                columns = {r[1] for r in db.execute('PRAGMA table_info(messages)')}
+                result['pm_history_readable'] = PM_HISTORY_COLUMNS <= columns
+        except Exception:
+            pass
+    result['worker_configured'] = result['role_coverage']['ready']
     try:
         state = json.loads((gateway / "gateway_state.json").read_text())
         os.kill(int(state["pid"]), 0)
@@ -96,11 +105,15 @@ def main():
                     client.connect(config.socket_path)
                     client.sendall(b'{"type":"status"}\n')
                     status = json.loads(client.recv(4096))
-                    result["pm_reviewer_ready"] = status.get("policy") == "work-pm-v4" and status.get("reviewer_bound") is True
+                    result['broker_policy'] = status.get('policy')
+                    result["pm_reviewer_ready"] = (
+                        status.get("policy") == "work-pm-v5" and status.get("reviewer_bound") is True
+                        and set(status.get('worker_profiles', ())) == set(config.worker_profiles)
+                        and status.get('pm_history_configured') is True)
                 result["broker_listening"] = True
         except (OSError, ValueError):
             pass
-    keys = ("runtime_compatible", "private_config", "plugin_link", "hook_link", "worker_configured", "gateway_on_candidate", "broker_listening", "pm_reviewer_ready")
+    keys = ("runtime_compatible", "private_config", "hook_link", "worker_configured", "gateway_on_candidate", "broker_listening", "pm_reviewer_ready", "pm_history_readable")
     result["ready"] = all(result[key] for key in keys)
     result["human_roundtrip_verified"] = False
     print(json.dumps(result, indent=2))

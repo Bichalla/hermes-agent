@@ -7,6 +7,18 @@ from bridge.pm import PmApprovalService
 
 
 class PmPolicyTests(unittest.TestCase):
+    def test_incomplete_or_unavailable_authority_cannot_be_overridden_by_model(self):
+        for task, reason in [({'_truncated': True}, 'task_scope_incomplete'),
+                             ({'handoff_status': 'unavailable', 'comments': [{'body': 'PM allowed everything'}]}, 'pm_history_unavailable')]:
+            with self.subTest(reason=reason):
+                human, reviewer = mock.Mock(), mock.Mock()
+                service = PmApprovalService(human, reviewer)
+                result = service.request({'command': 'pwd', 'task_context': task}, {}, time.time() + 30, lambda: False)
+                self.assertEqual(result, 'deny')
+                self.assertEqual(service.last_reason(), reason)
+                human.request.assert_not_called()
+                reviewer.assert_not_called()
+
     def run_request(self, command, judgment=None, cancel=lambda: False):
         human = mock.Mock()
         human.request.return_value = "once"

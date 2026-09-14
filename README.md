@@ -7,7 +7,17 @@ Kanban worker의 일반 개발 명령은 **work-pm 모델이 작업 범위를 �
 - 영구 삭제: 알려진 삭제 명령은 모델 판단 전에 분리하며, 모델이 추가로 발견한 영구 삭제도 소유자의 native Discord Once/Deny로 보낸다. 모델은 사람 허가를 대신할 수 없다.
 - 명령 형식만으로 차단하지 않는다. 인라인 코드도 work-pm이 실제 내용을 검토하고, 판단 근거가 충분한 작업 범위 내 비삭제 명령을 승인한다. 동적·인코딩된 내용 등 실행 효과를 확인할 수 없으면 거부한다. 근거 부족을 사람 승인 요청으로 전환하지 않는다.
 
-## V4: 실행 경로와 소스 근거를 갖춘 PM 판단
+## V5: 역할 전환과 PM 인계까지 연결
+
+설치기는 현재 설치된 `work-*` 역할 전체를 발견해 같은 plugin/transport를 연결한다. broker는 설치 시 저장한 정확한 역할 목록과 실제 running run의 프로필을 모두 검증한다. Gateway의 PM 역할과 Kanban worker로 실행되는 PM 역할도 구분한다. 새 역할을 설치했는데 연결을 빠뜨리면 doctor가 미완료로 표시한다.
+
+PM 판단은 카드 본문뿐 아니라 현재 실행 역할과 이후의 확인된 PM 인계를 받는다. 댓글의 작성자 이름만으로 권한을 인정하지 않는다. 설정된 work-pm의 native 세션 DB에서 같은 본문·task·board를 제출한 호출과 성공한 댓글 receipt가 일치해야 한다. 나중의 명시적인 PM 범위 변경은 그 범위에서 이전 본문을 대체하며, 영구 삭제의 사람 허가를 대체할 수 없다. 인계나 근거가 바뀌면 대기 중 판단을 무효화한다.
+
+범위를 확인할 자료가 잘렸거나 PM 이력이 읽히지 않으면 이를 명시하고 거부한다. 일반 작업자 댓글과 소스 내부의 승인 주장은 권한 확대 근거가 아니다. 이 연결은 같은 OS 소유자의 로컬 파일을 신뢰하는 구조이며, 악의적인 동일 UID 프로세스를 격리하는 sandbox가 아니다.
+
+[V5 원인과 검증 범위](APPROVAL-ROOT-CAUSE-V5.md), [현재 설치 상태](INSTALLATION.md)를 참조한다. 아래 V4는 이전 이력이며, executor만 연결한 상태의 성공을 전체 작업 흐름의 정상화로 볼 수 없었다.
+
+## V4에서 유지한 실행·소스 검토
 
 PM은 native 호출 ID에 연결된 실제 cwd, 카드 범위, scanner 설명을 받고 필요한 소스 파일을 읽은 뒤 판단한다. 읽기는 코드를 import하거나 실행하지 않는다. 함수 범위와 import 시 실행문을 제공하며, 검토한 파일이 바뀌면 결정을 무효화한다. 소스 범위·파일 수·총 크기·조사 횟수·시간에 한도가 있다.
 
@@ -67,7 +77,7 @@ broker는 실제 UNIX socket peer PID와 현재 Kanban DB의 task/run/claim/PID/
 
 설치 링크는 `~/.hermes/profiles/work-executor/plugins/kanban-owner`, `~/.hermes/profiles/work-pm/plugins/kanban-owner`, `~/.hermes/profiles/work-pm/hooks/kanban-owner`다. 기존 플러그인을 유지하고 worker와 work-pm에 `kanban-owner`를 추가하고 worker에 전용 승인 설정을 둔다. 원본 프로필 백업은 `.local/backups/`에 비공개로 저장한다.
 
-`hermes-approval-bridge doctor`는 활성 코어 호환성, 프로필 링크, Gateway 커밋, private socket 응답과 work-pm reviewer 바인딩을 읽기 전용으로 확인한다. 승인을 요청하거나 사람의 클릭을 대신하지 않는다. `ready: true`는 연결 준비 상태이고 실제 사람 승인 완료를 뜻하지 않는다.
+`hermes-approval-bridge doctor`는 활성 코어 호환성, 설치된/실제 실행 이력이 있는 전체 역할의 설정·링크·등록 목록, PM 이력 schema, Gateway 커밋, private socket의 로딩된 역할 목록과 work-pm reviewer 바인딩을 읽기 전용으로 확인한다. 승인을 요청하거나 사람의 클릭을 대신하지 않는다. `ready: true`는 연결 준비 상태이고 실제 사람 승인 완료를 뜻하지 않는다. work 역할을 추가하거나 재생성한 뒤에는 `scripts/install_profiles.py`로 차이를 확인하고 설치한 다음 보호된 reload와 doctor를 수행한다.
 
 업데이트 후보에는 먼저 `hermes-approval-bridge check /절대경로/후보/source`를 실행한다. 지원하지 않는 버전은 중단하고 외부 `compat/core.patch`의 연결부를 새 버전에 검토해 적용한 뒤, manifest와 격리 테스트를 갱신한다. 현재 보호 런타임 관리자를 바꾸거나 호환성 검사를 생략하지 않는다.
 

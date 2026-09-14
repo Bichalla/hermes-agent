@@ -9,6 +9,7 @@ import json
 import logging
 import os
 from pathlib import Path
+import re
 import select
 import socket
 import sqlite3
@@ -34,9 +35,12 @@ class BridgeConfig:
     socket_path: str
     owner_id: str
     notifier_profile: str
-    worker_profile: str
+    worker_profile: str = ""  # Read compatibility for pre-v5 installations.
     max_timeout: int = 300
     max_pending: int = 32
+    worker_profiles: tuple[str, ...] = ()
+    notifier_state_db: str = ""
+    board_name: str = "default"
 
     def __post_init__(self) -> None:
         if not 0 < int(self.max_timeout) <= 300:
@@ -45,6 +49,20 @@ class BridgeConfig:
             raise ValueError("max_pending out of range")
         if not str(self.owner_id).isdecimal():
             raise ValueError("owner_id must be numeric")
+        if not isinstance(self.worker_profiles, (tuple, list)):
+            raise ValueError("worker_profiles must be a list of exact profile names")
+        profiles = tuple(self.worker_profiles) or ((self.worker_profile,) if self.worker_profile else ())
+        if (not profiles or len(set(profiles)) != len(profiles)
+                or any(not isinstance(p, str) or not re.fullmatch(r'[a-zA-Z0-9][a-zA-Z0-9_-]*', p) for p in profiles)
+                or (self.worker_profile and self.worker_profile not in profiles)):
+            raise ValueError("invalid worker profiles")
+        object.__setattr__(self, 'worker_profiles', profiles)
+        if not isinstance(self.board_name, str) or not re.fullmatch(r'[a-zA-Z0-9][a-zA-Z0-9_-]*', self.board_name):
+            raise ValueError('invalid board name')
+        if self.notifier_state_db and (not Path(self.notifier_state_db).is_absolute()
+                or Path(self.notifier_state_db).name != 'state.db'
+                or Path(self.notifier_state_db).parent.name != self.notifier_profile):
+            raise ValueError("PM history must belong to the configured notifier profile")
 
 
 logger = logging.getLogger(__name__)
@@ -53,6 +71,7 @@ logger = logging.getLogger(__name__)
 class ApprovalService(Protocol):
     def request(self, data: dict, route: dict, deadline: float, cancel) -> str:
         """Return 'once' or 'deny' after delegated review or explicit human permission."""
+        ...
 
 
 class Broker:
@@ -161,7 +180,9 @@ class Broker:
                 raw = _read_line(conn)
                 payload = decode_line(raw)
                 if payload == {"type": "status"}:
-                    status = getattr(self.approval_service, "status", lambda: {"policy": "human-only"})()
+                    status: dict = getattr(self.approval_service, "status", lambda: {"policy": "human-only"})()
+                    status['worker_profiles'] = list(self.config.worker_profiles)
+                    status['pm_history_configured'] = bool(self.config.notifier_state_db)
                     conn.sendall(encode_line(status))
                     return
                 request = ApprovalBridgeRequest.from_dict(payload)
@@ -271,24 +292,8 @@ def _ro_connect(path: str) -> sqlite3.Connection:
 
 
 def read_task_context(config: BridgeConfig, task_id: str) -> dict:
-    """Only the current task's bounded redacted text, never the whole board."""
-    from agent.redact import redact_sensitive_text
-    db = _ro_connect(config.db_path)
-    try:
-        columns = {row[1] for row in db.execute("PRAGMA table_info(tasks)")}
-        selected = [name for name in ("title", "body", "description", "workspace_path") if name in columns]
-        if not selected:
-            return {}
-        row = db.execute("SELECT " + ",".join(selected) + " FROM tasks WHERE id=?", (task_id,)).fetchone()
-        if not row:
-            return {}
-        raw = {key: str(row[key] or '') for key in selected}
-        result = {key: redact_sensitive_text(value[:32000], force=True) for key, value in raw.items()}
-        result['_revision'] = hashlib.sha256(json.dumps(raw, sort_keys=True).encode()).hexdigest()
-        result['_truncated'] = any(len(value) > 32000 for value in raw.values())
-        return result
-    finally:
-        db.close()
+    from .task_context import read_context
+    return read_context(config, task_id)
 
 
 def validate_current_request(config: BridgeConfig, request: ApprovalBridgeRequest, now: float | None = None) -> dict:
@@ -300,7 +305,7 @@ def validate_current_request(config: BridgeConfig, request: ApprovalBridgeReques
             raise ProtocolError("expired request")
         if request.db_path != os.path.realpath(config.db_path):
             raise ProtocolError("wrong db")
-        if request.profile != config.worker_profile:
+        if request.profile not in config.worker_profiles:
             raise ProtocolError("wrong worker profile")
         row = db.execute(
             """
@@ -329,7 +334,7 @@ def validate_current_request(config: BridgeConfig, request: ApprovalBridgeReques
             raise ProtocolError("task not running")
         if row["run_status"] != "running":
             raise ProtocolError("run not running")
-        if row["run_profile"] != config.worker_profile or row["run_profile"] != request.profile:
+        if row["run_profile"] != request.profile:
             raise ProtocolError("wrong worker profile")
         if row["run_claim_lock"] != request.claim_lock or row["task_claim_lock"] != request.claim_lock:
             raise ProtocolError("claim mismatch")
@@ -418,7 +423,7 @@ def _peer_pid(conn: socket.socket) -> int:
     if hasattr(socket, "SO_PEERCRED"):
         import struct
 
-        creds = conn.getsockopt(socket.SOL_SOCKET, socket.SO_PEERCRED, struct.calcsize("3i"))
+        creds = conn.getsockopt(socket.SOL_SOCKET, getattr(socket, 'SO_PEERCRED'), struct.calcsize("3i"))
         pid, uid, _gid = struct.unpack("3i", creds)
         if int(uid) != os.getuid():
             raise ProtocolError("peer uid mismatch")

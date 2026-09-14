@@ -1,5 +1,18 @@
 # Installation status — 2026-09-14
 
+## V5: 전체 work 역할과 확인된 PM 인계
+
+**V5 운영 활성화 완료.** 설치된 9개 work 역할에 plugin `0.2.0`과 Kanban 전용 transport를 연결했다. 기존 보호 관리자의 정상 `restart`가 `activated`를 반환했고 default 및 work-pm Gateway가 전환됐다. 활성 코어는 `01896472311e6111284b8a8063e2a293f8a6af73` 그대로다.
+
+- 운영 doctor: `broker_policy=work-pm-v5`, 9개 역할의 enrollment/plugin/transport 모두 true, 누락 역할 없음. `pm_history_readable`, `pm_reviewer_ready`, `gateway_on_candidate`, 최종 `ready` 모두 true.
+- 설치된 각 역할을 별도 프로세스의 native `PluginManager.discover_and_load()`로 검사했다. 9개 모두 plugin `0.2.0`, 오류 없음, approval transport와 execution middleware 등록을 확인했다. 이 등록 검사는 명령을 실행하거나 실 운영 카드에 실행권을 만들지 않는다.
+- 격리 bridge 테스트 **123개 통과**. 실제 native terminal을 통한 9개 역할 전환 fixture와 별도의 실제 PM 모델 판단 5건을 구분해 검증했다. run561 원래 무결성 명령은 `pm_approved`; 허용된 제한 Oracle 조회도 `pm_approved`. run560 원래 전체 조회와 원격 쓰기 반례는 구체적 범위 위반으로 거부됐다. 기록된 업무 명령을 실제 실행하지 않았다.
+- 설정 백업은 `.local/backups/`의 비공개 파일로 보존했다. 변경은 plugin 등록, Kanban transport 선택, private bridge 역할 목록/PM 이력 경로이며 모델·인증·일반 single-query deny는 유지했다.
+- 활성화 전후 세 카드 `t_c7ee8515`, `t_d78243e1`, `t_ed941720`의 status/assignee/current_run_id/worker_pid/claim 해시가 동일했다. 세 카드는 triage이며 running run은 0이었다. 동일 조건 재시도나 새 카드 생성은 하지 않았다.
+- `hermes-runtime-update status`: runtime integrity verified, pending transition 없음. 실제 사람 Once 왕복은 검증하지 않았으므로 `human_roundtrip_verified=false`를 유지한다.
+
+V4에서 executor의 성공을 전체 역할 연결의 성공으로 본 부분과 SSH 범위 판단을 정정한다. 원인·책임·현재 한계는 [V5 보고서](APPROVAL-ROOT-CAUSE-V5.md)에 기록했다. 아래 V4 이하 내용은 당시 이력이며 현재 상태는 이 절을 따른다.
+
 ## V4: 실행 정보·소스 조사·거절 사유 연결
 
 **V4 운영 활성화 완료.** running 카드가 없음을 확인한 뒤 기존 보호 관리자의 정상 restart가 `status: activated`를 반환했다. default와 work-pm Gateway가 모두 전환됐다.
@@ -57,8 +70,8 @@ V2는 코어의 `tools/approval.py` 한 파일을 추가 변경하여, 선택된
 
 ## 설치된 외부 연결
 
-- work-executor의 `plugins/kanban-owner`: worker transport, soft-delete/restore 도구, patch 삭제 훅.
-- work-pm의 `plugins/kanban-owner`: 현재 work-pm 모델의 native `ctx.llm` 바인딩.
+- 설치된 9개 work 역할의 `plugins/kanban-owner`: worker transport, soft-delete/restore 도구, patch 삭제 훅. `scripts/install_profiles.py`가 현재 설치된 work 역할을 공통 경로로 연결한다.
+- work-pm의 `plugins/kanban-owner`: Gateway에서는 현재 work-pm 모델의 native `ctx.llm` 바인딩, Kanban worker에서는 transport도 등록한다.
 - work-pm의 `hooks/kanban-owner`: PM 판단과 사람 영구 삭제 승인 경로를 조합한 broker.
 - private 설정 `.local/config.json`, socket `.local/run/owner.sock`, worker trash `.local/trash`는 Git에 포함하지 않는다.
 - 원본 프로필 설정은 `.local/backups/`에 비공개 백업했다. 기존 플러그인, 모델, 인증 설정은 유지한다.

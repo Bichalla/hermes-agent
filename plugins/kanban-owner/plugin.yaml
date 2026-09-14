@@ -1,5 +1,5 @@
 name: kanban-owner
-version: 0.1.0
-description: One-command owner approval transport for verified Hermes Kanban workers.
+version: 0.2.0
+description: Delegated PM approval across Kanban work roles, with human permission for hard-delete.
 kind: standalone
 provides_hooks: []

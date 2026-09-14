@@ -152,7 +152,12 @@ class Broker:
                 conn.settimeout(1.0)
                 peer_pid = _peer_pid(conn)
                 raw = _read_line(conn)
-                request = ApprovalBridgeRequest.from_dict(decode_line(raw))
+                payload = decode_line(raw)
+                if payload == {"type": "status"}:
+                    status = getattr(self.approval_service, "status", lambda: {"policy": "human-only"})()
+                    conn.sendall(encode_line(status))
+                    return
+                request = ApprovalBridgeRequest.from_dict(payload)
                 self._serve_request(conn, request, peer_pid)
         except Exception:
             try:
@@ -209,6 +214,7 @@ class Broker:
         choice = "deny"
         if not cancel():
             native_data = request_payload_for_native(request)
+            native_data["task_context"] = read_task_context(self.config, request.task_id)
             choice = self.approval_service.request(native_data, route, deadline, cancel)
         if choice not in ("once", "deny"):
             choice = "deny"
@@ -243,6 +249,21 @@ def _ro_connect(path: str) -> sqlite3.Connection:
     conn = sqlite3.connect(uri, uri=True, timeout=1)
     conn.row_factory = sqlite3.Row
     return conn
+
+
+def read_task_context(config: BridgeConfig, task_id: str) -> dict:
+    """Only the current task's bounded redacted text, never the whole board."""
+    from agent.redact import redact_sensitive_text
+    db = _ro_connect(config.db_path)
+    try:
+        columns = {row[1] for row in db.execute("PRAGMA table_info(tasks)")}
+        selected = [name for name in ("title", "body", "description", "workspace_path") if name in columns]
+        if not selected:
+            return {}
+        row = db.execute("SELECT " + ",".join(selected) + " FROM tasks WHERE id=?", (task_id,)).fetchone()
+        return {key: redact_sensitive_text(str(row[key] or "")[:4000], force=True) for key in selected} if row else {}
+    finally:
+        db.close()
 
 
 def validate_current_request(config: BridgeConfig, request: ApprovalBridgeRequest, now: float | None = None) -> dict:

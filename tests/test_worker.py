@@ -176,6 +176,15 @@ class WorkerTransportTests(unittest.TestCase):
                 self.name = name
                 self.present = present
 
+            def register_tool(self, **_kwargs):
+                pass
+
+            def register_hook(self, *_args):
+                pass
+
+            def register_system_prompt_section(self, *_args):
+                pass
+
         env = {
             "HERMES_KANBAN_TASK": "t_fixture",
             "HERMES_KANBAN_RUN_ID": "17",

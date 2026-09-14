@@ -17,8 +17,14 @@ def register(ctx) -> None:
     from bridge.runtime import require_compatible_runtime
     require_compatible_runtime()
 
-    identity = WorkerIdentity.from_env()
     bridge_config = load_config(ROOT / ".local/config.json")
+    from hermes_constants import get_hermes_home
+    home = get_hermes_home()
+    if home.name == bridge_config.notifier_profile:
+        from bridge.pm import bind_reviewer
+        bind_reviewer(ctx.llm, home)
+        return
+    identity = WorkerIdentity.from_env()
     socket_path = bridge_config.socket_path
     timeout_seconds = float(bridge_config.max_timeout)
 
@@ -29,3 +35,5 @@ def register(ctx) -> None:
         )
 
     ctx.register_approval_transport("kanban-owner", present)
+    from bridge.worker_tools import register_tools
+    register_tools(ctx, identity, bridge_config, ROOT)

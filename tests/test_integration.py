@@ -23,6 +23,7 @@ import unittest
 from unittest import mock
 
 from bridge.broker import BridgeConfig, Broker
+from bridge.pm import PmApprovalService
 from gateway.config import Platform
 from gateway.kanban_approval import KanbanApprovalService
 from hermes_cli.approval_transport import RegisteredApprovalTransport
@@ -68,10 +69,22 @@ class Ctx:
     def __init__(self):
         self.present = None
         self.name = None
+        self.tools = {}
+        self.hooks = {}
+        self.sections = {}
 
     def register_approval_transport(self, name, present):
         self.name = name
         self.present = present
+
+    def register_tool(self, name, **kwargs):
+        self.tools[name] = kwargs
+
+    def register_hook(self, name, handler):
+        self.hooks[name] = handler
+
+    def register_system_prompt_section(self, name, content):
+        self.sections[name] = content
 
 
 class IntegrationTests(unittest.TestCase):
@@ -228,12 +241,14 @@ class IntegrationTests(unittest.TestCase):
             "HERMES_PROFILE": WORKER_PROFILE,
         }
 
-    def _run_guard(self, adapter: AdapterFixture):
+    def _run_guard(self, adapter: AdapterFixture, pm_review=None, command="docker restart app"):
         service = KanbanApprovalService(SimpleNamespace(
             _gateway_loop=self.loop,
             _running=True,
             adapters={Platform.DISCORD: adapter},
         ))
+        if pm_review is not None:
+            service = PmApprovalService(service, pm_review)
         broker = Broker(
             BridgeConfig(
                 db_path=str(self.db_path),
@@ -256,7 +271,7 @@ class IntegrationTests(unittest.TestCase):
                     profile_home=str(self.hermes_home.resolve()),
                 ) if name == "kanban-owner" else None)
                 with mock.patch("tools.approval_prompt.get_plugin_manager", return_value=manager):
-                    result = approval.check_all_command_guards("docker restart app", "local")
+                    result = approval.check_all_command_guards(command, "local")
                     self.assertEqual(os.environ["HERMES_SINGLE_QUERY_SESSION"], "1")
                     return result
         finally:
@@ -277,7 +292,23 @@ class IntegrationTests(unittest.TestCase):
         adapter = AdapterFixture(OWNER_ID, choice="deny")
         result = self._run_guard(adapter)
         self.assertFalse(result["approved"])
-        self.assertIn("denied", result["message"].lower())
+        self.assertIn("did not authorize", result["message"].lower())
+
+    def test_pm_auto_approval_never_sends_a_human_prompt(self):
+        adapter = AdapterFixture(OWNER_ID, choice=None)
+        review = mock.Mock(return_value={"decision": "approve", "effect": "non_delete", "within_task": True})
+        result = self._run_guard(adapter, pm_review=review)
+        self.assertTrue(result["approved"])
+        review.assert_called_once()
+        self.assertEqual(adapter.calls, [])
+
+    def test_hard_delete_uses_native_human_even_if_pm_would_approve(self):
+        adapter = AdapterFixture(OWNER_ID, choice="deny")
+        review = mock.Mock(return_value={"decision": "approve", "effect": "non_delete", "within_task": True})
+        result = self._run_guard(adapter, pm_review=review, command="rm old.txt")
+        self.assertFalse(result["approved"])
+        review.assert_not_called()
+        self.assertEqual(len(adapter.calls), 1)
 
     def test_reclaimed_run_during_native_prompt_denies_before_worker_authorizes(self):
         def reclaim():

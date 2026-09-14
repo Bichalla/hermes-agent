@@ -28,10 +28,26 @@ def main():
     sub.add_parser("doctor")
     check = sub.add_parser("check", help="refuse an incompatible candidate before an update")
     check.add_argument("source", type=Path)
+    delete = sub.add_parser("soft-delete", help="move a workspace path to private reversible trash")
+    delete.add_argument("workspace", type=Path)
+    delete.add_argument("target")
+    delete.add_argument("--trash-root", type=Path, default=ROOT / ".local/soft-trash")
+    restore_cmd = sub.add_parser("restore", help="restore a soft-delete receipt")
+    restore_cmd.add_argument("workspace", type=Path)
+    restore_cmd.add_argument("receipt_id")
+    restore_cmd.add_argument("--trash-root", type=Path, default=ROOT / ".local/soft-trash")
     args = parser.parse_args()
     manifest = load_manifest(ROOT / "compat/manifest.json")
     if args.command == "check":
         print(json.dumps(validate_candidate_source(args.source, manifest).as_dict(), indent=2))
+        return 0
+    if args.command == "soft-delete":
+        from bridge.soft_delete import soft_delete
+        print(json.dumps(soft_delete(args.workspace, args.target, args.trash_root), indent=2))
+        return 0
+    if args.command == "restore":
+        from bridge.soft_delete import restore
+        print(json.dumps(restore(args.workspace, args.receipt_id, args.trash_root), indent=2))
         return 0
 
     result = {}
@@ -66,6 +82,7 @@ def main():
     except (OSError, ValueError, KeyError):
         result["gateway_on_candidate"] = False
     result["broker_listening"] = False
+    result["pm_reviewer_ready"] = False
     if config:
         try:
             path = Path(config.socket_path)
@@ -77,10 +94,13 @@ def main():
                 with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as client:
                     client.settimeout(0.5)
                     client.connect(config.socket_path)
+                    client.sendall(b'{"type":"status"}\n')
+                    status = json.loads(client.recv(4096))
+                    result["pm_reviewer_ready"] = status.get("policy") == "work-pm-v2" and status.get("reviewer_bound") is True
                 result["broker_listening"] = True
-        except OSError:
+        except (OSError, ValueError):
             pass
-    keys = ("runtime_compatible", "private_config", "plugin_link", "hook_link", "worker_configured", "gateway_on_candidate", "broker_listening")
+    keys = ("runtime_compatible", "private_config", "plugin_link", "hook_link", "worker_configured", "gateway_on_candidate", "broker_listening", "pm_reviewer_ready")
     result["ready"] = all(result[key] for key in keys)
     result["human_roundtrip_verified"] = False
     print(json.dumps(result, indent=2))

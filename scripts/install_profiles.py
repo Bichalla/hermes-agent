@@ -30,7 +30,20 @@ def main():
     config_file = worker / "config.yaml"
     raw = config_file.read_bytes()
     config = yaml.safe_load(raw)
-    gateway_config = yaml.safe_load((gateway / "config.yaml").read_text())
+    gateway_file = gateway / "config.yaml"
+    gateway_raw = gateway_file.read_bytes()
+    gateway_config = yaml.safe_load(gateway_raw)
+    gateway_text = gateway_raw.decode()
+    if "kanban-owner" not in gateway_config.get("plugins", {}).get("enabled", []):
+        anchor = "    - pm-board-tools\n"
+        if gateway_text.count(anchor) != 1:
+            raise RuntimeError("gateway plugin configuration changed; review required")
+        gateway_text = gateway_text.replace(anchor, anchor + "    - kanban-owner\n", 1)
+    gateway_expected = yaml.safe_load(gateway_raw)
+    if "kanban-owner" not in gateway_expected["plugins"]["enabled"]:
+        gateway_expected["plugins"]["enabled"].append("kanban-owner")
+    if yaml.safe_load(gateway_text) != gateway_expected:
+        raise RuntimeError("gateway changes exceed reviewer plugin setting")
     discord = gateway_config.get("discord", {})
     owners = discord.get("allow_from", [])
     if (len(owners) != 1 or not str(owners[0]).isdecimal()
@@ -58,6 +71,7 @@ def main():
     links = {
         worker / "plugins/kanban-owner": ROOT / "plugins/kanban-owner",
         gateway / "hooks/kanban-owner": ROOT / "hooks/kanban-owner",
+        gateway / "plugins/kanban-owner": ROOT / "plugins/kanban-owner",
     }
     for target, source in links.items():
         if target.exists() or target.is_symlink():
@@ -80,7 +94,7 @@ def main():
         "mode": "apply" if args.apply else "stage", "worker_profile": str(worker),
         "gateway_profile": str(gateway), "profile_original_sha256": hashlib.sha256(raw).hexdigest(),
         "profile_staged_sha256": hashlib.sha256(text.encode()).hexdigest(),
-        "settings": ["plugins.enabled += kanban-owner", "security.approval.kanban_transport = kanban-owner"],
+        "settings": ["worker and work-pm plugins.enabled += kanban-owner", "security.approval.kanban_transport = kanban-owner"],
         "links": {str(k): str(v) for k, v in links.items()}, "owner_pinned": True,
     }
     if args.apply:
@@ -95,6 +109,14 @@ def main():
             private_write(tmp, text.encode())
             os.chmod(tmp, stat.S_IMODE(config_file.stat().st_mode))
             os.replace(tmp, config_file)
+        if gateway_raw != gateway_text.encode():
+            backup = ROOT / ".local/backups" / ("work-pm-" + hashlib.sha256(gateway_raw).hexdigest()[:12] + ".yaml")
+            if not backup.exists():
+                private_write(backup, gateway_raw)
+            tmp = gateway_file.with_name(".config.kanban-owner.tmp")
+            private_write(tmp, gateway_text.encode())
+            os.chmod(tmp, stat.S_IMODE(gateway_file.stat().st_mode))
+            os.replace(tmp, gateway_file)
         for target, source in links.items():
             if not target.is_symlink():
                 target.parent.mkdir(parents=True, exist_ok=True)

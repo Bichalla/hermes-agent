@@ -28,7 +28,7 @@ def _dangerous(command):
 
 class ApprovalSeamTests(unittest.TestCase):
     def setUp(self):
-        self.tmp = tempfile.TemporaryDirectory()
+        self.tmp = tempfile.TemporaryDirectory(ignore_cleanup_errors=True)
         self.home = Path(self.tmp.name)
         self._write_config(
             "security:\n"
@@ -69,6 +69,26 @@ class ApprovalSeamTests(unittest.TestCase):
         with mock.patch("tools.approval._present_with_kanban_owner_transport", side_effect=present) as transport:
             result = approval.check_all_command_guards("docker restart app", "local")
         self.assertTrue(result["approved"])
+        transport.assert_called_once()
+
+    def test_unflagged_command_still_reaches_pm_policy(self):
+        with mock.patch("tools.approval.detect_dangerous_command", return_value=(False, "", "")):
+            with mock.patch("tools.approval._present_with_kanban_owner_transport", return_value={
+                "selected": True, "name": "kanban-owner", "choice": "deny", "failure": None,
+            }) as transport:
+                result = approval.check_all_command_guards("custom-delete-tool target", "local")
+        self.assertFalse(result["approved"])
+        transport.assert_called_once()
+
+    def test_yolo_off_allowlist_and_container_do_not_bypass_kanban_policy(self):
+        with mock.patch("tools.approval._yolo_active", return_value=True), mock.patch(
+            "tools.approval._command_matches_permanent_allowlist", return_value=True
+        ), mock.patch("tools.approval.approval_context._get_approval_mode", return_value="off"):
+            with mock.patch("tools.approval._present_with_kanban_owner_transport", return_value={
+                "selected": True, "name": "kanban-owner", "choice": "deny", "failure": None,
+            }) as transport:
+                result = approval.check_all_command_guards("rm temp.txt", "docker")
+        self.assertFalse(result["approved"])
         transport.assert_called_once()
 
     def test_transport_deny_or_failure_blocks(self):

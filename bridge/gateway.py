@@ -9,6 +9,7 @@ import stat
 import threading
 
 from .broker import BridgeConfig, Broker
+from .pm import PmApprovalService
 
 _broker = None
 _lock = threading.Lock()
@@ -46,7 +47,7 @@ def start(service, config_path: Path) -> None:
         old, _broker = _broker, None
         if old is not None:
             old.close()
-        new = Broker(config, service)
+        new = Broker(config, PmApprovalService(service))
         try:
             new.start()
         except Exception:

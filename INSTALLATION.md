@@ -12,6 +12,14 @@
 
 V2는 코어의 `tools/approval.py` 한 파일을 추가 변경하여, 선택된 Kanban worker의 모든 terminal 명령을 위임 정책으로 보낸다. 기존 승인 off/yolo/permanent grant나 container 분기가 이 정책보다 앞서지 않는다. Hermes의 기존 hardline/user deny는 유지한다. V1부터의 전체 연결부는 세 파일이며 `compat/core.patch`는 V1 이전 `e96bfd0`부터의 전체 패치를 보관한다. manifest의 후보 준비 기준은 V1 활성 코어 `05e4bf9`이다.
 
+## 현재 운영 상태
+
+**V2 구현·테스트·Git push는 완료했지만 운영 활성화는 미완료다.** 기존 관리자의 전환을 시도했으나 실행 중 작업이 있어 drain timeout으로 종료됐다. 60초 대기 뒤 300초로 추가 대기했으며, 마지막에 실행 542 (`t_c7ee8515`)와 543 (`t_a68be24d`)가 남아 있었다. 두 프로세스의 생존도 읽기 전용으로 확인했다. 중간 실행 545는 자연 종료됐다.
+
+활성 코어는 여전히 `05e4bf9`이다. V2 프로필 연결은 설치됐지만 V2 manifest는 `0189647`만 허용하므로 현재 `doctor`는 `ready: false`다. 이는 새 정책의 운영 동작을 확인한 상태가 아니며, 승인 호환성 검사를 완화하지 않았다. V1의 기존 준비 상태가 그대로 유지된다고 주장하지 않는다.
+
+기존 runtime-protection 전환 잠금이나 drain을 생략하지 않았고 실행/카드 상태를 강제로 변경하지 않았다. 남은 단계는 작업이 자연 종료된 뒤 이미 준비된 위 V2 receipt를 기존 `hermes-runtime-update activate`로 활성화하고 `doctor`의 runtime/Gateway/reviewer 항목을 다시 확인하는 것이다. 자동 재시도 작업은 등록하지 않았다.
+
 ## 설치된 외부 연결
 
 - work-executor의 `plugins/kanban-owner`: worker transport, soft-delete/restore 도구, patch 삭제 훅.

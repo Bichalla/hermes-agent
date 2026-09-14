@@ -1122,7 +1122,7 @@ def _kanban_worker_bridge_decision(command: str) -> dict | None:
     if blocked is not None:
         return blocked
     if not warnings:
-        return _approved()
+        warnings = [("work-pm:command-review", "Work-pm task scope and deletion policy review", False)]
 
     combined_desc = "; ".join(desc for _, desc, _ in warnings)
     primary_key = warnings[0][0]
@@ -1146,8 +1146,9 @@ def _kanban_worker_bridge_decision(command: str) -> dict | None:
         _reset_denials(session_key)
         return _approved()
     return _blocked(
-        "BLOCKED: User denied this Kanban worker command through the owner approval transport. "
-        "The user has NOT consented to this action. Do NOT retry or attempt the same outcome through another route.",
+        "BLOCKED: Kanban approval policy did not authorize this command. "
+        "For recoverable file removal use kanban_soft_delete. For opaque scripts provide a bounded, "
+        "inspectable operation. Hard-delete requires explicit owner permission; do not disguise it or retry another route.",
         pattern_key=primary_key, description=combined_desc,
     )
 
@@ -1159,6 +1160,17 @@ def check_all_command_guards(command: str, env_type: str,
     dangerous-command findings are presented as ONE combined approval request, so a gateway
     force=True replay cannot bypass one check when only the other was shown to the user.
     ``has_host_access``: a Docker sandbox with bind-mounted host paths takes the normal flow."""
+    # An explicitly selected Kanban policy is above broad automatic grants.
+    # PM authority never inherits yolo/permanent grants for hard-delete.
+    if _kanban_worker_identity() is not None and _kanban_worker_transport_selected():
+        blocked = _floor_block(command, sudo_guard=True)
+        if blocked is not None:
+            return blocked
+        return _kanban_worker_bridge_decision(command) or _blocked(
+            "BLOCKED: Kanban approval policy changed during command review.",
+            pattern_key="work-pm:policy-unavailable", description="Kanban policy unavailable",
+        )
+
     if _should_skip_container_guards(env_type, has_host_access=has_host_access):
         return _user_deny_block(command) or _approved()
 
@@ -1176,9 +1188,6 @@ def check_all_command_guards(command: str, env_type: str,
     # Outside CLI/gateway/ask flows we never block on approvals: each
     # unattended context applies its configured deny/approve mode, else allow.
     if not is_cli and not is_gateway and not is_ask:
-        bridged = _kanban_worker_bridge_decision(command)
-        if bridged is not None:
-            return bridged
         for ctx in _unattended_contexts():
             result = _unattended_deny(command, ctx)
             if result is not None:

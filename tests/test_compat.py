@@ -87,7 +87,7 @@ class CompatTests(unittest.TestCase):
         with self.assertRaisesRegex(CompatError, "scanner-sensitive"):
             validate_candidate_source(self.repo, self.manifest)
 
-    def test_script_dry_run_outputs_json_for_real_manifest(self):
+    def test_real_manifest_validates_committed_source_independent_of_deployment(self):
         source = ROOT / ".work/hermes-source"
         if not source.exists():
             self.skipTest("local Hermes source fixture is absent")
@@ -97,16 +97,10 @@ class CompatTests(unittest.TestCase):
         ).strip()
         if dirty:
             self.skipTest("local Hermes source overlay is not committed yet")
-        result = subprocess.run(
-            [
-                "python3", str(ROOT / "scripts/prepare_candidate.py"), "--source", str(source),
-                "--runtime-protection", "/Users/honbul/.hermes/ops/runtime-protection",
-                "--active-config", "/Users/honbul/.hermes/ops/runtime-protection/runtime-protection.json",
-            ],
-            cwd=ROOT, check=False, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
-        )
-        self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertEqual(json.loads(result.stdout)["status"], "compatible")
+        # The preparation manifest records the pre-upgrade source. Activation must
+        # not turn a source-integrity test into a dependency on the live host.
+        report = validate_candidate_source(source, load_manifest(ROOT / "compat/manifest.json"))
+        self.assertEqual(report.as_dict()["status"], "compatible")
 
     def _manifest(self):
         return {

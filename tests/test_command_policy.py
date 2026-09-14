@@ -74,7 +74,7 @@ class CommandPolicyTests(unittest.TestCase):
             with self.subTest(command=command):
                 self.assert_effect(command, HARD_DELETE)
 
-    def test_opaque_payloads_are_not_delegated_to_pm(self):
+    def test_opaque_payloads_require_content_inspection(self):
         for command in [
             "bash -c 'pytest tests'",
             "python scripts/build.py",

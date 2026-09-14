@@ -10,7 +10,7 @@ import time
 from typing import Callable, Mapping, Optional
 
 from hermes_cli.approval_transport import ApprovalDecision, ApprovalRequest
-from bridge.protocol import ApprovalBridgeRequest, decode_line, encode_line
+from bridge.protocol import ApprovalBridgeRequest, ProtocolError, decode_line, encode_line
 
 logger = logging.getLogger(__name__)
 
@@ -134,10 +134,17 @@ def present_request(
             validator = validate_current_request
         initial_route = dict(validator(config, bridge_request, time.time()))
         response = sender(payload, socket_path=socket_path, timeout_seconds=timeout_seconds)
+        if (isinstance(response, Mapping) and response.get("request_id") == bridge_request.request_id
+                and response.get("request_digest") == bridge_request.digest):
+            reason = response.get("reason", "")
+            if isinstance(reason, str) and reason and len(reason) <= 80 and all(c.islower() or c == "_" for c in reason):
+                logger.info("Kanban approval task=%s run=%s request=%s reason=%s",
+                            identity.task_id, identity.run_id, bridge_request.request_id, reason)
         return decision_from_response(
             request, response if isinstance(response, Mapping) else {},
             bridge_request, config=config, validator=validator, initial_route=initial_route,
         )
-    except Exception:
-        logger.warning("Kanban owner approval request failed closed for %s", request.request_id)
+    except Exception as exc:
+        reason = str(exc) if isinstance(exc, ProtocolError) else type(exc).__name__
+        logger.warning("Kanban owner approval request failed closed for %s reason=%s", request.request_id, reason)
         return request.respond("deny")

@@ -4,6 +4,9 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 import errno
+import hashlib
+import json
+import logging
 import os
 from pathlib import Path
 import select
@@ -43,9 +46,12 @@ class BridgeConfig:
             raise ValueError("owner_id must be numeric")
 
 
+logger = logging.getLogger(__name__)
+
+
 class ApprovalService(Protocol):
     def request(self, data: dict, route: dict, deadline: float, cancel) -> str:
-        """Return 'once' or 'deny' after presenting a native human prompt."""
+        """Return 'once' or 'deny' after delegated review or explicit human permission."""
 
 
 class Broker:
@@ -159,7 +165,9 @@ class Broker:
                     return
                 request = ApprovalBridgeRequest.from_dict(payload)
                 self._serve_request(conn, request, peer_pid)
-        except Exception:
+        except Exception as exc:
+            reason = str(exc) if isinstance(exc, ProtocolError) else type(exc).__name__
+            logger.warning("kanban_bridge rejected stage=broker reason=%s", reason)
             try:
                 conn.close()
             except OSError:
@@ -221,9 +229,11 @@ class Broker:
             choice = self.approval_service.request(native_data, route, deadline, cancel)
         if choice not in ("once", "deny"):
             choice = "deny"
+        reason = getattr(self.approval_service, "last_reason", lambda: "")()
         if choice == "once" and not still_current(force=True):
             choice = "deny"
-        decision = ApprovalBridgeDecision(request.request_id, request.digest, choice)
+            reason = "authorization_changed"
+        decision = ApprovalBridgeDecision(request.request_id, request.digest, choice, reason)
         conn.sendall(encode_line(decision.to_dict()))
 
     def _prune_seen_locked(self, now: float) -> None:
@@ -316,12 +326,12 @@ def validate_current_request(config: BridgeConfig, request: ApprovalBridgeReques
         claim_expires = min(int(row["run_claim_expires"] or 0), int(row["task_claim_expires"] or 0))
         if claim_expires <= int(now):
             raise ProtocolError("claim expired")
-        return resolve_owner_route(db, config, request.task_id)
+        return resolve_owner_context(db, config, request.task_id)
     finally:
         db.close()
 
 
-def resolve_owner_route(db: sqlite3.Connection, config: BridgeConfig, task_id: str) -> dict:
+def resolve_owner_context(db: sqlite3.Connection, config: BridgeConfig, task_id: str) -> dict:
     rows = db.execute(
         """
         SELECT platform, chat_id, thread_id, user_id, user_id_alt, notifier_profile
@@ -344,13 +354,27 @@ def resolve_owner_route(db: sqlite3.Connection, config: BridgeConfig, task_id: s
                 "notifier_profile": config.notifier_profile,
             })
     unique = {(r["chat_id"], r["thread_id"]) for r in matches}
+    if not unique:
+        raise ProtocolError("no matching owner subscription")
+    # Owner identity authorizes delegation; notification count does not.
+    fingerprint = hashlib.sha256(json.dumps(sorted(unique)).encode()).hexdigest()
+    context = dict(matches[0])
+    context["route_fingerprint"] = fingerprint
     if len(unique) != 1:
+        context["chat_id"] = ""
+        context["thread_id"] = ""
+    return context
+
+
+def resolve_owner_route(db: sqlite3.Connection, config: BridgeConfig, task_id: str) -> dict:
+    context = resolve_owner_context(db, config, task_id)
+    if not context["chat_id"]:
         raise ProtocolError("approval route ambiguous")
-    return matches[0]
+    return context
 
 
 def _same_route(left: dict, right: dict) -> bool:
-    keys = ("platform", "chat_id", "thread_id", "owner_id", "notifier_profile")
+    keys = ("platform", "chat_id", "thread_id", "owner_id", "notifier_profile", "route_fingerprint")
     return all(str(left.get(key, "")) == str(right.get(key, "")) for key in keys)
 
 

@@ -182,23 +182,24 @@ class BrokerTests(unittest.TestCase):
             broker.close()
         self.assertEqual(service.calls, [])
 
-    def test_route_ambiguity_closes_without_decision(self):
-        conn = sqlite3.connect(self.db_path)
-        conn.execute(
-            "INSERT INTO kanban_notify_subs(task_id, platform, chat_id, thread_id, user_id, user_id_alt, notifier_profile) VALUES (?, 'discord', '101', '', ?, '', 'work-pm')",
-            (self.task_id, self.owner),
-        )
-        conn.commit()
-        conn.close()
-        service = FakeApprovalService("once")
+    def test_multiple_owner_routes_allow_pm_but_not_human_prompt(self):
+        from unittest import mock
+        from bridge.pm import PmApprovalService
+        with sqlite3.connect(self.db_path) as db:
+            db.execute("INSERT INTO kanban_notify_subs VALUES (?, 'discord', '101', '', ?, '', 'work-pm')",
+                       (self.task_id, self.owner))
+        human = mock.Mock()
+        reviewer = mock.Mock(return_value={"decision": "approve", "effect": "non_delete", "within_task": True, "evidence_complete": True})
+        service = PmApprovalService(human, reviewer)
         broker = Broker(self.config(), service)
         broker.start()
         try:
-            with self.assertRaises(Exception):
-                self.transact(self.make_request())
+            response = self.transact(self.make_request())
+            self.assertEqual(response["choice"], "once")
+            reviewer.assert_called_once()
+            human.request.assert_not_called()
         finally:
             broker.close()
-        self.assertEqual(service.calls, [])
 
     def test_user_id_alt_does_not_authorize_owner_route(self):
         conn = sqlite3.connect(self.db_path)

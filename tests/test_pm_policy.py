@@ -12,12 +12,13 @@ class PmPolicyTests(unittest.TestCase):
         human.request.return_value = "once"
         reviewer = mock.Mock(return_value=judgment or {
             "decision": "approve", "effect": "non_delete", "within_task": True,
+            "evidence_complete": True,
         })
         service = PmApprovalService(human, reviewer)
         result = service.request({
             "command": command, "description": "development", "request_id": "fixture",
             "task_id": "t_fixture", "run_id": 1, "task_context": {"title": "Build the app"},
-        }, {"owner_id": "1"}, time.time() + 30, cancel)
+        }, {"owner_id": "1", "chat_id": "100", "thread_id": "", "notifier_profile": "work-pm"}, time.time() + 30, cancel)
         return result, human, reviewer
 
     def test_routine_work_pm_approves_without_human(self):
@@ -42,6 +43,7 @@ class PmPolicyTests(unittest.TestCase):
     def test_model_classified_hard_delete_requires_human(self):
         result, human, _ = self.run_request("appctl cleanup", {
             "decision": "approve", "effect": "hard_delete", "within_task": True,
+            "deletion_evidence": "appctl cleanup", "evidence_complete": True,
         })
         self.assertEqual(result, "once")
         human.request.assert_called_once()
@@ -55,8 +57,8 @@ class PmPolicyTests(unittest.TestCase):
 
     def test_uncertain_out_of_scope_or_malformed_deny_without_human_spam(self):
         for judgment in [{}, {"decision": "approve", "effect": "unknown", "within_task": True},
-                         {"decision": "approve", "effect": "non_delete", "within_task": False},
-                         {"decision": "deny", "effect": "non_delete", "within_task": True}]:
+                         {"decision": "approve", "effect": "non_delete", "within_task": False, "evidence_complete": True},
+                         {"decision": "deny", "effect": "non_delete", "within_task": True, "evidence_complete": True}]:
             with self.subTest(judgment=judgment):
                 # A nonempty invalid value avoids the fixture's default response.
                 result, human, _ = self.run_request("appctl build", judgment or {"invalid": True})
@@ -69,14 +71,53 @@ class PmPolicyTests(unittest.TestCase):
         human.request.assert_not_called()
         reviewer.assert_not_called()
 
-    def test_opaque_commands_never_reach_model_or_human(self):
-        for command in ["python build.py", "bash -c 'pytest'", "eval \"$cmd\"",
-                        "trash file.txt", "gio trash file.txt"]:
-            with self.subTest(command=command):
-                result, human, reviewer = self.run_request(command)
-                self.assertEqual(result, "deny")
-                human.request.assert_not_called()
-                reviewer.assert_not_called()
+    def test_uninspectable_commands_need_evidence_not_human_permission(self):
+        for command in ["python build.py", "eval \"$cmd\"", "appctl build"]:
+            result, human, reviewer = self.run_request(command, {
+                "decision": "approve", "effect": "non_delete", "within_task": True,
+                "evidence_complete": False,
+            })
+            self.assertEqual(result, "deny")
+            human.request.assert_not_called()
+            reviewer.assert_called_once()
+
+    def test_visible_readonly_python_is_reviewed(self):
+        command = "pwd; python3 - <<'PY'\nimport pathlib\nprint(pathlib.Path.cwd().resolve())\nPY"
+        result, human, reviewer = self.run_request(command, {
+            "decision": "approve", "effect": "non_delete", "within_task": True,
+            "evidence_complete": True,
+        })
+        self.assertEqual(result, "once")
+        human.request.assert_not_called()
+        reviewer.assert_called_once()
+
+    def test_speculative_delete_claim_does_not_prompt_human(self):
+        result, human, _ = self.run_request("gzip -c evidence/source.diff > evidence/source.diff.gz", {
+            "decision": "approve", "effect": "hard_delete", "within_task": True,
+            "evidence_complete": False,
+        })
+        self.assertEqual(result, "deny")
+        human.request.assert_not_called()
+
+    def test_hard_delete_without_unique_human_route_stays_denied(self):
+        human = mock.Mock()
+        reviewer = mock.Mock()
+        service = PmApprovalService(human, reviewer)
+        result = service.request({"command": "rm data"}, {"chat_id": ""}, time.time() + 30, lambda: False)
+        self.assertEqual(result, "deny")
+        self.assertEqual(service.last_reason(), "human_route_ambiguous")
+        human.request.assert_not_called()
+        reviewer.assert_not_called()
+
+    def test_human_denial_is_never_replaced_by_pm_approval(self):
+        human = mock.Mock()
+        human.request.return_value = "deny"
+        reviewer = mock.Mock()
+        service = PmApprovalService(human, reviewer)
+        result = service.request({"command": "rm data"}, {"chat_id": "100"}, time.time() + 30, lambda: False)
+        self.assertEqual(result, "deny")
+        self.assertEqual(service.last_reason(), "human_declined")
+        reviewer.assert_not_called()
 
     def test_quoted_deletion_documentation_is_reviewed(self):
         result, human, reviewer = self.run_request('echo "rm file"')

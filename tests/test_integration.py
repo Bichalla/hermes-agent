@@ -296,7 +296,7 @@ class IntegrationTests(unittest.TestCase):
 
     def test_pm_auto_approval_never_sends_a_human_prompt(self):
         adapter = AdapterFixture(OWNER_ID, choice=None)
-        review = mock.Mock(return_value={"decision": "approve", "effect": "non_delete", "within_task": True})
+        review = mock.Mock(return_value={"decision": "approve", "effect": "non_delete", "within_task": True, "evidence_complete": True})
         result = self._run_guard(adapter, pm_review=review)
         self.assertTrue(result["approved"])
         review.assert_called_once()
@@ -304,7 +304,7 @@ class IntegrationTests(unittest.TestCase):
 
     def test_hard_delete_uses_native_human_even_if_pm_would_approve(self):
         adapter = AdapterFixture(OWNER_ID, choice="deny")
-        review = mock.Mock(return_value={"decision": "approve", "effect": "non_delete", "within_task": True})
+        review = mock.Mock(return_value={"decision": "approve", "effect": "non_delete", "within_task": True, "evidence_complete": True})
         result = self._run_guard(adapter, pm_review=review, command="rm old.txt")
         self.assertFalse(result["approved"])
         review.assert_not_called()

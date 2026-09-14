@@ -6,7 +6,7 @@ display text plus a digest that is bound to the exact request fields.
 
 from __future__ import annotations
 
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, field
 import hashlib
 import json
 import math
@@ -14,9 +14,9 @@ import time
 import uuid
 
 
-MAX_LINE_BYTES = 16 * 1024
-MAX_COMMAND_DISPLAY = 1200
-MAX_DESCRIPTION = 200
+MAX_LINE_BYTES = 256 * 1024
+MAX_COMMAND_DISPLAY = 32 * 1024
+MAX_DESCRIPTION = 16 * 1024
 ALLOWED_CHOICES = ("once", "deny")
 
 
@@ -42,6 +42,7 @@ class ApprovalBridgeRequest:
     expires_at: float
     allowed_choices: tuple[str, ...] = ALLOWED_CHOICES
     digest: str = ""
+    execution: dict = field(default_factory=dict)
 
     @classmethod
     def create(
@@ -60,6 +61,7 @@ class ApprovalBridgeRequest:
         profile: str,
         timeout_seconds: int,
         now: float | None = None,
+        execution: dict | None = None,
     ) -> "ApprovalBridgeRequest":
         now = time.time() if now is None else now
         timeout = _bounded_timeout(timeout_seconds)
@@ -78,6 +80,7 @@ class ApprovalBridgeRequest:
             profile=profile,
             timeout_seconds=timeout,
             expires_at=now + timeout,
+            execution=dict(execution or {}),
         )
         return cls.from_dict(req.with_digest().to_dict())
 
@@ -103,6 +106,7 @@ class ApprovalBridgeRequest:
                 expires_at=float(payload["expires_at"]),
                 allowed_choices=tuple(_texts(payload.get("allowed_choices", ALLOWED_CHOICES), "allowed_choices", 16)),
                 digest=_text(payload["digest"], "digest", 128),
+                execution=payload.get("execution", {}),
             )
         except KeyError as exc:
             raise ProtocolError(f"missing field: {exc.args[0]}") from None
@@ -112,7 +116,7 @@ class ApprovalBridgeRequest:
         extra = set(payload) - {
             "request_id", "command", "description", "pattern_key", "pattern_keys", "session_key",
             "task_id", "run_id", "claim_lock", "worker_pid", "db_path", "profile",
-            "timeout_seconds", "expires_at", "allowed_choices", "digest",
+            "timeout_seconds", "expires_at", "allowed_choices", "digest", "execution",
         }
         if extra:
             raise ProtocolError("unknown field")
@@ -145,8 +149,10 @@ class ApprovalBridgeRequest:
                       "task_id", "claim_lock", "db_path", "profile"):
             if not getattr(self, field):
                 raise ProtocolError(f"{field} required")
-        if "```" in self.command or "```" in self.description:
-            raise ProtocolError("unsafe display text")
+        if not isinstance(self.execution, dict) or set(self.execution) - {"cwd", "tool_call_id"}:
+            raise ProtocolError("invalid execution context")
+        for key, value in self.execution.items():
+            _text(value, key, 4096 if key == "cwd" else 200)
         expected = self.with_digest().digest
         if not hmac_compare(expected, self.digest):
             raise ProtocolError("digest mismatch")
@@ -158,6 +164,8 @@ class ApprovalBridgeDecision:
     request_digest: str
     choice: str
     reason: str = ""
+    evidence: list[dict] = field(default_factory=list)
+    details: str = ''
 
     def to_dict(self) -> dict:
         return asdict(self)
@@ -171,6 +179,8 @@ class ApprovalBridgeDecision:
             request_digest=_text(payload.get("request_digest"), "request_digest", 128),
             choice=_text(payload.get("choice"), "choice", 16),
             reason=_text(payload.get("reason", ""), "reason", 200),
+            evidence=payload.get("evidence", []),
+            details=_text(payload.get('details', ''), 'details', 2000),
         )
         if decision.request_id != request.request_id or not hmac_compare(decision.request_digest, request.digest):
             raise ProtocolError("decision correlation mismatch")
@@ -213,6 +223,7 @@ def request_payload_for_native(request: ApprovalBridgeRequest) -> dict:
         "run_id": request.run_id,
         "timeout_seconds": request.timeout_seconds,
         "allowed_choices": list(request.allowed_choices),
+        "execution": dict(request.execution),
     }
 
 
@@ -243,7 +254,7 @@ def _strict_int(value, name: str) -> int:
 def _text(value, name: str, limit: int) -> str:
     if not isinstance(value, str):
         raise ProtocolError(f"{name} must be text")
-    if not value and name not in {"reason"}:
+    if not value and name not in {"reason", "details"}:
         raise ProtocolError(f"{name} required")
     if len(value) > limit:
         raise ProtocolError(f"{name} too long")

@@ -74,5 +74,9 @@ def register_tools(ctx, identity, config, root: Path) -> None:
         "The owner delegates normal development approvals to work-pm. Do not ask for routine Allow Once clicks. "
         "Use kanban_soft_delete for file removal and kanban_restore to undo it; keep the restore receipt. "
         "Hard-delete always requires explicit human permission. A backup claim or a soft-delete label does not authorize irreversible deletion. "
-        "Opaque commands denied by policy must be decomposed into inspectable operations, never disguised or encoded.",
+        "Always supply terminal workdir. PM can inspect bounded source files before deciding. "
+        "Read approval_policy.reason and guidance in terminal results: needs_evidence, outside_task_scope, "
+        "human_declined and infrastructure failures are different. Do not report a missing terminal capability "
+        "when a policy decision is the cause. Preserve exact requests and evidence; never disguise, encode, "
+        "change profiles or obtain unrelated approval to evade a denial.",
     )

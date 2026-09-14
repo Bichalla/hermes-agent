@@ -20,7 +20,10 @@
     "gateway/kanban_approval.py": "2da4bee83501b8ed8686097f861289346d8cee9139f1bd2e67eef4801efd7cba",
     "agent/plugin_llm.py": "a5efb0ffdbcb57806b9a2b65d1d0f749e06eb7048b3f8beb988d83b1c4dc7f4d",
     "agent/auxiliary_client.py": "becbb3f3a6b9b847b95791e0c43d2689d5f07726f75b106f13afad8d45c5c9c7",
-    "hermes_constants.py": "d26e0db65ed08561a061db3bf6a51e4446938dc8d90737a9ba9c52e1983d15f2"
+    "hermes_constants.py": "d26e0db65ed08561a061db3bf6a51e4446938dc8d90737a9ba9c52e1983d15f2",
+    "model_tools.py": "699ddf9dbf9fc0397c8f93316616499d152e9ae841e7c81e7109265f0d4d71c7",
+    "hermes_cli/middleware.py": "62b1c1b6aa2e736c852ffd4dc551b9325ae4d41debafb6ece1169739fb6ce228",
+    "tools/terminal_tool.py": "5ca8d06f9cc42f8f8672d76bca5efcc4c523a24244a345529a76e2b3c5c4cbb7"
   },
   "overlay_files": {
     "tools/approval.py": {

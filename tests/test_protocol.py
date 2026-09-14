@@ -1,4 +1,5 @@
 import unittest
+from dataclasses import replace
 
 from bridge.protocol import (
     ApprovalBridgeDecision,
@@ -6,6 +7,7 @@ from bridge.protocol import (
     ProtocolError,
     decode_line,
     encode_line,
+    MAX_COMMAND_DISPLAY,
 )
 
 
@@ -44,9 +46,20 @@ class ProtocolTests(unittest.TestCase):
 
     def test_rejects_oversize_command(self):
         payload = self.make_request().to_dict()
-        payload["command"] = "x" * 1201
-        with self.assertRaises(ProtocolError):
+        payload["command"] = "x" * (MAX_COMMAND_DISPLAY + 1)
+        with self.assertRaisesRegex(ProtocolError, 'command too long'):
             ApprovalBridgeRequest.from_dict(payload)
+
+    def test_pm_envelope_preserves_long_command_findings_and_cwd(self):
+        original = replace(self.make_request(), command='echo ' + 'a' * 3000,
+                           description='scanner finding; ' * 100,
+                           execution={'cwd': '/tmp/task', 'tool_call_id': 'call1'}).with_digest()
+        received = ApprovalBridgeRequest.from_dict(decode_line(encode_line(original.to_dict())))
+        self.assertEqual(received, original)
+        changed = original.to_dict()
+        changed['execution'] = {'cwd': '/tmp/other', 'tool_call_id': 'call1'}
+        with self.assertRaisesRegex(ProtocolError, 'digest mismatch'):
+            ApprovalBridgeRequest.from_dict(changed)
 
     def test_rejects_decision_mismatch(self):
         request = self.make_request()

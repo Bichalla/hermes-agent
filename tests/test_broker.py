@@ -6,7 +6,7 @@ import time
 import unittest
 from pathlib import Path
 
-from bridge.broker import BridgeConfig, Broker
+from bridge.broker import BridgeConfig, Broker, read_task_context
 from bridge.protocol import ApprovalBridgeRequest, decode_line, encode_line
 
 
@@ -166,6 +166,18 @@ class BrokerTests(unittest.TestCase):
         finally:
             broker.close()
         self.assertEqual(response["choice"], "deny")
+
+    def test_scope_revision_detects_changes_beyond_display_limit(self):
+        with sqlite3.connect(self.db_path) as db:
+            db.execute('ALTER TABLE tasks ADD COLUMN body TEXT')
+            db.execute('UPDATE tasks SET body=?', ('x' * 32000 + ' first restriction',))
+        before = read_task_context(self.config(), self.task_id)
+        with sqlite3.connect(self.db_path) as db:
+            db.execute('UPDATE tasks SET body=?', ('x' * 32000 + ' different restriction',))
+        after = read_task_context(self.config(), self.task_id)
+        self.assertTrue(before['_truncated'])
+        self.assertEqual(before['body'], after['body'])
+        self.assertNotEqual(before['_revision'], after['_revision'])
 
     def test_stale_run_closes_without_decision(self):
         conn = sqlite3.connect(self.db_path)

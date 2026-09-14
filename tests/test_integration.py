@@ -1,8 +1,9 @@
 """End-to-end isolated approval bridge fixtures.
 
-This exercises the candidate core guard, plugin transport, worker socket,
-broker DB validation, and native gateway facade without running shell commands,
-networking, or touching the production Hermes runtime/profile.
+This exercises the core guard, native middleware/hooks, plugin transport, socket,
+broker validation, and gateway facade. One fixture executes a harmless Python
+process in a temporary workspace. No production command or real human approval
+is executed; all HOME/DB/socket state belongs to the fixtures.
 """
 
 from __future__ import annotations
@@ -72,6 +73,10 @@ class Ctx:
         self.tools = {}
         self.hooks = {}
         self.sections = {}
+        self.middleware = {}
+
+    def register_middleware(self, name, callback):
+        self.middleware[name] = callback
 
     def register_approval_transport(self, name, present):
         self.name = name
@@ -225,6 +230,7 @@ class IntegrationTests(unittest.TestCase):
         module.ROOT = self.plugin_root
         ctx = Ctx()
         module.register(ctx)
+        self.ctx = ctx
         self.assertEqual(ctx.name, "kanban-owner")
         self.assertIsNotNone(ctx.present)
         return ctx.present
@@ -270,8 +276,14 @@ class IntegrationTests(unittest.TestCase):
                     plugin_id="kanban-owner",
                     profile_home=str(self.hermes_home.resolve()),
                 ) if name == "kanban-owner" else None)
-                with mock.patch("tools.approval_prompt.get_plugin_manager", return_value=manager):
-                    result = approval.check_all_command_guards(command, "local")
+                def hook(name, **kwargs):
+                    callback = self.ctx.hooks.get(name)
+                    return [callback(**kwargs)] if callback else []
+                with mock.patch("tools.approval_prompt.get_plugin_manager", return_value=manager), mock.patch('hermes_cli.lifecycle.invoke_hook', side_effect=hook):
+                    result = self.ctx.middleware['tool_execution'](
+                        tool_name='terminal', args={'command': command, 'workdir': str(self.root)},
+                        next_call=lambda args: approval.check_all_command_guards(args['command'], 'local'),
+                    )
                     self.assertEqual(os.environ["HERMES_SINGLE_QUERY_SESSION"], "1")
                     return result
         finally:
@@ -301,6 +313,44 @@ class IntegrationTests(unittest.TestCase):
         self.assertTrue(result["approved"])
         review.assert_called_once()
         self.assertEqual(adapter.calls, [])
+
+    def test_native_dispatch_executes_only_after_bound_pm_review(self):
+        from hermes_cli.plugins import PluginContext, PluginManager, PluginManifest
+        from model_tools import _CallIds, _execute_tool
+        seen = []
+        def review(data, *_args):
+            seen.append(data)
+            return {'decision': 'approve', 'effect': 'non_delete', 'within_task': True, 'evidence_complete': True}
+        adapter = AdapterFixture(OWNER_ID)
+        native = KanbanApprovalService(SimpleNamespace(_gateway_loop=self.loop, _running=True,
+                                                       adapters={Platform.DISCORD: adapter}))
+        cfg = BridgeConfig(str(self.db_path), str(self.socket_path), OWNER_ID, NOTIFIER_PROFILE, WORKER_PROFILE, max_timeout=5)
+        broker = Broker(cfg, PmApprovalService(native, review))
+        broker.start()
+        try:
+            with mock.patch.dict(os.environ, self._env(), clear=True):
+                manager = PluginManager(scope_key=str(self.hermes_home))
+                manager._discovered = True
+                ctx = PluginContext(PluginManifest(name='kanban-owner', path=str(PLUGIN_PATH.parent)), manager)
+                spec = importlib.util.spec_from_file_location('native_bound_plugin', PLUGIN_PATH)
+                module = importlib.util.module_from_spec(spec)
+                spec.loader.exec_module(module)
+                module.ROOT = self.plugin_root
+                module.register(ctx)
+                command = f"{sys.executable} -I -c 'from pathlib import Path; Path(\"native-proof.txt\").write_text(\"verified\")'"
+                args = {'command': command, 'workdir': str(self.root), 'timeout': 10}
+                with mock.patch('hermes_cli.plugins.get_plugin_manager', return_value=manager), mock.patch('tools.approval_prompt.get_plugin_manager', return_value=manager), mock.patch.object(approval, '_kanban_worker_findings', return_value=([('fixture', 'Long finding; ' * 100, False)], None)):
+                    result = _execute_tool('terminal', args, args, _CallIds(task_id='native-session', session_id='native-session', turn_id='turn1', tool_call_id='native-call1'), user_task=None, enabled_tools=['terminal'], skip_tool_execution_middleware=False)
+                value = json.loads(result)
+                self.assertEqual(value.get('exit_code'), 0, value)
+                self.assertEqual(value['approval_policy']['reason'], 'pm_approved')
+                self.assertEqual((self.root / 'native-proof.txt').read_text(), 'verified')
+                self.assertEqual(seen[0]['execution']['cwd'], str(self.root.resolve()))
+                self.assertEqual(seen[0]['execution']['tool_call_id'], 'native-call1')
+                self.assertGreater(len(seen[0]['description']), 200)
+                self.assertEqual(adapter.calls, [])
+        finally:
+            broker.close()
 
     def test_hard_delete_uses_native_human_even_if_pm_would_approve(self):
         adapter = AdapterFixture(OWNER_ID, choice="deny")

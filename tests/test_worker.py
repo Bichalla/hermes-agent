@@ -132,8 +132,30 @@ class WorkerTransportTests(unittest.TestCase):
         self.assertEqual(decision.choice, "deny")
         self.assertEqual(validate.call_count, 2)
 
+    def test_source_change_after_broker_reply_denies_with_specific_reason(self):
+        from bridge.evidence import SourceReader
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp).resolve()
+            source = root / 'test.py'
+            source.write_text('print(1)')
+            reader = SourceReader(root, [root])
+            reader.read({'path': 'test.py'})
+            bindings = mock.Mock()
+            bindings.context.return_value = {'cwd': str(root), 'tool_call_id': 'fixture'}
+            def sender(payload, **_kwargs):
+                source.write_text('print(2)')
+                return {'request_id': payload['request_id'], 'request_digest': payload['digest'],
+                        'choice': 'once', 'evidence': reader.snapshot()}
+            request = make_request()
+            decision = worker.present_request(request, identity=self.identity(), socket_path='/tmp/socket',
+                                              config=self.config(), sender=sender, validator=self.validator,
+                                              bindings=bindings)
+            self.assertEqual(decision.choice, 'deny')
+            bindings.decision.assert_called_with(request, 'source_changed')
+
     def test_oversize_display_description_denies_without_sender(self):
-        request = make_request(description="x" * 201)
+        from bridge.protocol import MAX_DESCRIPTION
+        request = make_request(description="x" * (MAX_DESCRIPTION + 1))
         sender = mock.Mock()
         decision = worker.present_request(
             request, identity=self.identity(), socket_path="/tmp/socket",
@@ -183,6 +205,9 @@ class WorkerTransportTests(unittest.TestCase):
                 pass
 
             def register_system_prompt_section(self, *_args):
+                pass
+
+            def register_middleware(self, *_args):
                 pass
 
         env = {

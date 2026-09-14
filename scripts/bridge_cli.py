@@ -96,7 +96,7 @@ def main():
                     client.connect(config.socket_path)
                     client.sendall(b'{"type":"status"}\n')
                     status = json.loads(client.recv(4096))
-                    result["pm_reviewer_ready"] = status.get("policy") == "work-pm-v3" and status.get("reviewer_bound") is True
+                    result["pm_reviewer_ready"] = status.get("policy") == "work-pm-v4" and status.get("reviewer_bound") is True
                 result["broker_listening"] = True
         except (OSError, ValueError):
             pass

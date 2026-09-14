@@ -25,6 +25,9 @@ def register(ctx) -> None:
         bind_reviewer(ctx.llm, home)
         return
     identity = WorkerIdentity.from_env()
+    from bridge.execution import ExecutionBindings
+    bindings = ExecutionBindings()
+    bindings.register(ctx)
     socket_path = bridge_config.socket_path
     timeout_seconds = float(bridge_config.max_timeout)
 
@@ -32,6 +35,7 @@ def register(ctx) -> None:
         return present_request(
             request, identity=identity, socket_path=socket_path, config=bridge_config,
             timeout_seconds=timeout_seconds,
+            bindings=bindings,
         )
 
     ctx.register_approval_transport("kanban-owner", present)

@@ -21,6 +21,7 @@ from .protocol import (
     ApprovalBridgeDecision,
     ApprovalBridgeRequest,
     ProtocolError,
+    MAX_LINE_BYTES,
     decode_line,
     encode_line,
     request_payload_for_native,
@@ -233,7 +234,12 @@ class Broker:
         if choice == "once" and not still_current(force=True):
             choice = "deny"
             reason = "authorization_changed"
-        decision = ApprovalBridgeDecision(request.request_id, request.digest, choice, reason)
+        evidence = getattr(self.approval_service, 'last_evidence', lambda: [])()
+        from .evidence import verify_snapshot
+        if choice == 'once' and not verify_snapshot(evidence):
+            choice, reason = 'deny', 'source_changed'
+        details = getattr(self.approval_service, 'last_details', lambda: '')()
+        decision = ApprovalBridgeDecision(request.request_id, request.digest, choice, reason, evidence, details)
         conn.sendall(encode_line(decision.to_dict()))
 
     def _prune_seen_locked(self, now: float) -> None:
@@ -274,7 +280,13 @@ def read_task_context(config: BridgeConfig, task_id: str) -> dict:
         if not selected:
             return {}
         row = db.execute("SELECT " + ",".join(selected) + " FROM tasks WHERE id=?", (task_id,)).fetchone()
-        return {key: redact_sensitive_text(str(row[key] or "")[:4000], force=True) for key in selected} if row else {}
+        if not row:
+            return {}
+        raw = {key: str(row[key] or '') for key in selected}
+        result = {key: redact_sensitive_text(value[:32000], force=True) for key, value in raw.items()}
+        result['_revision'] = hashlib.sha256(json.dumps(raw, sort_keys=True).encode()).hexdigest()
+        result['_truncated'] = any(len(value) > 32000 for value in raw.values())
+        return result
     finally:
         db.close()
 
@@ -380,7 +392,7 @@ def _same_route(left: dict, right: dict) -> bool:
 
 def _read_line(conn: socket.socket) -> bytes:
     data = bytearray()
-    while len(data) <= 16 * 1024:
+    while len(data) <= MAX_LINE_BYTES:
         chunk = conn.recv(1)
         if not chunk:
             raise ProtocolError("client closed")

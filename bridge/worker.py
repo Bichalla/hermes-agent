@@ -10,7 +10,7 @@ import time
 from typing import Callable, Mapping, Optional
 
 from hermes_cli.approval_transport import ApprovalDecision, ApprovalRequest
-from bridge.protocol import ApprovalBridgeRequest, ProtocolError, decode_line, encode_line
+from bridge.protocol import ApprovalBridgeRequest, ProtocolError, MAX_LINE_BYTES, decode_line, encode_line
 
 logger = logging.getLogger(__name__)
 
@@ -51,6 +51,7 @@ class WorkerIdentity:
 
 def build_bridge_request(
     request: ApprovalRequest, identity: WorkerIdentity, *, timeout_seconds: float = DEFAULT_TIMEOUT_SECONDS,
+    execution: dict | None = None,
 ) -> ApprovalBridgeRequest:
     return ApprovalBridgeRequest.create(
         command=request.command,
@@ -65,6 +66,7 @@ def build_bridge_request(
         db_path=os.path.realpath(identity.db_path),
         profile=identity.profile,
         timeout_seconds=int(min(float(request.timeout_seconds), float(timeout_seconds), DEFAULT_TIMEOUT_SECONDS)),
+        execution=execution,
     )
 
 
@@ -78,11 +80,15 @@ def _socket_roundtrip(payload: dict, *, socket_path: str, timeout_seconds: float
         client.connect(socket_path)
         client.sendall(encode_line(payload))
         chunks: list[bytes] = []
+        total = 0
         while True:
             chunk = client.recv(65536)
             if not chunk:
                 break
             chunks.append(chunk)
+            total += len(chunk)
+            if total > MAX_LINE_BYTES:
+                raise ProtocolError('response too large')
             if b"\n" in chunk:
                 break
     line = b"".join(chunks).split(b"\n", 1)[0]
@@ -108,6 +114,9 @@ def decision_from_response(
         and response.get("choice") == "once"
         and time.time() < bridge_request.expires_at
     ):
+        from bridge.evidence import verify_snapshot
+        if not verify_snapshot(response.get('evidence', [])):
+            return request.respond('deny')
         if validator(config, bridge_request, time.time()) == initial_route:
             return request.respond("once")
     return request.respond("deny")
@@ -118,6 +127,7 @@ def present_request(
     config=None, timeout_seconds: float = DEFAULT_TIMEOUT_SECONDS,
     sender: Callable[..., dict] = send_payload,
     validator: Callable[..., dict] | None = None,
+    bindings=None,
 ) -> ApprovalDecision:
     if (
         identity is None
@@ -127,7 +137,8 @@ def present_request(
     ):
         return request.respond("deny")
     try:
-        bridge_request = build_bridge_request(request, identity, timeout_seconds=timeout_seconds)
+        execution = bindings.context(request) if bindings is not None else {}
+        bridge_request = build_bridge_request(request, identity, timeout_seconds=timeout_seconds, execution=execution)
         payload = bridge_request.to_dict()
         if validator is None:
             from bridge.broker import validate_current_request
@@ -138,13 +149,22 @@ def present_request(
                 and response.get("request_digest") == bridge_request.digest):
             reason = response.get("reason", "")
             if isinstance(reason, str) and reason and len(reason) <= 80 and all(c.islower() or c == "_" for c in reason):
+                if bindings is not None:
+                    bindings.decision(request, reason, response.get('details', ''))
                 logger.info("Kanban approval task=%s run=%s request=%s reason=%s",
                             identity.task_id, identity.run_id, bridge_request.request_id, reason)
-        return decision_from_response(
+        decision = decision_from_response(
             request, response if isinstance(response, Mapping) else {},
             bridge_request, config=config, validator=validator, initial_route=initial_route,
         )
+        if bindings is not None and decision.choice == 'deny' and isinstance(response, Mapping) and response.get('choice') == 'once':
+            from bridge.evidence import verify_snapshot
+            reason = 'authorization_changed' if verify_snapshot(response.get('evidence', [])) else 'source_changed'
+            bindings.decision(request, reason)
+        return decision
     except Exception as exc:
         reason = str(exc) if isinstance(exc, ProtocolError) else type(exc).__name__
+        if bindings is not None:
+            bindings.decision(request, 'transport_invalid', reason)
         logger.warning("Kanban owner approval request failed closed for %s reason=%s", request.request_id, reason)
         return request.respond("deny")

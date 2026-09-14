@@ -1,14 +1,14 @@
 # Installation status — 2026-09-14
 
-구현과 외부 프로필 연결은 설치했지만 **운영 런타임 활성화는 아직 완료되지 않았다**.
+외부 프로필 연결과 **운영 런타임 활성화를 완료했다**. 실제 소유자의 Discord Once 클릭 왕복은 별도 검증 사항이다.
 
 ## 준비된 릴리스
 
-- 기존 활성 코어: `e96bfd0452f951ae3fe354108840cfee299bb04e`
-- 후보 코어: `05e4bf9383bed637498872dbec349e8feb9329d2`
+- 이전 활성 코어: `e96bfd0452f951ae3fe354108840cfee299bb04e`
+- 현재 활성 코어: `05e4bf9383bed637498872dbec349e8feb9329d2`
 - 공식 기반: `939e45c91d751fadd94dcd1b873ac3cb44846213`, Hermes v0.21.2
 - 후보 receipt: `/Users/honbul/.hermes/runtime/protected-releases/hermes-candidate-05e4bf9383be-20260914T003309Z-c2cb83b3/candidate-receipt.json`
-- 후보 상태: 기존 manager의 `finalize` 통과, `ready`.
+- 릴리스 상태: 기존 manager의 `finalize` 및 `activate` 통과. default와 work-pm Gateway가 보호 절차로 전환됐다.
 - 코어 변경은 `tools/approval.py`, `gateway/run_startup.py`, `gateway/kanban_approval.py`의 세 파일이다. 활성 보호 코어를 직접 수정하거나 보호를 해제하지 않았다.
 
 ## 설치된 외부 연결
@@ -30,13 +30,13 @@
 - 후보 의존성 검사, core import 검사, 무결성 검사, 기존 migration 검사 및 외부 호환성 검사가 통과했다.
 - 실제 Discord 전송이나 사람의 Once 클릭은 검증하지 않았다. 자동 테스트의 응답은 fixture이며 사람 승인이 아니다.
 
-## 활성화가 남은 이유
+## 운영 전환 결과
 
-기존 `hermes-runtime-update activate <receipt> --timeout 60`을 실행했으나, 다른 카드 `t_9b291278`의 실행 537이 여전히 running이어서 drain timeout으로 안전 중단됐다. 해당 worker PID 59595가 살아 있음을 읽기 전용으로 확인했다.
+첫 시도는 다른 카드의 실행 537이 running이어서 drain timeout으로 안전 중단됐다. 이후 사용자가 작업 중지를 알리고 운영 적용을 지시했으며, DB에서 running 작업이 없음을 다시 확인했다.
 
-이 결과는 새 승인 연결의 테스트 실패가 아니라, 실행 중인 작업을 중단하지 않고 코어를 전환하는 기존 보호 절차의 차단이다. 강제 종료, claim 회수, 카드 상태 변경 또는 drain 생략은 하지 않았다. 활성 코어가 바뀌지 않아 현재 `doctor`의 `ready`는 false이며 broker도 아직 시작되지 않았다.
+같은 receipt로 기존 `hermes-runtime-update activate`를 다시 실행해 `activated` 결과를 받았다. 강제 종료, claim 회수, 카드 상태 변경 또는 drain 생략은 하지 않았다.
 
-후속 전환은 실행 중인 작업이 정상 종료된 뒤 동일 receipt에 기존 보호 관리자의 activate 절차를 다시 적용하는 것이다. 이후 doctor의 runtime/gateway/socket 검증과 실제 소유자 승인 왕복을 별도로 확인해야 한다. 이미 종료된 투자 앱 worker는 이 설치만으로 재개되지 않는다.
+전환 후 `hermes-approval-bridge doctor`는 runtime 호환성, private config, plugin/hook 링크, worker 설정, Gateway 커밋 일치, broker listening 모두 true, 최종 `ready: true`를 반환했다. 소켓 권한은 `0600`이다. `human_roundtrip_verified`는 false로 유지한다. 이미 종료된 투자 앱 worker는 이 설치만으로 재개되지 않는다.
 
 투자 앱 배포, 컨테이너 조작, 기존 투자 카드의 claim/blocked/완료 상태 변경은 수행하지 않았다.
 
@@ -45,3 +45,9 @@
 외부 구현, 프로필 링크, 정확한 core patch와 호환성 manifest를 분리 보관했다. 런타임에 연결부가 없거나 지원되지 않는 버전이면 플러그인과 훅은 승인 기능을 활성화하지 않는다. 현재 보호 관리자를 수정해 검사 절차를 우회하지 않았다.
 
 이는 미래 버전과의 무조건 자동 호환 보장이 아니다. 업데이트 후보에는 `hermes-approval-bridge check <source>`를 먼저 수행하고, 새 버전에서는 연결부/API 변경을 검토한 뒤 manifest와 테스트를 갱신해야 한다.
+
+## Git 보관 위치
+
+- 원격 저장소: `https://github.com/Bichalla/hermes-agent.git`
+- 코어 연결부: `feat/kanban-owner-approval-core` 브랜치
+- 외부 패키지: `custom/kanban-owner-approval-bridge` 브랜치. 외부 저장소의 독립 이력을 이 브랜치에 보관하며 Hermes main에 병합한 상태는 아니다.

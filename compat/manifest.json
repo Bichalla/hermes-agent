@@ -1,0 +1,57 @@
+{
+  "schema_version": 1,
+  "name": "hermes-kanban-approval-bridge",
+  "official_upstream_base": "939e45c91d751fadd94dcd1b873ac3cb44846213",
+  "active_head": "e96bfd0452f951ae3fe354108840cfee299bb04e",
+  "base_ref": "e96bfd0452f951ae3fe354108840cfee299bb04e",
+  "supported_heads": [
+    "05e4bf9383bed637498872dbec349e8feb9329d2"
+  ],
+  "required_base_hashes": {
+    "gateway/run_startup.py": "23ba1c4f0cf42f7292a0a50cb86d00000b75d9a531447c59d59510540fbee3bc",
+    "hermes_cli/approval_transport.py": "4da11e7783c4806d3ed1f0f2a623d22519c713bed1b04064dd1eecd61c33298c",
+    "hermes_cli/kanban_db_dispatch.py": "a94ef3c5c0be0a49fd9261df9fdefb7cff430b807c5849d35a95d98f31ade03c",
+    "tools/approval.py": "e48f1909968b253907fca01e9dad0593bee7a2bf7cf5278470c6d15a5150359f"
+  },
+  "overlay_files": {
+    "gateway/kanban_approval.py": {
+      "state": "added",
+      "patched_sha256": "2da4bee83501b8ed8686097f861289346d8cee9139f1bd2e67eef4801efd7cba"
+    },
+    "gateway/run_startup.py": {
+      "state": "modified",
+      "base_sha256": "23ba1c4f0cf42f7292a0a50cb86d00000b75d9a531447c59d59510540fbee3bc",
+      "patched_sha256": "fbdf5bdc81581f37ab3c4a0e7583d3018e3e345cf05e48f7508e8e3e0ca48bda"
+    },
+    "tools/approval.py": {
+      "state": "modified",
+      "base_sha256": "e48f1909968b253907fca01e9dad0593bee7a2bf7cf5278470c6d15a5150359f",
+      "patched_sha256": "6185d8e8b536dfe1c0624bdda8f2a92b58da92b985555427f6fd980d540d1819"
+    }
+  },
+  "allowed_scanner_sensitive_files": [],
+  "required_snippets": {
+    "gateway/kanban_approval.py": [
+      "class KanbanApprovalService:",
+      "api_version = 1",
+      "allow_permanent=False",
+      "allow_session=False",
+      "return \"once\" if ("
+    ],
+    "gateway/run_startup.py": [
+      "from gateway.kanban_approval import KanbanApprovalService",
+      "\"kanban_approval\": KanbanApprovalService(self)"
+    ],
+    "tools/approval.py": [
+      "def check_all_command_guards(",
+      "if _should_skip_container_guards(env_type, has_host_access=has_host_access):",
+      "def _kanban_worker_bridge_decision(command: str) -> dict | None:",
+      "\"kanban-owner\"",
+      "return _human_decision("
+    ]
+  },
+  "notes": [
+    "This manifest pins the reviewed gateway startup facade and Kanban-only approval seam overlay.",
+    "manager.finalize and compatibility checks remain unchanged; this helper only prepares inactive candidates after fail-closed validation."
+  ]
+}

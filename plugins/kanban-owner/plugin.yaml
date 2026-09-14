@@ -1,0 +1,5 @@
+name: kanban-owner
+version: 0.1.0
+description: One-command owner approval transport for verified Hermes Kanban workers.
+kind: standalone
+provides_hooks: []

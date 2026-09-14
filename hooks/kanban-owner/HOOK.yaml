@@ -1,0 +1,4 @@
+name: kanban-owner
+description: Native owner approval bridge for active Kanban workers
+events:
+  - gateway:startup

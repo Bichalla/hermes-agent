@@ -12,7 +12,6 @@ import importlib.util
 import json
 import os
 from pathlib import Path
-import shutil
 import sqlite3
 import sys
 import tempfile
@@ -32,7 +31,6 @@ from tools import approval
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 PLUGIN_PATH = REPO_ROOT / "plugins/kanban-owner/__init__.py"
-ROOT_CONFIG_PATH = REPO_ROOT / ".local/config.json"
 OWNER_ID = "1494011544214835201"
 TASK_ID = "t_integration"
 RUN_ID = 1
@@ -82,6 +80,8 @@ class IntegrationTests(unittest.TestCase):
         self.root = Path(self.tmp.name)
         self.hermes_home = self.root / "hermes-home"
         self.hermes_home.mkdir(mode=0o700)
+        self.plugin_root = self.root / "plugin-root"
+        (self.plugin_root / ".local").mkdir(parents=True, mode=0o700)
         self.db_path = self.root / "kanban.db"
         self.socket_path = self.root / "run" / "approval.sock"
         self._create_db()
@@ -104,7 +104,6 @@ class IntegrationTests(unittest.TestCase):
         self.loop.call_soon_threadsafe(self.loop.stop)
         self.loop_thread.join(3)
         self.loop.close()
-        self._restore_bridge_config()
         self._restore_tirith()
         self.tmp.cleanup()
         self._clear_config_cache()
@@ -173,11 +172,6 @@ class IntegrationTests(unittest.TestCase):
         self._clear_config_cache()
 
     def _write_bridge_config(self):
-        ROOT_CONFIG_PATH.parent.mkdir(mode=0o700, exist_ok=True)
-        self.backup_path = None
-        if ROOT_CONFIG_PATH.exists():
-            self.backup_path = self.root / "config.json.backup"
-            shutil.copy2(ROOT_CONFIG_PATH, self.backup_path)
         data = BridgeConfig(
             db_path=str(self.db_path),
             socket_path=str(self.socket_path),
@@ -186,17 +180,9 @@ class IntegrationTests(unittest.TestCase):
             worker_profile=WORKER_PROFILE,
             max_timeout=5,
         )
-        ROOT_CONFIG_PATH.write_text(json.dumps(data.__dict__))
-        os.chmod(ROOT_CONFIG_PATH, 0o600)
-
-    def _restore_bridge_config(self):
-        if getattr(self, "backup_path", None) is not None and self.backup_path.exists():
-            shutil.copy2(self.backup_path, ROOT_CONFIG_PATH)
-        else:
-            try:
-                ROOT_CONFIG_PATH.unlink()
-            except FileNotFoundError:
-                pass
+        config_path = self.plugin_root / ".local/config.json"
+        config_path.write_text(json.dumps(data.__dict__))
+        os.chmod(config_path, 0o600)
 
     def _install_fake_tirith(self):
         self.original_tirith = sys.modules.get("tools.tirith_security")
@@ -223,9 +209,9 @@ class IntegrationTests(unittest.TestCase):
         spec = importlib.util.spec_from_file_location("kanban_owner_integration", PLUGIN_PATH)
         module = importlib.util.module_from_spec(spec)
         spec.loader.exec_module(module)
+        module.ROOT = self.plugin_root
         ctx = Ctx()
-        with mock.patch("bridge.runtime.require_compatible_runtime"):
-            module.register(ctx)
+        module.register(ctx)
         self.assertEqual(ctx.name, "kanban-owner")
         self.assertIsNotNone(ctx.present)
         return ctx.present

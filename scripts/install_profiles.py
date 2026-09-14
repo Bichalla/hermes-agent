@@ -65,7 +65,7 @@ def main():
                 raise RuntimeError("existing plugin/hook path belongs to another installation")
     local = {
         "db_path": str(home / "role-profiles/kanban/kanban.db"),
-        "socket_path": str(home / "ops/approval-bridge/owner.sock"),
+        "socket_path": str(ROOT / ".local/run/owner.sock"),
         "owner_id": str(owners[0]), "notifier_profile": "work-pm",
         "worker_profile": "work-executor", "max_timeout": 300, "max_pending": 8,
     }

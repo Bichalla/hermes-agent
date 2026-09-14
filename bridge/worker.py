@@ -5,7 +5,6 @@ from __future__ import annotations
 from dataclasses import dataclass
 import logging
 import os
-from pathlib import Path
 import socket
 import time
 from typing import Callable, Mapping, Optional
@@ -48,11 +47,6 @@ class WorkerIdentity:
             profile=values["HERMES_PROFILE"],
             worker_pid=os.getpid(),
         )
-
-
-def default_socket_path() -> str:
-    base = Path(os.environ.get("HERMES_HOME") or Path.home() / ".hermes")
-    return str(base / "kanban-approval-bridge" / "worker.sock")
 
 
 def build_bridge_request(
@@ -99,24 +93,13 @@ def _socket_roundtrip(payload: dict, *, socket_path: str, timeout_seconds: float
 
 
 def send_payload(payload: dict, *, socket_path: str, timeout_seconds: float) -> dict:
-    """Send one immutable request to the owner broker.
-
-    A future broker module may provide a richer helper. This fallback keeps the
-    wire contract explicit and small for tests and dry-run validation.
-    """
-    try:
-        from bridge import protocol
-        helper = getattr(protocol, "send_worker_request", None)
-        if callable(helper):
-            return helper(payload, socket_path=socket_path, timeout_seconds=timeout_seconds)
-    except Exception:
-        logger.debug("Bridge protocol helper unavailable; using direct socket transport", exc_info=True)
+    """Send one immutable request to the configured owner broker."""
     return _socket_roundtrip(payload, socket_path=socket_path, timeout_seconds=timeout_seconds)
 
 
 def decision_from_response(
     request: ApprovalRequest, response: Mapping[str, object], bridge_request: ApprovalBridgeRequest,
-    *, config, validator: Callable[..., dict],
+    *, config, validator: Callable[..., dict], initial_route: dict,
 ) -> ApprovalDecision:
     response_digest = response.get("request_digest", response.get("digest"))
     if (
@@ -125,8 +108,8 @@ def decision_from_response(
         and response.get("choice") == "once"
         and time.time() < bridge_request.expires_at
     ):
-        validator(config, bridge_request, time.time())
-        return request.respond("once")
+        if validator(config, bridge_request, time.time()) == initial_route:
+            return request.respond("once")
     return request.respond("deny")
 
 
@@ -146,13 +129,14 @@ def present_request(
     try:
         bridge_request = build_bridge_request(request, identity, timeout_seconds=timeout_seconds)
         payload = bridge_request.to_dict()
-        response = sender(payload, socket_path=socket_path, timeout_seconds=timeout_seconds)
         if validator is None:
             from bridge.broker import validate_current_request
             validator = validate_current_request
+        initial_route = dict(validator(config, bridge_request, time.time()))
+        response = sender(payload, socket_path=socket_path, timeout_seconds=timeout_seconds)
         return decision_from_response(
             request, response if isinstance(response, Mapping) else {},
-            bridge_request, config=config, validator=validator,
+            bridge_request, config=config, validator=validator, initial_route=initial_route,
         )
     except Exception:
         logger.warning("Kanban owner approval request failed closed for %s", request.request_id)

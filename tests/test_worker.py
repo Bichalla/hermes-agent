@@ -110,14 +110,27 @@ class WorkerTransportTests(unittest.TestCase):
         def sender(payload, **_kwargs):
             return {"request_id": payload["request_id"], "request_digest": payload["digest"], "choice": "once"}
 
-        def stale(_config, _bridge_request, _now):
-            raise RuntimeError("reclaimed")
+        stale = mock.Mock(side_effect=[self.validator(None, None, None), RuntimeError("reclaimed")])
 
         decision = worker.present_request(
             request, identity=self.identity(), socket_path="/tmp/socket",
             config=self.config(), sender=sender, validator=stale,
         )
         self.assertEqual(decision.choice, "deny")
+        self.assertEqual(stale.call_count, 2)
+
+    def test_route_change_after_broker_reply_denies_once(self):
+        initial = self.validator(None, None, None)
+        changed = {**initial, "chat_id": "200"}
+        validate = mock.Mock(side_effect=[initial, changed])
+        def sender(payload, **_kwargs):
+            return {"request_id": payload["request_id"], "request_digest": payload["digest"], "choice": "once"}
+        decision = worker.present_request(
+            make_request(), identity=self.identity(), socket_path="/tmp/socket",
+            config=self.config(), sender=sender, validator=validate,
+        )
+        self.assertEqual(decision.choice, "deny")
+        self.assertEqual(validate.call_count, 2)
 
     def test_oversize_display_description_denies_without_sender(self):
         request = make_request(description="x" * 201)

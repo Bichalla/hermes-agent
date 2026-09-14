@@ -8,9 +8,14 @@
     "05e4bf9383bed637498872dbec349e8feb9329d2"
   ],
   "required_base_hashes": {
+    "gateway/hooks.py": "1baa2219a5c233891066be2149c5e89d98ef2b2a38bd006b3b53db7a6d53ad0b",
     "gateway/run_startup.py": "23ba1c4f0cf42f7292a0a50cb86d00000b75d9a531447c59d59510540fbee3bc",
     "hermes_cli/approval_transport.py": "4da11e7783c4806d3ed1f0f2a623d22519c713bed1b04064dd1eecd61c33298c",
     "hermes_cli/kanban_db_dispatch.py": "a94ef3c5c0be0a49fd9261df9fdefb7cff430b807c5849d35a95d98f31ade03c",
+    "hermes_cli/plugins.py": "9903d8d5a2f44c9f4772b28632d012b443c9fbe24a5d57df17b5ac62c33210d2",
+    "plugins/platforms/discord/adapter.py": "6e8640cd0f0a1256586c3c37e110eef6557945d26d444cc6d413d967de1bf25a",
+    "tools/approval_context.py": "91b086647fed3d5e23c2ef350d87f963530c0ec53d9373d5ef069dfbad022479",
+    "tools/approval_gateway_wait.py": "8f96a1307e8e38204f92eb52e67d682937d217e6a4a472f52c9cae6655af606e",
     "tools/approval.py": "e48f1909968b253907fca01e9dad0593bee7a2bf7cf5278470c6d15a5150359f"
   },
   "overlay_files": {
@@ -34,6 +39,10 @@
     "gateway/kanban_approval.py": [
       "class KanbanApprovalService:",
       "api_version = 1",
+      "deadline - time.time() > 300",
+      "from plugins.platforms.discord.adapter import ExecApprovalView",
+      "adapter._send_prompt(destination, {}, build_prompt)",
+      "require_admin=True, admin_user_ids={owner}",
       "allow_permanent=False",
       "allow_session=False",
       "return \"once\" if ("
@@ -42,11 +51,35 @@
       "from gateway.kanban_approval import KanbanApprovalService",
       "\"kanban_approval\": KanbanApprovalService(self)"
     ],
+    "gateway/hooks.py": [
+      "Events: gateway:startup",
+      "async def emit(self, event_type: str, context: Optional[Dict[str, Any]] = None) -> None:"
+    ],
+    "hermes_cli/plugins.py": [
+      "def register_approval_transport(self, name: str, present_fn: Callable",
+      "get_approval_transport"
+    ],
+    "plugins/platforms/discord/adapter.py": [
+      "class ExecApprovalView(_HermesView):",
+      "require_admin: bool = False, admin_user_ids: Optional[set] = None",
+      "if uid and uid in self.admin_user_ids:"
+    ],
+    "tools/approval_context.py": [
+      "def _is_single_query_approval_context() -> bool:",
+      "HERMES_SINGLE_QUERY_SESSION"
+    ],
+    "tools/approval_gateway_wait.py": [
+      "def _await_gateway_decision(",
+      "from tools import approval as _approval"
+    ],
     "tools/approval.py": [
       "def check_all_command_guards(",
       "if _should_skip_container_guards(env_type, has_host_access=has_host_access):",
       "def _kanban_worker_bridge_decision(command: str) -> dict | None:",
-      "\"kanban-owner\"",
+      "cfg.get(\"kanban_transport\")",
+      "return name == \"kanban-owner\"",
+      "allow_permanent=False, timeout_seconds=timeout_seconds",
+      "surface=\"transport:kanban-owner\"",
       "return _human_decision("
     ]
   },

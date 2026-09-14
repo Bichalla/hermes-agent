@@ -152,39 +152,25 @@ def _classify_segment(segment: list[str]) -> CommandClassification:
 
 def _strip_prefixes(segment: list[str]) -> list[str]:
     args = list(segment)
-    while args and _ASSIGNMENT.match(args[0]):
-        args.pop(0)
-    if args and _base(args[0]) == "env":
-        args.pop(0)
-        while args:
-            if args[0] in {"-i", "-0"}:
-                args.pop(0)
-                continue
-            if args[0] in {"-u", "--unset"}:
-                args.pop(0)
-                if not args:
-                    return []
-                args.pop(0)
-                continue
-            if args[0].startswith("-u") and len(args[0]) > 2:
-                args.pop(0)
-                continue
-            if args[0] == "--":
-                args.pop(0)
-                break
-            if _ASSIGNMENT.match(args[0]):
-                args.pop(0)
-                continue
-            break
-    while args and _base(args[0]) in {"sudo", "doas", "command", "builtin", "time", "nohup"}:
-        wrapper = _base(args.pop(0))
-        if wrapper in {"sudo", "doas"}:
-            args = _strip_sudo_options(args)
-            if not args:
-                return []
-            continue
-        while args and args[0].startswith("-"):
+    while args:
+        if _ASSIGNMENT.match(args[0]):
             args.pop(0)
+            continue
+        wrapper = _base(args[0])
+        if wrapper == "env":
+            args = _strip_options(args[1:], options_with_values={"-u", "--unset"},
+                                  allow_flags={"-i", "--ignore-environment", "-0"})
+            if args is None:
+                return []
+        elif wrapper in {"sudo", "doas"}:
+            args = _strip_sudo_options(args[1:])
+        elif wrapper in {"command", "builtin", "time", "nohup"}:
+            args = _strip_options(args[1:], options_with_values=set(),
+                                  allow_flags={"-p", "-v", "-V"})
+            if args is None:
+                return []
+        else:
+            break
     return args
 
 

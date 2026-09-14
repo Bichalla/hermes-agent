@@ -60,6 +60,8 @@ class CommandPolicyTests(unittest.TestCase):
     def test_wrapped_hard_delete_still_requires_human(self):
         for command in [
             "sudo rm file.txt",
+            "sudo env FOO=1 rm file.txt",
+            "env -i sudo -u deploy rm file.txt",
             "sudo -u deploy rm file.txt",
             "sudo --user deploy rm file.txt",
             "env FOO=1 rm file.txt",

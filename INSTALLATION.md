@@ -10,7 +10,8 @@ V3는 `bridge/broker.py`, `bridge/pm.py`, `bridge/worker.py`와 doctor의 외부
 - 실제 work-pm native 모델로 보고된 압축·해시·크기 명령과 run555의 정확한 작업공간 확인 명령을 판단만 했다. 둘 다 `pm_approved`, 사람 호출 없음. 해당 명령을 실행하지 않았다.
 - 반대 사례인 인라인 Python `os.unlink`는 실제 모델이 `hard_delete / evidence_complete=true`로 분류했다. 실행·사람 승인 요청 없음.
 - run555의 현재 다중 구독은 확인했지만 과거 로그가 예외 이유를 숨겨 당시 최초 차단 원인을 단정할 수는 없다. 새 로그는 task/run/request와 이유를 구분한다.
-- 운영 전환: 기존 보호 관리자의 정상 drain/restart 결과 확인 중.
+- 운영 전환 **미완료**: 기존 보호 관리자의 restart(60초), 같은 코어 receipt의 activate(300초)가 모두 `t_ed941720 / run556` 실행 때문에 drain timeout으로 중단됐다. worker 프로세스가 살아 있음을 확인했다. 강제 종료나 카드 상태 변경은 하지 않았다.
+- 외부 코드 수정은 `8eda177`로 원격 `custom/kanban-owner-approval-bridge`에 push했다. Gateway가 메모리에 로드한 정책은 아직 V2이며, V3 doctor의 `pm_reviewer_ready`와 `ready`는 전환 전에는 false다. run556 종료 후 기존 보호 관리자의 restart를 완료해야 V3가 활성화된다.
 
 아래 V2 항목은 설치 기반 및 이전 활성화 이력이다. V3의 판단 정책과 최신 검증 결과는 이 절을 따른다.
 

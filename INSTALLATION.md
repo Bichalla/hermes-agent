@@ -4,8 +4,8 @@
 
 사용자의 명시적 정책에 따라 일반 개발은 work-pm이 판단하고, 전용 도구의 복구 가능한 파일 삭제는 사람 허가 없이 처리한다. 영구 삭제는 사람만 허가할 수 있다.
 
-- 기존 운영 코어: `05e4bf9383bed637498872dbec349e8feb9329d2`
-- V2 후보 코어: `01896472311e6111284b8a8063e2a293f8a6af73`
+- V2 전환 이전 코어: `05e4bf9383bed637498872dbec349e8feb9329d2`
+- V2 활성 코어: `01896472311e6111284b8a8063e2a293f8a6af73`
 - 공식 기반: `939e45c91d751fadd94dcd1b873ac3cb44846213`, Hermes v0.21.2
 - V2 receipt: `/Users/honbul/.hermes/runtime/protected-releases/hermes-candidate-01896472311e-20260914T015226Z-7b2e8585/candidate-receipt.json`
 - 후보 준비 및 기존 보호 관리자의 finalize가 통과했다. 운영 전환 결과는 아래 상태를 따른다.
@@ -14,11 +14,15 @@ V2는 코어의 `tools/approval.py` 한 파일을 추가 변경하여, 선택된
 
 ## 현재 운영 상태
 
-**V2 구현·테스트·Git push는 완료했지만 운영 활성화는 미완료다.** 기존 관리자의 전환을 시도했으나 실행 중 작업이 있어 drain timeout으로 종료됐다. 60초 대기 뒤 300초로 추가 대기했으며, 마지막에 실행 542 (`t_c7ee8515`)와 543 (`t_a68be24d`)가 남아 있었다. 두 프로세스의 생존도 읽기 전용으로 확인했다. 중간 실행 545는 자연 종료됐다.
+**V2 운영 활성화 완료.** 사용자가 작업 중지를 알린 뒤 다시 확인했을 때 Kanban running 작업은 없었다. work-pm의 활성 대화 1개가 남아 첫 60초 대기는 중단됐으나, 추가 정상 대기 중 해당 대화가 종료되어 기존 보호 관리자가 `status: activated`를 반환했다.
 
-활성 코어는 여전히 `05e4bf9`이다. V2 프로필 연결은 설치됐지만 V2 manifest는 `0189647`만 허용하므로 현재 `doctor`는 `ready: false`다. 이는 새 정책의 운영 동작을 확인한 상태가 아니며, 승인 호환성 검사를 완화하지 않았다. V1의 기존 준비 상태가 그대로 유지된다고 주장하지 않는다.
+- 활성 코어: `01896472311e6111284b8a8063e2a293f8a6af73`, Git 작업 트리 clean.
+- default 및 work-pm Gateway 모두 보호 절차로 새 런타임으로 전환됨.
+- 전환 후 doctor: `runtime_compatible`, `gateway_on_candidate`, `broker_listening`, `pm_reviewer_ready`, 최종 `ready` 모두 true.
+- 남은 pending transition 없음. 보호 코어 직접 수정, 강제 작업 종료, 카드 상태 변경, drain 생략 없음.
+- 실제 사람의 Discord Once 왕복은 검증하지 않았으므로 `human_roundtrip_verified: false`를 유지한다. 이전의 native work-pm 모델 판단 호출 검증과 실제 사람 승인은 구분한다.
 
-기존 runtime-protection 전환 잠금이나 drain을 생략하지 않았고 실행/카드 상태를 강제로 변경하지 않았다. 남은 단계는 작업이 자연 종료된 뒤 이미 준비된 위 V2 receipt를 기존 `hermes-runtime-update activate`로 활성화하고 `doctor`의 runtime/Gateway/reviewer 항목을 다시 확인하는 것이다. 자동 재시도 작업은 등록하지 않았다.
+이전에 실행 542·543 때문에 전환이 중단됐던 기록은 과거 이력이다. 현재 운영 활성화의 장애가 아니다. 투자 앱의 배포나 기존 worker 재개를 수행한 것은 아니다.
 
 ## 설치된 외부 연결
 

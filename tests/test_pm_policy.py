@@ -66,6 +66,27 @@ class PmPolicyTests(unittest.TestCase):
         human.request.assert_not_called()
         reviewer.assert_not_called()
 
+    def test_opaque_commands_never_reach_model_or_human(self):
+        for command in ["python build.py", "bash -c 'pytest'", "eval \"$cmd\""]:
+            with self.subTest(command=command):
+                result, human, reviewer = self.run_request(command)
+                self.assertEqual(result, "deny")
+                human.request.assert_not_called()
+                reviewer.assert_not_called()
+
+    def test_quoted_deletion_documentation_is_reviewed(self):
+        result, human, reviewer = self.run_request('echo "rm file"')
+        self.assertEqual(result, "once")
+        human.request.assert_not_called()
+        reviewer.assert_called_once()
+
+    def test_cancellation_after_model_judgment_revokes_approval(self):
+        cancel = mock.Mock(side_effect=[False, True])
+        result, human, reviewer = self.run_request("git status", cancel=cancel)
+        self.assertEqual(result, "deny")
+        human.request.assert_not_called()
+        reviewer.assert_called_once()
+
 
 if __name__ == "__main__":
     unittest.main()

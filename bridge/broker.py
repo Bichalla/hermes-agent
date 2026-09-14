@@ -188,6 +188,7 @@ class Broker:
             self._seen[request.request_id] = request.expires_at
 
         route = validate_current_request(self.config, request, now)
+        task_context = read_task_context(self.config, request.task_id)
         deadline = min(request.expires_at, now + self.config.max_timeout)
         next_validation = 0.0
 
@@ -199,6 +200,8 @@ class Broker:
             next_validation = current_time + 0.2
             try:
                 current_route = validate_current_request(self.config, request, current_time)
+                if read_task_context(self.config, request.task_id) != task_context:
+                    return False
             except Exception:
                 return False
             return _same_route(route, current_route)
@@ -214,7 +217,7 @@ class Broker:
         choice = "deny"
         if not cancel():
             native_data = request_payload_for_native(request)
-            native_data["task_context"] = read_task_context(self.config, request.task_id)
+            native_data["task_context"] = task_context
             choice = self.approval_service.request(native_data, route, deadline, cancel)
         if choice not in ("once", "deny"):
             choice = "deny"

@@ -147,6 +147,26 @@ class BrokerTests(unittest.TestCase):
             broker.close()
         self.assertEqual(response["choice"], "deny")
 
+    def test_task_scope_change_revokes_pending_decision(self):
+        with sqlite3.connect(self.db_path) as db:
+            db.execute("ALTER TABLE tasks ADD COLUMN body TEXT DEFAULT 'Build app'")
+        test = self
+
+        class ChangingScope(FakeApprovalService):
+            def request(self, data, route, deadline, cancel):
+                test.assertEqual(data["task_context"]["body"], "Build app")
+                with sqlite3.connect(test.db_path) as db:
+                    db.execute("UPDATE tasks SET body='Different task'")
+                return "once"
+
+        broker = Broker(self.config(), ChangingScope())
+        broker.start()
+        try:
+            response = self.transact(self.make_request())
+        finally:
+            broker.close()
+        self.assertEqual(response["choice"], "deny")
+
     def test_stale_run_closes_without_decision(self):
         conn = sqlite3.connect(self.db_path)
         conn.execute("UPDATE task_runs SET status='reclaimed' WHERE id=?", (self.run_id,))

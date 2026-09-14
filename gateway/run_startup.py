@@ -1219,7 +1219,11 @@ class GatewayStartupMixin:
         hook_count = len(self.hooks.loaded_hooks)
         if hook_count:
             logger.info("%s hook(s) loaded", hook_count)
-        await self.hooks.emit("gateway:startup", {"platforms": [p.value for p in self.adapters]})
+        from gateway.kanban_approval import KanbanApprovalService
+        await self.hooks.emit("gateway:startup", {
+            "platforms": [p.value for p in self.adapters],
+            "kanban_approval": KanbanApprovalService(self),
+        })
         if connected_count > 0:
             logger.info("Gateway running with %s platform(s)", connected_count)
         # Initial channel directory for send_message name resolution

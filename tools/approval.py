@@ -991,6 +991,167 @@ def _tirith_scan(command: str) -> dict:
         }]}
 
 
+def _kanban_worker_identity() -> dict | None:
+    """Return the exact Kanban worker identity required for bridged approval."""
+    if (
+        not _is_single_query_approval_context()
+        or _is_cron_approval_context()
+        or _is_unattended_platform_approval_context()
+    ):
+        return None
+    env = os.environ
+    values = {
+        "task_id": env.get("HERMES_KANBAN_TASK", "").strip(),
+        "run_id": env.get("HERMES_KANBAN_RUN_ID", "").strip(),
+        "claim_lock": env.get("HERMES_KANBAN_CLAIM_LOCK", ""),
+        "db_path": env.get("HERMES_KANBAN_DB", "").strip(),
+        "profile": env.get("HERMES_PROFILE", "").strip(),
+    }
+    return values if all(values.values()) else None
+
+
+def _kanban_worker_transport_selected() -> bool:
+    try:
+        from hermes_cli.config import load_config_readonly
+        cfg = ((load_config_readonly() or {}).get("security") or {}).get("approval") or {}
+        name = str(cfg.get("kanban_transport") or "").strip().lower()
+    except Exception:
+        return False
+    return name == "kanban-owner"
+
+
+def _present_with_kanban_owner_transport(
+    *, command: str, description: str, pattern_key: str, pattern_keys: list[str], session_key: str,
+) -> dict:
+    """Present a Kanban-only request through the explicitly configured owner transport."""
+    if not _kanban_worker_transport_selected():
+        return {"selected": False}
+    try:
+        from tools.approval_prompt import get_plugin_manager
+        registered = get_plugin_manager().get_approval_transport("kanban-owner")
+    except Exception:
+        logger.warning("Could not resolve Kanban owner approval transport")
+        registered = None
+    if registered is None:
+        logger.warning("Kanban owner approval transport is unavailable")
+        return {"selected": True, "name": "kanban-owner", "choice": "deny", "failure": "unavailable"}
+
+    try:
+        from agent.redact import redact_sensitive_text
+        from hermes_cli.approval_transport import ApprovalRequest, invoke_approval_transport
+        from tools.approval_human_wait import activity_heartbeat, human_wait_window
+        from tools.interrupt import is_interrupted
+
+        timeout_seconds = approval_context._get_approval_timeout()
+        request = ApprovalRequest.create(
+            command=redact_sensitive_text(command, force=True),
+            description=redact_sensitive_text(description, force=True),
+            pattern_key=pattern_key, pattern_keys=tuple(pattern_keys),
+            session_key=session_key, surface="kanban_worker", allow_session=False,
+            allow_permanent=False, timeout_seconds=timeout_seconds,
+        )
+    except Exception:
+        logger.warning("Could not build redacted Kanban owner approval request")
+        return {"selected": True, "name": "kanban-owner", "choice": "deny", "failure": "error"}
+
+    hook_kwargs = dict(
+        command=request.command, description=request.description, pattern_key=pattern_key,
+        pattern_keys=list(pattern_keys), session_key=session_key, surface="transport:kanban-owner",
+        request_id=request.request_id, request_digest=request.digest,
+    )
+    approval_context._fire_approval_hook("pre_approval_request", **hook_kwargs)
+    with human_wait_window(session_key):
+        result = invoke_approval_transport(
+            registered.present, request, timeout_seconds=timeout_seconds,
+            on_poll=activity_heartbeat("waiting for Kanban owner approval transport"),
+            is_interrupted=is_interrupted,
+        )
+    hook_choice = result.choice if result.failure is None else f"transport_{result.failure}"
+    approval_context._fire_approval_hook("post_approval_response", **hook_kwargs, choice=hook_choice)
+    return {
+        "selected": True, "name": "kanban-owner", "choice": result.choice,
+        "failure": result.failure,
+    }
+
+
+def _kanban_worker_findings(command: str) -> tuple[list[tuple[str, str, bool]], dict | None]:
+    """Gather findings for a verified Kanban worker without smart/session grants."""
+    try:
+        from tools.tirith_security import check_command_security
+        tirith_result = check_command_security(command)
+    except ImportError:
+        if _tirith_fail_open():
+            tirith_result = {"action": "allow", "findings": [], "summary": ""}
+        else:
+            return [], _blocked(
+                "BLOCKED: the Tirith security scanner could not be imported and security.tirith_fail_open is false, "
+                "so this Kanban worker command cannot be sent for unattended approval. Find an alternative approach "
+                "or restore the scanner before retrying.",
+                pattern_key="tirith:import-error", description="Tirith security scanner unavailable",
+            )
+
+    warnings: list[tuple[str, str, bool]] = []
+    if tirith_result.get("action") in {"block", "warn"}:
+        findings = tirith_result.get("findings") or []
+        rule_id = findings[0].get("rule_id", "unknown") if findings else "unknown"
+        warnings.append((f"tirith:{rule_id}", _format_tirith_description(tirith_result), True))
+
+    is_dangerous, pattern_key, description = detect_dangerous_command(command)
+    if is_dangerous:
+        warnings.append((pattern_key, description, False))
+    return warnings, None
+
+
+def _kanban_worker_bridge_decision(command: str) -> dict | None:
+    """Ask the selected external Kanban owner transport for a Once/Deny decision.
+
+    ``None`` means this context is not eligible for the bridge and the caller should
+    continue with the normal unattended branch. Any selected-transport failure is a
+    hard denial because there is no built-in human surface in ``chat -q``.
+    """
+    identity = _kanban_worker_identity()
+    if identity is None or not _kanban_worker_transport_selected():
+        return None
+
+    session_key = (
+        "kanban-worker:"
+        f"{identity['task_id']}:{identity['run_id']}:"
+        f"{hashlib.sha256(command.encode('utf-8', 'surrogatepass')).hexdigest()}"
+    )
+    warnings, blocked = _kanban_worker_findings(command)
+    if blocked is not None:
+        return blocked
+    if not warnings:
+        return _approved()
+
+    combined_desc = "; ".join(desc for _, desc, _ in warnings)
+    primary_key = warnings[0][0]
+    all_keys = [key for key, _, _ in warnings]
+    attempt = _present_with_kanban_owner_transport(
+        command=command, description=combined_desc, pattern_key=primary_key,
+        pattern_keys=all_keys, session_key=session_key,
+    )
+    if not attempt.get("selected") or str(attempt.get("name", "")).strip().lower() != "kanban-owner":
+        return _blocked(
+            "BLOCKED: Kanban owner approval transport is unavailable for this worker command.",
+            pattern_key=primary_key, description=combined_desc,
+        )
+    if attempt.get("failure"):
+        return _blocked(
+            "BLOCKED: Kanban owner approval transport failed. The user has NOT consented to this action. "
+            "Do NOT retry this command or attempt the same outcome through another route.",
+            pattern_key=primary_key, description=combined_desc,
+        )
+    if attempt.get("choice") == "once":
+        _reset_denials(session_key)
+        return _approved()
+    return _blocked(
+        "BLOCKED: User denied this Kanban worker command through the owner approval transport. "
+        "The user has NOT consented to this action. Do NOT retry or attempt the same outcome through another route.",
+        pattern_key=primary_key, description=combined_desc,
+    )
+
+
 def check_all_command_guards(command: str, env_type: str,
                              approval_callback=None,
                              has_host_access: bool = False) -> dict:
@@ -1015,6 +1176,9 @@ def check_all_command_guards(command: str, env_type: str,
     # Outside CLI/gateway/ask flows we never block on approvals: each
     # unattended context applies its configured deny/approve mode, else allow.
     if not is_cli and not is_gateway and not is_ask:
+        bridged = _kanban_worker_bridge_decision(command)
+        if bridged is not None:
+            return bridged
         for ctx in _unattended_contexts():
             result = _unattended_deny(command, ctx)
             if result is not None:

@@ -22,7 +22,8 @@ _ASSIGNMENT = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*=.*")
 _SQL_DELETE = re.compile(r"(?is)\b(delete\s+from|drop\s+(table|database|schema)\b|truncate\s+table\b)")
 _INTERPRETER_DELETE = re.compile(
     r"(?is)\b(os|shutil|path|fs)\s*\.\s*(remove|unlink|rmdir|removedirs|rmtree|rm)\s*\("
-    r"|\b(remove_all|unlinkSync|rmSync|rmdirSync|deleteMany|deleteOne|rmtree)\s*\("
+    r"|\b(remove_all|unlinkSync|rmSync|rmdirSync|deleteMany|deleteOne|rmtree|unlink)\s*\("
+    r"|\bRemove-Item\b"
 )
 _ENCODED_PAYLOAD = re.compile(r"(?i)\b(base64\s+-d|base64\s+--decode|openssl\s+enc|xxd\s+-r|python\s+-m\s+base64)\b")
 _COMMAND_SUBSTITUTION = re.compile(r"`|\$\(")
@@ -31,6 +32,8 @@ _COMMAND_SUBSTITUTION = re.compile(r"`|\$\(")
 def classify(command: str) -> CommandClassification:
     if not isinstance(command, str) or not command.strip():
         return CommandClassification(OPAQUE, "empty")
+    if _apply_patch_delete(command):
+        return CommandClassification(HARD_DELETE, "apply_patch_delete")
     if "<<" in command or _COMMAND_SUBSTITUTION.search(command) or _ENCODED_PAYLOAD.search(command):
         return CommandClassification(OPAQUE, "opaque_shell_payload")
     try:
@@ -112,8 +115,8 @@ def _classify_segment(segment: list[str]) -> CommandClassification:
 
     if exe in {"rm", "unlink", "rmdir", "shred", "srm", "truncate"} or exe.startswith("mkfs"):
         return CommandClassification(HARD_DELETE, exe)
-    if exe == "find" and "-delete" in rest:
-        return CommandClassification(HARD_DELETE, "find_delete")
+    if exe == "find":
+        return _classify_find(rest)
     if exe == "git":
         return _classify_git(rest)
     if exe in {"docker", "podman"}:
@@ -122,20 +125,28 @@ def _classify_segment(segment: list[str]) -> CommandClassification:
         return CommandClassification(HARD_DELETE, "sql_delete")
     if exe == "kubectl" and rest and rest[0] == "delete":
         return CommandClassification(HARD_DELETE, "kubectl_delete")
+    if exe == "kubectl":
+        return _classify_kubectl(rest)
     if exe in {"aws", "gcloud", "az"} and any(arg in {"delete", "destroy", "remove", "rm"} for arg in rest):
         return CommandClassification(HARD_DELETE, f"{exe}_delete")
     if exe == "terraform" and rest and rest[0] == "destroy":
         return CommandClassification(HARD_DELETE, "terraform_destroy")
     if exe == "curl" and _curl_delete(rest):
         return CommandClassification(HARD_DELETE, "curl_delete")
+    if exe == "rsync" and any(arg == "--delete" or arg.startswith("--delete-") or arg == "--remove-source-files" for arg in rest):
+        return CommandClassification(HARD_DELETE, "rsync_delete")
+    if exe == "trash" or (exe == "gio" and rest and rest[0] == "trash"):
+        return CommandClassification(OPAQUE, "trash_helper")
     if exe in {"eval", "exec"}:
         return _classify_payload(rest, "shell_payload")
     if exe == "source" or exe == ".":
         return CommandClassification(OPAQUE, "source")
     if exe in {"sh", "bash", "zsh", "dash", "fish", "ksh"}:
         return _classify_shell(rest)
-    if exe in {"python", "python3", "node", "ruby", "perl"}:
+    if exe in {"python", "python3", "node", "ruby", "perl", "php", "powershell", "pwsh"}:
         return _classify_interpreter(rest)
+    if exe == "xargs":
+        return _classify_xargs(rest)
     return CommandClassification(REVIEW, "inspectable")
 
 
@@ -229,17 +240,96 @@ def _strip_git_options(rest: list[str]) -> list[str]:
     return args
 
 
+def _classify_find(rest: list[str]) -> CommandClassification:
+    if "-delete" in rest:
+        return CommandClassification(HARD_DELETE, "find_delete")
+    for idx, arg in enumerate(rest):
+        if arg not in {"-exec", "-execdir", "-ok", "-okdir"}:
+            continue
+        nested = [arg for arg in rest[idx + 1:] if arg not in {";", "+"}]
+        if not nested:
+            return CommandClassification(OPAQUE, "find_exec")
+        decision = _classify_segment(nested)
+        if decision.effect == HARD_DELETE:
+            return CommandClassification(HARD_DELETE, "find_exec_delete")
+        if decision.effect == OPAQUE:
+            return decision
+    return CommandClassification(REVIEW, "find")
+
+
 def _classify_container(rest: list[str]) -> CommandClassification:
-    args = [arg for arg in rest if arg != "--"]
-    while args and args[0].startswith("-"):
-        args.pop(0)
+    stripped = _strip_options(
+        rest,
+        options_with_values={"--context", "-c", "--host", "-H", "--config", "--log-level"},
+        allow_flags={"--tls", "--tlsverify", "--debug"},
+    )
+    if stripped is None:
+        return CommandClassification(OPAQUE, "container_options")
+    args = stripped
     if not args:
         return CommandClassification(REVIEW, "container")
     if args[0] in {"rm", "rmi", "prune"}:
         return CommandClassification(HARD_DELETE, "container_delete")
     if len(args) >= 2 and args[1] in {"rm", "rmi", "prune"} and args[0] in {"container", "image", "volume", "network", "system", "builder"}:
         return CommandClassification(HARD_DELETE, "container_delete")
+    if args[0] == "exec":
+        nested = _strip_docker_exec_options(args[1:])
+        if nested is None:
+            return CommandClassification(OPAQUE, "container_exec")
+        if not nested:
+            return CommandClassification(OPAQUE, "container_exec")
+        decision = _classify_segment(nested)
+        if decision.effect == HARD_DELETE:
+            return CommandClassification(HARD_DELETE, "container_exec_delete")
+        if decision.effect == OPAQUE:
+            return decision
     return CommandClassification(REVIEW, "container")
+
+
+def _strip_docker_exec_options(rest: list[str]) -> list[str] | None:
+    args = _strip_options(
+        rest,
+        options_with_values={"-e", "--env", "-u", "--user", "-w", "--workdir"},
+        allow_flags={"-i", "-t", "--interactive", "--tty", "--privileged", "--detach"},
+    )
+    if args is None or not args:
+        return None
+    return args[1:]
+
+
+def _classify_kubectl(rest: list[str]) -> CommandClassification:
+    args = _strip_options(
+        rest,
+        options_with_values={"--context", "--namespace", "-n", "--kubeconfig", "--as", "--as-group"},
+        allow_flags={"--all", "--wait", "--force", "--ignore-not-found"},
+    )
+    if args is None:
+        return CommandClassification(OPAQUE, "kubectl_options")
+    if args and args[0] == "delete":
+        return CommandClassification(HARD_DELETE, "kubectl_delete")
+    return CommandClassification(REVIEW, "kubectl")
+
+
+def _strip_options(rest: list[str], *, options_with_values: set[str], allow_flags: set[str]) -> list[str] | None:
+    args = list(rest)
+    while args:
+        arg = args[0]
+        if arg == "--":
+            return args[1:]
+        if not arg.startswith("-"):
+            return args
+        args.pop(0)
+        if arg in options_with_values:
+            if not args:
+                return None
+            args.pop(0)
+            continue
+        if any(arg.startswith(option + "=") for option in options_with_values if option.startswith("--")):
+            continue
+        if arg in allow_flags:
+            continue
+        return None
+    return args
 
 
 def _curl_delete(rest: list[str]) -> bool:
@@ -261,7 +351,7 @@ def _classify_shell(rest: list[str]) -> CommandClassification:
 
 
 def _classify_interpreter(rest: list[str]) -> CommandClassification:
-    payload = _option_payload(rest, {"-c", "-e"})
+    payload = _option_payload(rest, {"-c", "-e", "-r", "-command", "-encodedcommand"})
     if payload is None:
         return CommandClassification(OPAQUE, "interpreter")
     if _INTERPRETER_DELETE.search(payload):
@@ -272,11 +362,29 @@ def _classify_interpreter(rest: list[str]) -> CommandClassification:
     return CommandClassification(OPAQUE, "interpreter_payload")
 
 
+def _classify_xargs(rest: list[str]) -> CommandClassification:
+    args = _strip_options(
+        rest,
+        options_with_values={"-n", "--max-args", "-P", "--max-procs", "-I", "--replace", "-s", "--max-chars"},
+        allow_flags={"-0", "--null", "-r", "--no-run-if-empty", "-t", "--verbose"},
+    )
+    if args is None:
+        return CommandClassification(OPAQUE, "xargs_options")
+    if not args:
+        return CommandClassification(REVIEW, "xargs")
+    decision = _classify_segment(args)
+    if decision.effect == HARD_DELETE:
+        return CommandClassification(HARD_DELETE, "xargs_delete")
+    if decision.effect == OPAQUE:
+        return decision
+    return CommandClassification(REVIEW, "xargs")
+
+
 def _option_payload(rest: list[str], flags: set[str]) -> str | None:
     args = list(rest)
-    while args and args[0].startswith("-") and args[0] not in flags:
+    while args and args[0].startswith("-") and args[0].lower() not in flags:
         args.pop(0)
-    if not args or args[0] not in flags or len(args) < 2:
+    if not args or args[0].lower() not in flags or len(args) < 2:
         return None
     return args[1]
 
@@ -292,3 +400,10 @@ def _classify_payload(rest: list[str], reason: str) -> CommandClassification:
 
 def _base(token: str) -> str:
     return token.rsplit("/", 1)[-1]
+
+
+def _apply_patch_delete(command: str) -> bool:
+    return (
+        command.lstrip().startswith("apply_patch:")
+        and ("delete file:" in command.lower() or re.search(r"\bdelete:\s+\S+", command, re.I) is not None)
+    )

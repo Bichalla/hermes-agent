@@ -28,6 +28,16 @@ class Ctx:
 
 
 class WorkerToolsTests(unittest.TestCase):
+    def test_apply_patch_delete_shapes_are_blocked(self):
+        ctx = Ctx()
+        register_tools(ctx, None, None, Path("/unused"))
+        hook = ctx.hooks["pre_tool_call"]
+        for args in [{"patch": "*** Delete File: app.py"},
+                     {"changes": [{"kind": "delete", "path": "app.py"}]},
+                     {"changes": [{"kind": {"type": "delete"}, "path": "app.py"}]}]:
+            self.assertEqual(hook(tool_name="apply_patch", args=args)["action"], "block")
+        self.assertIsNone(hook(tool_name="apply_patch", args={"changes": [{"kind": "update"}]}))
+
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
         self.root = Path(self.tmp.name)

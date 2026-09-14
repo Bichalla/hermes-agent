@@ -29,7 +29,10 @@ class PmPolicyTests(unittest.TestCase):
     def test_hard_delete_never_delegates_to_model(self):
         for command in ["rm file", "rm -rf build", "find . -delete", "git clean -fd",
                         "docker volume rm data", "sqlite3 app.db 'DELETE FROM users'",
-                        "python -c 'import os; os.unlink(\"data\")'", "shred data"]:
+                        "python -c 'import os; os.unlink(\"data\")'", "shred data",
+                        "xargs rm -rf file.txt", "find . -print0 | xargs -0 rm -f",
+                        "php -r 'unlink(\"file\");'", "powershell -Command 'Remove-Item file'",
+                        "rsync --delete src/ dst/", "apply_patch: 1 delete: app.py"]:
             with self.subTest(command=command):
                 result, human, reviewer = self.run_request(command)
                 self.assertEqual(result, "once")
@@ -67,7 +70,8 @@ class PmPolicyTests(unittest.TestCase):
         reviewer.assert_not_called()
 
     def test_opaque_commands_never_reach_model_or_human(self):
-        for command in ["python build.py", "bash -c 'pytest'", "eval \"$cmd\""]:
+        for command in ["python build.py", "bash -c 'pytest'", "eval \"$cmd\"",
+                        "trash file.txt", "gio trash file.txt"]:
             with self.subTest(command=command):
                 result, human, reviewer = self.run_request(command)
                 self.assertEqual(result, "deny")

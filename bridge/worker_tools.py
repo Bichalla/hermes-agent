@@ -55,7 +55,16 @@ def register_tools(ctx, identity, config, root: Path) -> None:
                           }})
 
     def no_patch_delete(tool_name="", args=None, **_kw):
-        if tool_name == "patch" and isinstance(args, dict) and "*** Delete File:" in str(args.get("patch", "")):
+        if tool_name not in {"patch", "apply_patch"} or not isinstance(args, dict):
+            return None
+        changes = args.get("changes", [])
+        deletes = any(
+            isinstance(change, dict) and (
+                change.get("kind") == "delete" or
+                isinstance(change.get("kind"), dict) and change["kind"].get("type") == "delete"
+            ) for change in changes
+        ) if isinstance(changes, list) else False
+        if "delete file:" in str(args.get("patch", "")).lower() or deletes:
             return {"action": "block", "message": "Use kanban_soft_delete for recoverable file deletion. Permanent deletion requires the owner's explicit approval via the command policy."}
         return None
 

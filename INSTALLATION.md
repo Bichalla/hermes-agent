@@ -10,8 +10,10 @@ V3는 `bridge/broker.py`, `bridge/pm.py`, `bridge/worker.py`와 doctor의 외부
 - 실제 work-pm native 모델로 보고된 압축·해시·크기 명령과 run555의 정확한 작업공간 확인 명령을 판단만 했다. 둘 다 `pm_approved`, 사람 호출 없음. 해당 명령을 실행하지 않았다.
 - 반대 사례인 인라인 Python `os.unlink`는 실제 모델이 `hard_delete / evidence_complete=true`로 분류했다. 실행·사람 승인 요청 없음.
 - run555의 현재 다중 구독은 확인했지만 과거 로그가 예외 이유를 숨겨 당시 최초 차단 원인을 단정할 수는 없다. 새 로그는 task/run/request와 이유를 구분한다.
-- 운영 전환 **미완료**: 기존 보호 관리자의 restart(60초), 같은 코어 receipt의 activate(300초)가 모두 `t_ed941720 / run556` 실행 때문에 drain timeout으로 중단됐다. worker 프로세스가 살아 있음을 확인했다. 강제 종료나 카드 상태 변경은 하지 않았다.
-- 외부 코드 수정은 `8eda177`로 원격 `custom/kanban-owner-approval-bridge`에 push했다. Gateway가 메모리에 로드한 정책은 아직 V2이며, V3 doctor의 `pm_reviewer_ready`와 `ready`는 전환 전에는 false다. run556 종료 후 기존 보호 관리자의 restart를 완료해야 V3가 활성화된다.
+- **V3 운영 활성화 완료.** 사용자의 재요청 후 running 작업이 없음을 확인했고, 기존 보호 관리자의 restart가 `status: activated`를 반환했다. default 및 work-pm Gateway가 모두 정상 전환됐다. 코어 교체, 강제 worker 종료, 카드 상태 변경, drain 생략은 하지 않았다.
+- 실행 중인 broker의 읽기 전용 status 응답은 `policy: work-pm-v3`, `reviewer_bound: true`다. doctor의 `runtime_compatible`, `gateway_on_candidate`, `broker_listening`, `pm_reviewer_ready`, `ready`가 모두 true다. 보호 런타임 무결성이 확인됐고 `transition_pending: false`다.
+- 외부 코드 수정은 `8eda177`로 원격 `custom/kanban-owner-approval-bridge`에 push했다. 이전 restart(60초) 및 activate(300초)가 `t_ed941720 / run556` 때문에 중단됐던 것은 과거 이력이며 현재 활성화 장애가 아니다.
+- 이번 운영 점검은 정책 로딩과 연결 준비 상태 확인이다. 실제 사람의 Discord Once 왕복, 종료된 worker 재개, 투자 앱 배포를 수행했다는 뜻은 아니다.
 
 아래 V2 항목은 설치 기반 및 이전 활성화 이력이다. V3의 판단 정책과 최신 검증 결과는 이 절을 따른다.
 
@@ -27,7 +29,7 @@ V3는 `bridge/broker.py`, `bridge/pm.py`, `bridge/worker.py`와 doctor의 외부
 
 V2는 코어의 `tools/approval.py` 한 파일을 추가 변경하여, 선택된 Kanban worker의 모든 terminal 명령을 위임 정책으로 보낸다. 기존 승인 off/yolo/permanent grant나 container 분기가 이 정책보다 앞서지 않는다. Hermes의 기존 hardline/user deny는 유지한다. V1부터의 전체 연결부는 세 파일이며 `compat/core.patch`는 V1 이전 `e96bfd0`부터의 전체 패치를 보관한다. manifest의 후보 준비 기준은 V1 활성 코어 `05e4bf9`이다.
 
-## 현재 운영 상태
+## V2 운영 전환 이력
 
 **V2 운영 활성화 완료.** 사용자가 작업 중지를 알린 뒤 다시 확인했을 때 Kanban running 작업은 없었다. work-pm의 활성 대화 1개가 남아 첫 60초 대기는 중단됐으나, 추가 정상 대기 중 해당 대화가 종료되어 기존 보호 관리자가 `status: activated`를 반환했다.
 

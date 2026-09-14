@@ -47,7 +47,10 @@ class CommandPolicyTests(unittest.TestCase):
     def test_wrapped_hard_delete_still_requires_human(self):
         for command in [
             "sudo rm file.txt",
+            "sudo -u deploy rm file.txt",
+            "sudo --user deploy rm file.txt",
             "env FOO=1 rm file.txt",
+            "env -i PATH=/bin rm file.txt",
             "bash -c 'rm file.txt'",
             "python -c 'import os; os.unlink(\"data\")'",
             "node -e 'require(\"fs\").rmSync(\"data\", {recursive:true})'",
@@ -70,6 +73,11 @@ class CommandPolicyTests(unittest.TestCase):
         ]:
             with self.subTest(command=command):
                 self.assert_effect(command, OPAQUE)
+
+    def test_later_hard_delete_beats_earlier_opaque_segment(self):
+        self.assert_effect("python scripts/build.py; rm file.txt", HARD_DELETE)
+        self.assert_effect("python scripts/build.py\nrm file.txt", HARD_DELETE)
+        self.assert_effect("echo 'hello\nrm file.txt'", REVIEW)
 
     def test_routine_development_commands_remain_reviewable(self):
         for command in [

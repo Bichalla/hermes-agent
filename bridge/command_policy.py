@@ -34,7 +34,7 @@ def classify(command: str) -> CommandClassification:
     if "<<" in command or _COMMAND_SUBSTITUTION.search(command) or _ENCODED_PAYLOAD.search(command):
         return CommandClassification(OPAQUE, "opaque_shell_payload")
     try:
-        tokens = _tokens(command)
+        tokens = _tokens(_normalize_newline_separators(command))
     except ValueError:
         return CommandClassification(OPAQUE, "parse_error")
     if not tokens:
@@ -49,9 +49,37 @@ def _tokens(command: str) -> list[str]:
     return list(lexer)
 
 
+def _normalize_newline_separators(command: str) -> str:
+    result: list[str] = []
+    quote = ""
+    escaped = False
+    for char in command:
+        if escaped:
+            result.append(char)
+            escaped = False
+            continue
+        if char == "\\" and quote != "'":
+            result.append(char)
+            escaped = True
+            continue
+        if char in {"'", '"'}:
+            if quote == char:
+                quote = ""
+            elif not quote:
+                quote = char
+            result.append(char)
+            continue
+        if char == "\n" and not quote:
+            result.append(";")
+            continue
+        result.append(char)
+    return "".join(result)
+
+
 def _classify_tokens(tokens: list[str]) -> CommandClassification:
     i = 0
     saw_command = False
+    opaque: CommandClassification | None = None
     while i < len(tokens):
         if tokens[i] in _OPERATORS:
             i += 1
@@ -64,10 +92,14 @@ def _classify_tokens(tokens: list[str]) -> CommandClassification:
             continue
         decision = _classify_segment(segment)
         saw_command = True
-        if decision.effect != REVIEW:
+        if decision.effect == HARD_DELETE:
             return decision
+        if decision.effect == OPAQUE and opaque is None:
+            opaque = decision
     if not saw_command:
         return CommandClassification(OPAQUE, "no_command")
+    if opaque is not None:
+        return opaque
     return CommandClassification(REVIEW, "inspectable")
 
 
@@ -114,10 +146,17 @@ def _strip_prefixes(segment: list[str]) -> list[str]:
     if args and _base(args[0]) == "env":
         args.pop(0)
         while args:
-            if args[0] in {"-i", "-0"} or args[0].startswith("-u"):
+            if args[0] in {"-i", "-0"}:
                 args.pop(0)
-                if args and args[0] != "--" and not _ASSIGNMENT.match(args[0]):
-                    args.pop(0)
+                continue
+            if args[0] in {"-u", "--unset"}:
+                args.pop(0)
+                if not args:
+                    return []
+                args.pop(0)
+                continue
+            if args[0].startswith("-u") and len(args[0]) > 2:
+                args.pop(0)
                 continue
             if args[0] == "--":
                 args.pop(0)
@@ -127,10 +166,33 @@ def _strip_prefixes(segment: list[str]) -> list[str]:
                 continue
             break
     while args and _base(args[0]) in {"sudo", "doas", "command", "builtin", "time", "nohup"}:
-        args.pop(0)
+        wrapper = _base(args.pop(0))
+        if wrapper in {"sudo", "doas"}:
+            args = _strip_sudo_options(args)
+            if not args:
+                return []
+            continue
         while args and args[0].startswith("-"):
             args.pop(0)
     return args
+
+
+def _strip_sudo_options(args: list[str]) -> list[str]:
+    remaining = list(args)
+    options_with_values = {"-u", "--user", "-g", "--group", "-h", "--host", "-p", "--prompt", "-C", "-T"}
+    while remaining and remaining[0].startswith("-"):
+        option = remaining.pop(0)
+        if option == "--":
+            break
+        if option in options_with_values:
+            if not remaining:
+                return []
+            remaining.pop(0)
+        elif any(option.startswith(prefix + "=") for prefix in {"--user", "--group", "--host", "--prompt"}):
+            continue
+        elif len(option) > 2 and option[:2] in {"-u", "-g", "-h", "-p", "-C", "-T"}:
+            continue
+    return remaining
 
 
 def _classify_git(rest: list[str]) -> CommandClassification:

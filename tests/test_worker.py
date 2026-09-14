@@ -264,6 +264,19 @@ class WorkerTransportTests(unittest.TestCase):
                 with self.assertRaises(FileNotFoundError):
                     module.register(Ctx())
 
+    def test_non_kanban_session_keeps_native_terminal_execution(self):
+        import importlib.util
+        plugin_path = Path(__file__).resolve().parents[1] / 'plugins/kanban-owner/__init__.py'
+        spec = importlib.util.spec_from_file_location('non_kanban_fixture', plugin_path)
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        with mock.patch('bridge.runtime.require_compatible_runtime'), \
+             mock.patch.object(module, 'load_config', return_value=self.config()), \
+             mock.patch.object(module.WorkerIdentity, 'from_env', return_value=None), \
+             mock.patch('bridge.execution.ExecutionBindings.register') as bind:
+            module.register(mock.Mock())
+        bind.assert_not_called()
+
 
 if __name__ == "__main__":
     unittest.main()

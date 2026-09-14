@@ -13,7 +13,7 @@ PM은 native 호출 ID에 연결된 실제 cwd, 카드 범위, scanner 설명을
 
 terminal 결과의 `approval_policy.reason/guidance/details`가 근거 부족, 카드 범위 위반, 사람 거절, 인프라 실패를 구분한다. source/handler 등록을 실제 handler 실행과 혼동하거나, 시험의 성공을 시험 실행 승인의 전제 조건으로 요구하지 않는다. PM 판단을 위한 긴 요청과 영구 삭제의 사람 표시 조건도 분리했다.
 
-110개 격리 테스트와 실제 work-pm 모델을 포함한 별도 프로세스의 native 승인 경로로 검증했다. [원인·근거·검증 범위](APPROVAL-ROOT-CAUSE-V4.md), [현재 설치 상태](INSTALLATION.md)를 참조한다. 실제 업무 명령과 사람 클릭까지 검증했다는 뜻은 아니다.
+111개 격리 테스트와 실제 work-pm 모델을 포함한 별도 프로세스의 native 승인 경로로 검증했다. [원인·근거·검증 범위](APPROVAL-ROOT-CAUSE-V4.md), [현재 설치 상태](INSTALLATION.md)를 참조한다. 실제 업무 명령과 사람 클릭까지 검증했다는 뜻은 아니다.
 
 ## V3에서 유지한 권한 경계
 

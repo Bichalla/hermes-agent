@@ -63,7 +63,7 @@ V3의 93개 테스트와 doctor `ready=true`를 정상 개발 경로가 해결�
 
 ## 최종 검증
 
-격리 HOME/DB/socket의 기능 테스트 **110개 통과**. 실제 native dispatcher/middleware/hook/socket/PM 경로 뒤에 임시 workspace에서 무해한 Python 프로세스가 파일을 생성하는 테스트도 포함한다. 긴 scanner 설명, 서로 다른 call ID, 취소·재할당·카드 변경·소스 변경·잘못된 응답·hard-delete·soft-delete 경계를 확인했다. AST 검사와 `git diff --check` 통과. 전용 Ruff/Mypy/Pyright는 환경에 설치돼 있지 않아 실행하지 않았으며 새 도구를 설치하지 않았다.
+격리 HOME/DB/socket의 기능 테스트 **111개 통과**. 실제 native dispatcher/middleware/hook/socket/PM 경로 뒤에 임시 workspace에서 무해한 Python 프로세스가 파일을 생성하는 테스트도 포함한다. 긴 scanner 설명, 서로 다른 call ID, 취소·재할당·카드 변경·소스 변경·잘못된 응답·hard-delete·soft-delete 경계를 확인했다. AST 검사와 `git diff --check` 통과. 전용 Ruff/Mypy/Pyright는 환경에 설치돼 있지 않아 실행하지 않았으며 새 도구를 설치하지 않았다.
 
 별도 검증에서는 실제 work-pm native 모델과 **별도 프로세스의 격리 worker**를 사용했다. 원래 명령·cwd·카드 범위와 실제 scanner 설명을 승인 경로로 전달했다. 해당 명령의 실행 단계는 guard 결과 반환으로 대체했다. 실제 업무 명령을 실행하거나 운영 DB에 테스트 실행권을 만들지 않았다.
 

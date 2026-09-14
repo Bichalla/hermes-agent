@@ -27,7 +27,8 @@ def register(ctx) -> None:
     identity = WorkerIdentity.from_env()
     from bridge.execution import ExecutionBindings
     bindings = ExecutionBindings()
-    bindings.register(ctx)
+    if identity is not None:
+        bindings.register(ctx)
     socket_path = bridge_config.socket_path
     timeout_seconds = float(bridge_config.max_timeout)
 

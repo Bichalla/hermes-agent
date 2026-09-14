@@ -2,15 +2,17 @@
 
 ## V4: 실행 정보·소스 조사·거절 사유 연결
 
-현재 V4 코드와 검증은 완료됐으며 운영 Gateway의 보호된 재로딩 전이다. 아래 V3 활성화 이력은 V4 로딩을 의미하지 않는다.
+**V4 운영 활성화 완료.** running 카드가 없음을 확인한 뒤 기존 보호 관리자의 정상 restart가 `status: activated`를 반환했다. default와 work-pm Gateway가 모두 전환됐다.
 
 - 추가 코어 변경 없음. 활성 코어는 `01896472311e6111284b8a8063e2a293f8a6af73` 그대로다.
 - 외부 native middleware/hook이 실제 cwd와 call ID를 요청에 연결하고, PM이 제한된 소스 조사 후 판단한다. 검토 파일 변경은 결정을 무효화한다.
 - 사람 표시 제한과 PM 전송 한도를 분리했고, terminal 결과에 이유와 구체적인 근거를 반환한다.
-- 기능 테스트 **110개 통과**, AST 검사 및 `git diff --check` 통과. 새 의존성 없음.
+- 기능 테스트 **111개 통과**, AST 검사 및 `git diff --check` 통과. 새 의존성 없음. 새 middleware는 Kanban 신원이 있는 worker에서만 등록하여 일반 foreground 세션에 영향을 주지 않는다.
 - 실제 native PM + 별도 격리 worker + 훅/소켓으로 원래 네 명령을 **실행 없이** 검토했다. preflight와 로컬 회귀 테스트는 PM 승인, runtime import는 저장 경로 격리 근거 부족, SSH는 카드 범위 위반으로 구분됐다. 사람 요청 0회.
 - 별도의 실제 native terminal 실행 fixture에서 임시 파일 생성까지 통과했다. 해당 fixture는 업무 명령을 실행하지 않는다.
 - 자세한 원인·관측·한계는 [APPROVAL-ROOT-CAUSE-V4.md](APPROVAL-ROOT-CAUSE-V4.md)에 기록했다. 기존 triage 카드 상태와 claim은 변경하지 않는다.
+- 로딩된 broker의 `work-pm-v4 / reviewer_bound=true`를 doctor로 확인했다. `runtime_compatible`, `gateway_on_candidate`, `broker_listening`, `pm_reviewer_ready`, `ready` 모두 true다. 실제 사람 승인은 검증하지 않아 `human_roundtrip_verified=false`를 유지한다.
+- V4 본체는 `e8b09de`로 외부 원격 브랜치에 push했다. 마지막 Kanban 등록 범위 보완은 다음 worker의 프로필 plugin 로딩에 적용되며, PM 모델·core·프로필 설정 변경은 없다.
 
 ## V3: 일반 판단과 사람 알림의 분리
 

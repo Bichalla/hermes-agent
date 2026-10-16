@@ -19,6 +19,7 @@ class CommunicationPolicy:
     owner_ids: frozenset[str]
     private_output_channels: frozenset[str] = frozenset()
     existing_admin_bot_ids: frozenset[str] = frozenset()
+    shared_participant_bot_ids: frozenset[str] = frozenset()
 
     @classmethod
     def from_config(cls, config):
@@ -33,18 +34,20 @@ class CommunicationPolicy:
         owners = frozenset(str(v) for v in config.get('owner_ids', []))
         private = frozenset(str(v) for v in config.get('private_output_channels', []))
         admin_bots = frozenset(str(v) for v in config.get('existing_admin_bot_ids', []))
-        ids = [*primary.values(), *routes.keys(), *routes.values(), *owners, *private, *admin_bots]
+        shared_bots = frozenset(str(v) for v in config.get('shared_participant_bot_ids', []))
+        ids = [*primary.values(), *routes.keys(), *routes.values(), *owners, *private, *admin_bots, *shared_bots]
         if enabled and (set(primary) != {'personal', 'work', 'development'}
                         or len(set(primary.values())) != 3
                         or any(not value.isdecimal() for value in ids)):
             raise CommunicationPolicyError('communication requires three distinct numeric primary channel IDs')
-        return cls(enabled, primary, routes, owners, private, admin_bots)
+        return cls(enabled, primary, routes, owners, private, admin_bots, shared_bots)
 
     def as_config(self):
         return dict(enabled=self.enabled, primary_channels=dict(self.primary_channels),
                     routes=dict(self.routes), owner_ids=sorted(self.owner_ids),
                     private_output_channels=sorted(self.private_output_channels),
-                    existing_admin_bot_ids=sorted(self.existing_admin_bot_ids))
+                    existing_admin_bot_ids=sorted(self.existing_admin_bot_ids),
+                    shared_participant_bot_ids=sorted(self.shared_participant_bot_ids))
 
     def accepts_input(self, channel_id, parent_id=None):
         return (not self.enabled or str(channel_id) in self.primary_channels.values()
@@ -85,13 +88,46 @@ async def _surface(client, channel):
     return channel
 
 
+async def _fresh_member_roles(client, guild_id, role_ids, owner_id):
+    """Read one complete raw REST page; a full page reaches the 1000-member HOLD cap.
+
+    discord.py Guild.fetch_members uses HTTPClient.get_members(id, 1000, after)
+    and treats a short page as terminal. Raw IDs avoid Member.roles' guild cache.
+    No cached members, approximate counts, or truncated pagination prove readers.
+    """
+    try:
+        data = await client.http.get_members(int(guild_id), 1000, None)
+    except Exception as exc:
+        raise CommunicationPolicyError('fresh complete member evidence unavailable') from exc
+    if not isinstance(data, list) or not data or len(data) >= 1000:
+        raise CommunicationPolicyError('complete member evidence exceeds cap or is unavailable')
+    members = {}
+    for raw in data:
+        user = raw.get('user') if isinstance(raw, dict) else None
+        roles = raw.get('roles') if isinstance(raw, dict) else None
+        if not isinstance(user, dict) or not isinstance(roles, list):
+            raise CommunicationPolicyError('incomplete raw member evidence')
+        uid = str(user.get('id', ''))
+        member_roles = frozenset(str(rid) for rid in roles)
+        if not uid.isdecimal() or uid in members or not member_roles <= role_ids:
+            raise CommunicationPolicyError('stale or ambiguous raw member role evidence')
+        members[uid] = (member_roles, user.get('bot') is True)
+    if str(owner_id) not in members:
+        raise CommunicationPolicyError('owner absent from complete member evidence')
+    return members
+
+
 async def _restricted_reader_scope(client, channel, policy):
     """Prove owner/sender readers plus explicitly recorded, current guild admin bots.
 
-    Existing admin bot IDs grant no permissions: every call requires fresh REST roles,
-    managed=True, the matching bot tag and administrator=True. Such bots already bypass
-    every channel ACL in this guild. Ordinary roles/member grants never inherit this
-    exception from a raw configuration entry or a cached member list.
+    Existing admin bot IDs grant no permissions: every call requires fresh managed
+    bot identity tags plus administrator evidence. A managed admin role proves it
+    directly; a shared guild Admin role additionally needs complete fresh raw member
+    role IDs. Unmanaged reader roles require proof that all actual holders are already
+    allowed. No cached members or permission names prove these facts. User-approved
+    shared participants need current managed bot tags and are admitted only on the
+    three primary text surfaces, including the parent of a public child thread.
+    This opt-in does not authorize those bots on private output channels or in voice.
     """
     guild_id = getattr(getattr(channel, 'guild', None), 'id', None)
     bot_id = str(getattr(getattr(client, 'user', None), 'id', ''))
@@ -106,7 +142,7 @@ async def _restricted_reader_scope(client, channel, policy):
     view = 1 << 10
     default_allow, default_deny = overwrite_by_role.get(int(guild_id), (0, 0))
     default_role = next((r for r in roles if int(r.id) == int(guild_id)), None)
-    if default_role is None:
+    if default_role is None or getattr(default_role.permissions, 'administrator', False):
         return False
     everyone_view = bool(getattr(default_role.permissions, 'view_channel', False))
     everyone_view = (everyone_view and not default_deny & view) or bool(default_allow & view)
@@ -127,14 +163,40 @@ async def _restricted_reader_scope(client, channel, policy):
         if managed_bot_id(role) in policy.existing_admin_bot_ids
         and getattr(role.permissions, 'administrator', False) is True
     }
-    if policy.existing_admin_bot_ids - verified_admin_bots:
-        return False  # Revoked/missing/wrong-tag evidence does not become a member allowlist.
-    allowed_bot_ids = verified_admin_bots | {bot_id}
+    identity_roles = {}
+    for role in roles:
+        identity = managed_bot_id(role)
+        if identity:
+            identity_roles.setdefault(identity, set()).add(str(role.id))
+    members = None
+    unresolved_admin_bots = policy.existing_admin_bot_ids - verified_admin_bots
+    if unresolved_admin_bots:
+        if not unresolved_admin_bots <= identity_roles.keys():
+            return False
+        members = await _fresh_member_roles(client, guild_id, {str(rid) for rid in role_ids}, guild.owner_id)
+        roles_by_id = {str(role.id): role for role in roles}
+        for uid in unresolved_admin_bots:
+            member_roles, is_bot = members.get(uid, (frozenset(), False))
+            if (not is_bot or not member_roles & identity_roles[uid]
+                    or not any(getattr(roles_by_id[rid].permissions, 'administrator', False)
+                               for rid in member_roles)):
+                return False
+        verified_admin_bots |= unresolved_admin_bots
+    shared_surface = (str(getattr(channel, 'id', '')) in policy.primary_channels.values()
+                      and _kind(channel) == 0)
+    verified_shared_bots = {
+        managed_bot_id(role) for role in roles
+        if shared_surface and managed_bot_id(role) in policy.shared_participant_bot_ids
+    }
+    if shared_surface and policy.shared_participant_bot_ids - verified_shared_bots:
+        return False
+    allowed_bot_ids = verified_admin_bots | verified_shared_bots | {bot_id}
     everyone_base_view = bool(getattr(default_role.permissions, 'view_channel', False))
+    reader_roles_needing_members = set()
     for role in roles:
         trusted_bot_role = managed_bot_id(role) in allowed_bot_ids
         if getattr(role.permissions, 'administrator', False) and not trusted_bot_role:
-            return False
+            reader_roles_needing_members.add(str(role.id))
         # Discord ORs guild role base permissions, then applies @everyone overwrite,
         # aggregate role denies and aggregate role allows. Testing every non-bot role
         # plus rejecting every effective role allow proves no combination adds VIEW.
@@ -143,10 +205,23 @@ async def _restricted_reader_scope(client, channel, policy):
         allow, deny = overwrite_by_role.get(int(role.id), (0, 0))
         effective_view = (after_everyone and not deny & view) or bool(allow & view)
         if effective_view and not trusted_bot_role:
-            return False
+            reader_roles_needing_members.add(str(role.id))
     allowed_members = policy.owner_ids | allowed_bot_ids
-    return not any(kind == 1 and allow & view and str(oid) not in allowed_members
-                   for oid, kind, allow, _ in entries)
+    if any(kind == 1 and allow & view and str(oid) not in allowed_members
+           for oid, kind, allow, _ in entries):
+        return False
+    if reader_roles_needing_members:
+        if members is None:
+            members = await _fresh_member_roles(client, guild_id, {str(rid) for rid in role_ids}, guild.owner_id)
+        for uid in allowed_bot_ids:
+            member_roles, is_bot = members.get(uid, (frozenset(), False))
+            if not is_bot or not member_roles & identity_roles.get(uid, set()):
+                return False
+        for rid in reader_roles_needing_members:
+            if any(uid not in allowed_members and rid in member_roles
+                   for uid, (member_roles, _) in members.items()):
+                return False
+    return True
 
 
 
@@ -155,7 +230,8 @@ async def resolve_discord_delivery(client, policy, chat_id, metadata=None, *, ed
 
     ``communication_source_channel_id`` is an existing trusted source boundary, not a
     user/role allowlist. Direct destinations require verified restricted readers; optional
-    existing admin bots must have current managed administrator roles in this guild.
+    existing admin bots must have current managed identity and administrator evidence
+    in this guild; shared roles additionally require complete fresh raw membership.
     A relocated edit is rejected: message IDs cannot be transplanted between channels.
     """
     metadata = metadata or {}
@@ -228,4 +304,7 @@ async def verify_discord_voice_audience(client, policy, voice_channel_id, source
     if (not policy.accepts_input(source_id, getattr(source, 'parent_id', None))
             and _acl(boundary) == _acl(voice)):
         return True
-    return await _restricted_reader_scope(client, voice, policy)
+    try:
+        return await _restricted_reader_scope(client, voice, policy)
+    except CommunicationPolicyError:
+        return False  # Incomplete membership evidence never authorizes voice playback.

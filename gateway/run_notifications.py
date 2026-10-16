@@ -285,6 +285,7 @@ class GatewayNotificationsMixin:
                 else self._thread_metadata_for_source(event.source, self._reply_anchor_for_event(event))
             )
             chat_id = event.source.chat_id
+            turn_status = getattr(event, "_turn_status", None)
             # Images go out as one batch (e.g. Signal's multi-attachment RPC) unless [[as_document]].
             def _is_photo(media_path: str, is_voice: bool) -> bool:
                 ext = Path(media_path).suffix.lower()
@@ -295,20 +296,28 @@ class GatewayNotificationsMixin:
             if image_paths:
                 try:
                     images = [(f"file://{_quote(p)}", "") for p in image_paths]
-                    await adapter.send_multiple_images(chat_id=chat_id, images=images, metadata=_thread_meta)
+                    operation = lambda: adapter.send_multiple_images(chat_id=chat_id, images=images, metadata=_thread_meta)
+                    if turn_status is not None:
+                        await turn_status.send_result(operation, role="attachments")
+                    else:
+                        await operation()
                 except Exception as e:
                     logger.warning("[%s] Post-stream image batch delivery failed: %s", adapter.name, e)
             for media_path, is_voice in non_image_media:
                 try:
                     ext = Path(media_path).suffix.lower()
                     if should_send_media_as_audio(event.source.platform, ext, is_voice=is_voice):
-                        await adapter.send_voice(
+                        operation = lambda: adapter.send_voice(
                             chat_id=chat_id, audio_path=media_path, metadata=_thread_meta, is_voice=is_voice,
                         )
                     elif ext in _VIDEO_EXTS:
-                        await adapter.send_video(chat_id=chat_id, video_path=media_path, metadata=_thread_meta)
+                        operation = lambda: adapter.send_video(chat_id=chat_id, video_path=media_path, metadata=_thread_meta)
                     else:
-                        await adapter.send_document(chat_id=chat_id, file_path=media_path, metadata=_thread_meta)
+                        operation = lambda: adapter.send_document(chat_id=chat_id, file_path=media_path, metadata=_thread_meta)
+                    if turn_status is not None:
+                        await turn_status.send_result(operation, role="attachments")
+                    else:
+                        await operation()
                 except Exception as e:
                     logger.warning("[%s] Post-stream media delivery failed: %s", adapter.name, e)
 
@@ -318,6 +327,7 @@ class GatewayNotificationsMixin:
         metadata: Optional[Dict[str, Any]] = None, event_message_id: Optional[str] = None,
         text_already_delivered: bool = False, deliver_media: bool = True, stream_consumer=None,
         session_key: Optional[str] = None, inbound_message_id: Optional[str] = None,
+        turn_status=None,
     ) -> None:
         """Deliver a queued response using the normal text+attachment split.
 
@@ -326,6 +336,8 @@ class GatewayNotificationsMixin:
         ``event_message_id`` reply anchor); see ``_send_queued_final_text``. Without a key the send
         stays unledgered."""
         from gateway.run import _strip_response_attachments_for_direct_send
+        if turn_status is not None:
+            await turn_status.before_result(response)
         if not text_already_delivered:
             text_content = _strip_response_attachments_for_direct_send(response, adapter)
             if text_content:
@@ -366,20 +378,27 @@ class GatewayNotificationsMixin:
                 if not _reconciled:
                     await self._send_queued_final_text(
                         adapter, source, text_content, metadata, event_message_id, session_key,
-                        inbound_message_id)
+                        inbound_message_id, **({"turn_status": turn_status} if turn_status is not None else {}))
         # Failed turns deliver their (normalized failure) text but must not upload attachments as if
         # they succeeded — mirrors the ``not agent_result.get("failed")`` completed-turn guard.
         if not deliver_media:
+            if turn_status is not None:
+                await turn_status.finish_delivery()
             return
+        media_event = MessageEvent(text="", source=source, message_id=event_message_id)
+        if turn_status is not None:
+            media_event._turn_status = turn_status
         await self._deliver_media_from_response(
-            response, MessageEvent(text="", source=source, message_id=event_message_id), adapter,
-            thread_metadata=metadata,
+            response, media_event, adapter, thread_metadata=metadata,
         )
+        if turn_status is not None:
+            await turn_status.finish_delivery()
 
     async def _send_queued_final_text(
         self, adapter, source: SessionSource, text_content: str, metadata: Optional[Dict[str, Any]],
         event_message_id: Optional[str], session_key: Optional[str],
         inbound_message_id: Optional[str] = None,
+        turn_status=None,
     ):
         """Send a queued-lane final through the same ledger bracket as the normal final
         (``send_final_ledgered``). This lane used to call ``adapter.send`` bare and discard the
@@ -389,7 +408,10 @@ class GatewayNotificationsMixin:
         (Telegram forum topics, Slack reaction handoffs) and so cannot identify the turn; with no
         inbound id the ledger falls back to the event's own (empty) message id. Adapters without
         the base contract and sends without a session key keep the plain send."""
-        if session_key and isinstance(adapter, BasePlatformAdapter):
+        if turn_status is not None:
+            result = await turn_status.send_result(lambda: adapter.send(
+                source.chat_id, text_content, metadata=_mark_notify_metadata(metadata), reply_to=event_message_id))
+        elif session_key and isinstance(adapter, BasePlatformAdapter):
             result, _ = await adapter.send_final_ledgered(
                 MessageEvent(text="", source=source, ledger_message_id=inbound_message_id),
                 session_key, text_content, _mark_notify_metadata(metadata), reply_to=event_message_id)

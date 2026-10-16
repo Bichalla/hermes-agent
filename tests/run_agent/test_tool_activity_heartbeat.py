@@ -110,10 +110,13 @@ def test_heartbeat_touches_periodically_and_stops():
 
     touches: list = []
     stop = threading.Event()
+    periodic_touches = threading.Event()
 
     class _Agent:
         def _touch_activity(self, desc):
             touches.append(desc)
+            if len(touches) >= 2:
+                periodic_touches.set()
 
     thread = threading.Thread(
         target=te._run_tool_activity_heartbeat,
@@ -122,9 +125,13 @@ def test_heartbeat_touches_periodically_and_stops():
         daemon=True,
     )
     thread.start()
-    time.sleep(0.12)
-    stop.set()
-    thread.join(timeout=1.0)
+    try:
+        # Scheduler delays may coalesce 50ms ticks; wait for the behavior,
+        # with a real failure ceiling, rather than assuming a quiet 120ms.
+        assert periodic_touches.wait(2.0), f"expected periodic touches, got {len(touches)}"
+    finally:
+        stop.set()
+        thread.join(timeout=2.0)
 
     assert not thread.is_alive(), "heartbeat thread did not exit on stop"
     assert len(touches) >= 2, f"expected periodic touches, got {len(touches)}"
@@ -149,7 +156,18 @@ def test_slow_tool_call_refreshes_activity_during_execution(monkeypatch):
         before_call=lambda name, args: MagicMock(allows_execution=True)
     )
     touches: list = []
-    agent._touch_activity = lambda desc: touches.append(time.time())
+    mid_call_touches = threading.Event()
+    def touch(desc):
+        touches.append(time.time())
+        if len(touches) >= 3 and touches[-1] - touches[0] >= 0.15:
+            mid_call_touches.set()
+    agent._touch_activity = touch
+
+    def slow_execute(_args):
+        # The tool stays in flight until periodic activity is observable.
+        # A missing heartbeat still fails after this bounded 2s wait.
+        assert mid_call_touches.wait(2.0), f"expected mid-call heartbeats, got {len(touches)}"
+        return json.dumps({"ok": True})
 
     result = te._run_agent_tool_execution_middleware(
         agent,
@@ -157,7 +175,7 @@ def test_slow_tool_call_refreshes_activity_during_execution(monkeypatch):
         function_args={"command": "true"},
         effective_task_id="task",
         tool_call_id="tc1",
-        execute=_slow_execute(delay=0.25),
+        execute=slow_execute,
         display_index=1,
     )
 

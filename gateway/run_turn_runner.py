@@ -51,6 +51,7 @@ class TurnRunner:
     def __init__(self, runner: "GatewayRunner", ctx: TurnContext) -> None:
         self._runner = runner
         self._ctx = ctx
+        self.turn_status = None
 
     # ── shared thread→loop plumbing ─────────────────────────────────────────────────────────
 
@@ -109,6 +110,10 @@ class TurnRunner:
             ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
             preview_str = f' "{preview}"' if preview else ""
             ctx.log_queue.put(f"{ts}  {tool_name}:{preview_str}".rstrip())
+        if self.turn_status is not None:
+            # Suppress chat progress only: the diagnostic log and terminal
+            # subagent-failure notice above remain live with durable cards.
+            return
         if not ctx.progress_queue or not ctx._run_still_current():
             return
         if event_type == "tool.completed" and not ctx.long_tool_hint_fired[0]:
@@ -817,6 +822,8 @@ class TurnRunner:
     def _status_callback_sync(self, event_type: str, message: str) -> None:
         from gateway.run import _prepare_gateway_status_message, _redact_gateway_user_facing_secrets, _send_or_update_status_coro
         ctx = self._ctx
+        if self.turn_status is not None:
+            return  # This protocol updates the same status card, not extra bubbles.
         if not self._status_live():
             return
         prepared = _prepare_gateway_status_message(ctx.source.platform, event_type, message)
@@ -852,6 +859,10 @@ class TurnRunner:
             scfg.enabled and scfg.transport != "off" if plat_streaming is None else bool(plat_streaming)
         )
         want_interim_messages = ctx.interim_assistant_messages_enabled
+        if self.turn_status is not None:
+            # The receipt protocol owns text delivery; streamed deltas must not
+            # race ACK/card creation or the completion-card-before-result order.
+            return None, None, None, False
         if want_stream_deltas or want_interim_messages:
             try:
                 from gateway.stream_consumer import GatewayStreamConsumer
@@ -1153,6 +1164,8 @@ class TurnRunner:
         # ALWAYS attached (never gated to None): its body gates each event class, and subagent-
         # failure notices must fire even with tool_progress/thinking off.
         agent.tool_progress_callback = ctx.progress_callback
+        # Clear on every turn as cached agents may move between opt-in settings.
+        agent.before_tool_execution = self.turn_status.before_tool_execution if self.turn_status else None
         # Discord's one-time voice ack and Slack's task cards both ride the authoritative start
         # callback, so neither infers identity from tool names.
         agent.tool_start_callback = (

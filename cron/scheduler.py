@@ -468,6 +468,9 @@ from cron.executions import (
     _TERMINAL_STATES, create_execution, finish_execution, get_execution,
     mark_execution_handoff_pending, mark_execution_running, recover_interrupted_executions)
 
+from cron.communication_transition import (
+    DefinitionDrift, bind_execution, claim_gate, record_definition_changed, settle_execution, stamp_claim)
+
 # Response marker that suppresses delivery (output is still saved locally for audit).
 SILENT_MARKER = "[SILENT]"
 
@@ -2427,10 +2430,18 @@ def run_one_job(
     # Every gateway path (built-in scheduler, external providers, and direct
     # API fires) crosses this seam.  Ensure the detached worker has a durable
     # attempt to adopt before any launch can occur.
-    if not job.get("execution_id"):
-        execution = create_execution(
-            job["id"], source="direct", scheduled_instant=job.get("_scheduled_instant"))
-        job["execution_id"] = execution["id"]
+    metadata = job.get("_communication_transition") or {}
+    admission_id = (metadata.get("admission_id")
+                    or (job.get("fire_claim") or {}).get("by") or job.get("execution_id"))
+    with claim_gate(admission_id) as allowed:
+        if not allowed:
+            return False
+        if not job.get("execution_id"):
+            execution = create_execution(
+                job["id"], source="direct", scheduled_instant=job.get("_scheduled_instant"))
+            job["execution_id"] = execution["id"]
+        job.update(stamp_claim(job, admission_id=admission_id or job["execution_id"]))
+        bind_execution(job)
 
     execution_id = str(job["execution_id"])
     external_owner = os.environ.get("_HERMES_CRON_EXTERNAL_WORKER") == execution_id
@@ -2488,6 +2499,7 @@ def run_one_job(
                 executions.pop(execution_token, None)
                 if not executions:
                     _running_fire_owners.pop(job["id"], None)
+        settle_execution(job)
 
 
 _OWNERSHIP_LOST_INTERRUPTED = "Interrupted by shutdown before terminal completion."
@@ -3541,15 +3553,29 @@ def _sweep_mcp_orphans() -> None:
 def _process_due_job(job: dict, adapters, loop, verbose: bool) -> bool:
     """Run one due job via the shared ``run_one_job`` body."""
     # Claim only when the worker actually starts, so a queued lease can't expire first.
-    claimed = claim_job_for_fire(job["id"], return_job=True)
-    if not claimed:
-        finish_execution(
-            job["execution_id"], success=False, error="Fire claim lost; execution was not started.")
-        return True
-    # CAS returns the persisted record; bool fallback only for older test doubles.
-    claimed_job = dict(claimed) if isinstance(claimed, dict) else dict(job)
-    claimed_job["execution_id"] = job["execution_id"]
-    claimed_job["_scheduled_instant"] = job.get("_scheduled_instant")
+    with claim_gate(job["execution_id"]) as allowed:
+        if not allowed:
+            return False
+        try:
+            claimed = claim_job_for_fire(
+                job["id"], return_job=True,
+                expected_definition_hash=job["_communication_transition"]["definition_hash"])
+        except DefinitionDrift as drift:
+            record_definition_changed(job, drift.observed_hash)
+            finish_execution(job["execution_id"], success=False, error=str(drift),
+                             delivery_outcome="suppressed")
+            settle_execution(job)
+            return False
+        if not claimed:
+            finish_execution(
+                job["execution_id"], success=False, error="Fire claim lost; execution was not started.")
+            return True
+        # The submitted execution already owns a fixed destination and generation.
+        claimed_job = dict(claimed) if isinstance(claimed, dict) else dict(job)
+        claimed_job["execution_id"] = job["execution_id"]
+        claimed_job["_scheduled_instant"] = job.get("_scheduled_instant")
+        claimed_job["_communication_transition"] = job["_communication_transition"]
+        bind_execution(claimed_job)
     return run_one_job(claimed_job, adapters=adapters, loop=loop, verbose=verbose)
 
 
@@ -3605,7 +3631,9 @@ def _submit_with_guard(job: dict, pool: concurrent.futures.ThreadPoolExecutor, p
     try:
         execution = create_execution(
             job_id, source="builtin", scheduled_instant=job.get("_scheduled_instant"))
-        dispatched_job = dict(job, execution_id=execution["id"])
+        dispatched_job = stamp_claim(dict(job, execution_id=execution["id"]),
+                                     admission_id=execution["id"])
+        bind_execution(dispatched_job)
         _ctx = contextvars.copy_context()
     except Exception as execution_err:
         # Release the claim so the next tick retries instead of wedging "already running".
@@ -3693,58 +3721,61 @@ def tick(
             logger.debug("Cron dispatch paused while gateway drains existing work")
             return 0
 
-        _maybe_reap_dead_owners()
-        # Periodic worktree GC (6h, threaded) — the only sweep gateway-only boxes get.
-        try:
-            _maybe_run_worktree_maintenance()
-        except Exception as _wt_exc:
-            logger.debug("Worktree maintenance dispatch failed: %s", _wt_exc)
+        with claim_gate() as allowed:
+            if not allowed:
+                return 0
+            _maybe_reap_dead_owners()
+            # Periodic worktree GC (6h, threaded) — the only sweep gateway-only boxes get.
+            try:
+                _maybe_run_worktree_maintenance()
+            except Exception as _wt_exc:
+                logger.debug("Worktree maintenance dispatch failed: %s", _wt_exc)
 
-        due_jobs = get_due_jobs()
-        _sweep_stale_inflight_for_tick(due_jobs)
+            due_jobs = get_due_jobs()
+            _sweep_stale_inflight_for_tick(due_jobs)
 
-        if not due_jobs:
-            # Idle tick: skip config load + pool setup, but still reap crashed jobs' MCP orphans.
+            if not due_jobs:
+                # Idle tick: skip config load + pool setup, but still reap crashed jobs' MCP orphans.
+                if verbose:
+                    # Idle tick: skip config load + pool partitioning entirely (#33612 — the gateway ticker
+                    # calls tick(verbose=False) every 60s, so idle ticks previously fell through to
+                    # load_config()). Still run the post-tick MCP orphan sweep: main intentionally sweeps on
+                    # idle ticks so orphaned stdio children from crashed jobs are reaped even when nothing is
+                    # due.
+                    logger.info("%s - No jobs due", _hermes_now().strftime('%H:%M:%S'))
+                _sweep_mcp_orphans()
+                return 0
+
             if verbose:
-                # Idle tick: skip config load + pool partitioning entirely (#33612 — the gateway ticker
-                # calls tick(verbose=False) every 60s, so idle ticks previously fell through to
-                # load_config()). Still run the post-tick MCP orphan sweep: main intentionally sweeps on
-                # idle ticks so orphaned stdio children from crashed jobs are reaped even when nothing is
-                # due.
-                logger.info("%s - No jobs due", _hermes_now().strftime('%H:%M:%S'))
-            _sweep_mcp_orphans()
-            return 0
+                logger.info("%s - %s job(s) due", _hermes_now().strftime('%H:%M:%S'), len(due_jobs))
 
-        if verbose:
-            logger.info("%s - %s job(s) due", _hermes_now().strftime('%H:%M:%S'), len(due_jobs))
+            # Advance next_run_at for recurring jobs FIRST, under the lock, before any execution
+            # (at-most-once). Re-advancing running jobs keeps the grace window alive; mark_job_run
+            # overwrites it on completion. Composes with the claim-time advance in claim_job_for_fire.
+            advance_next_runs([job["id"] for job in due_jobs])
 
-        # Advance next_run_at for recurring jobs FIRST, under the lock, before any execution
-        # (at-most-once). Re-advancing running jobs keeps the grace window alive; mark_job_run
-        # overwrites it on completion. Composes with the claim-time advance in claim_job_for_fire.
-        advance_next_runs([job["id"] for job in due_jobs])
+            _max_workers = _resolve_max_parallel_workers()
+            if verbose:
+                logger.info(
+                    "Running %d job(s) in parallel (max_workers=%s)",
+                    len(due_jobs),
+                    _max_workers if _max_workers else "unbounded")
 
-        _max_workers = _resolve_max_parallel_workers()
-        if verbose:
-            logger.info(
-                "Running %d job(s) in parallel (max_workers=%s)",
-                len(due_jobs),
-                _max_workers if _max_workers else "unbounded")
+            def _process_job(job: dict) -> bool:
+                return _process_due_job(job, adapters, loop, verbose)
 
-        def _process_job(job: dict) -> bool:
-            return _process_due_job(job, adapters, loop, verbose)
-
-        # Persistent pool, non-blocking dispatch. Already-running jobs are skipped; mark_job_run
-        # re-arms next_run_at on completion, so no catch-up queue is needed.
-        _results: list = []
-        _all_futures: list = []
-        pool = _get_parallel_pool(_max_workers)
-        for job in due_jobs:
-            fut = _submit_with_guard(job, pool, _process_job)
-            if fut is None:
-                continue
-            _all_futures.append(fut)
-            if not sync:
-                _results.append(True)  # optimistically counted
+            # Persistent pool, non-blocking dispatch. Already-running jobs are skipped; mark_job_run
+            # re-arms next_run_at on completion, so no catch-up queue is needed.
+            _results: list = []
+            _all_futures: list = []
+            pool = _get_parallel_pool(_max_workers)
+            for job in due_jobs:
+                fut = _submit_with_guard(job, pool, _process_job)
+                if fut is None:
+                    continue
+                _all_futures.append(fut)
+                if not sync:
+                    _results.append(True)  # optimistically counted
 
         if sync:
             for f in concurrent.futures.as_completed(_all_futures):

@@ -356,9 +356,20 @@ class GatewayVoiceMixin:
         guild_id = self._get_guild_id(event)
         play = getattr(adapter, "play_in_voice_channel", None)
         is_in_vc = getattr(adapter, "is_in_voice_channel", None)
-        if guild_id and callable(play) and callable(is_in_vc) and is_in_vc(guild_id):
+        turn_status = getattr(event, "_turn_status", None)
+        extra = getattr(getattr(adapter, "config", None), "extra", None)
+        communication = extra.get("communication", {}) if isinstance(extra, dict) else {}
+        guarded_voice = (event.source.platform == Platform.DISCORD and isinstance(communication, dict)
+                         and communication.get("enabled") is True)
+        # A joined guild VC does not prove the readers of this text request can
+        # hear that VC. Keep voice output as an attachment on the adapter's
+        # freshly authorized text surface when communication routing is enabled.
+        if not guarded_voice and guild_id and callable(play) and callable(is_in_vc) and is_in_vc(guild_id):
             for path in audio_paths:
-                await play(guild_id, path)
+                if turn_status is not None:
+                    await turn_status.send_result(lambda: play(guild_id, path), role="tts")
+                else:
+                    await play(guild_id, path)
             return
         if not callable(send_voice := getattr(adapter, "send_voice", None)):
             return
@@ -367,6 +378,12 @@ class GatewayVoiceMixin:
         # adapters (Telegram "important" mode) deliver it. Clone: shared w/ typing-indicator state.
         thread_meta = dict(self._thread_metadata_for_source(event.source, reply_anchor) or {})
         thread_meta["notify"] = True
+        if guarded_voice:
+            thread_meta["communication_source_channel_id"] = str(event.source.chat_id)
         for path in audio_paths:
-            await send_voice(chat_id=event.source.chat_id, audio_path=path, reply_to=reply_anchor,
-                             metadata=thread_meta)
+            operation = lambda: send_voice(chat_id=event.source.chat_id, audio_path=path, reply_to=reply_anchor,
+                                           metadata=thread_meta)
+            if turn_status is not None:
+                await turn_status.send_result(operation, role="tts")
+            else:
+                await operation()

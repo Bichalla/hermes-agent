@@ -23,13 +23,14 @@ class DiscordMediaMixin:
 
         See #66797.
         """
-        from plugins.platforms.discord.adapter import _prompt_target_id, discord
+        from plugins.platforms.discord.adapter import discord
 
         if not self._client:
             return SendResult(success=False, error="Not connected")
         if not os.path.isfile(file_path):
             return SendResult(success=False, error=f"File not found: {file_path}")
-        channel = await self._resolve_channel(_prompt_target_id(chat_id, metadata))
+        target = await self._resolve_delivery_target(chat_id, metadata)
+        channel = target.channel
         if not channel:
             return SendResult(success=False, error=f"Channel {chat_id} not found")
         filename = file_name or os.path.basename(file_path)
@@ -68,7 +69,7 @@ class DiscordMediaMixin:
     ) -> SendResult:
         """Send images as one Discord message (<=10 attachments): URLs are downloaded and uploaded
         inline (bare links don't render); on chunk failure the remainder uses the per-image loop."""
-        from plugins.platforms.discord.adapter import _prompt_target_id, _image_ext_from_content_type, _read_url_image_with_redirect_guard, is_safe_url
+        from plugins.platforms.discord.adapter import _image_ext_from_content_type, _read_url_image_with_redirect_guard, is_safe_url
 
         if not self._client:
             return SendResult(success=False, error="Not connected")
@@ -81,22 +82,27 @@ class DiscordMediaMixin:
         except Exception:  # pragma: no cover
             return await super().send_multiple_images(chat_id, images, metadata, human_delay)
         try:
-            channel = await self._resolve_channel(_prompt_target_id(chat_id, metadata))
+            target = await self._resolve_delivery_target(chat_id, metadata)
+            channel = target.channel
             if not channel:
                 logger.warning("[%s] Channel %s not found for multi-image send", self.name, chat_id)
                 return SendResult(success=False, error=f"Channel {chat_id} not found")
         except Exception as e:
             logger.warning("[%s] Failed to resolve channel for multi-image send: %s", self.name, e)
+            if self._communication_policy().enabled:
+                return SendResult(success=False, error=str(e))
             return await super().send_multiple_images(chat_id, images, metadata, human_delay)
         CHUNK = 10
         chunks = [images[i:i + CHUNK] for i in range(0, len(images), CHUNK)]
         delivered = False
+        message_ids = []
         for chunk_idx, chunk in enumerate(chunks):
             if human_delay > 0 and chunk_idx > 0:
                 await asyncio.sleep(human_delay)
             files: List[Any] = []
             captions: List[str] = []
             aiohttp_session = None
+            network_attempted = False
             try:
                 for image_url, alt_text in chunk:
                     if alt_text:
@@ -142,18 +148,35 @@ class DiscordMediaMixin:
                     "[%s] Sending %d image(s) as single Discord message (chunk %d/%d)",
                     self.name, len(files), chunk_idx + 1, len(chunks),
                 )
+                if self._communication_policy().enabled:
+                    current = await self._resolve_delivery_target(chat_id, metadata)
+                    if current.target_id != target.target_id:
+                        raise ValueError("communication destination changed during image download")
+                    channel = current.channel
+                network_attempted = True
                 if self._is_forum_parent(channel):
-                    await self._forum_post_file(
+                    result = await self._forum_post_file(
                         channel, content=(content or "").strip(), files=files,
                     )
+                    if not result.success:
+                        return result
+                    if result.message_id:
+                        message_ids.append(result.message_id)
                 else:
-                    await channel.send(content=content, files=files)
+                    sent = await channel.send(content=content, files=files)
+                    message_ids.append(str(sent.id))
                 delivered = True
             except Exception as e:
                 logger.warning(
                     "[%s] Multi-image Discord send failed (chunk %d/%d), falling back to per-image: %s",
                     self.name, chunk_idx + 1, len(chunks), e, exc_info=True,
                 )
+                if self._communication_policy().enabled:
+                    return SendResult(success=False, message_id=message_ids[0] if message_ids else None,
+                                      error="delivery_unknown" if network_attempted else str(e), raw_response={
+                        "message_ids": message_ids, "delivery_state": "partial" if message_ids else ("unknown" if network_attempted else "not_sent"),
+                        "uncertain": network_attempted, "target_id": str(channel.id),
+                    })
                 fallback = await super().send_multiple_images(chat_id, chunk, metadata, human_delay=human_delay)
                 delivered = delivered or fallback.success
             finally:
@@ -170,16 +193,19 @@ class DiscordMediaMixin:
         reply_to: Optional[str] = None, metadata: Optional[Dict[str, Any]] = None, **kwargs,
     ) -> SendResult:
         """Send audio as a Discord file attachment."""
-        from plugins.platforms.discord.adapter import _prompt_target_id, discord
+        from plugins.platforms.discord.adapter import discord
 
         try:
             import io
-            channel = await self._resolve_channel(_prompt_target_id(chat_id, metadata))
+            target = await self._resolve_delivery_target(chat_id, metadata)
+            channel = target.channel
             if not channel:
                 return SendResult(success=False, error=f"Channel {chat_id} not found")
             if not os.path.exists(audio_path):
                 return SendResult(success=False, error=f"Audio file not found: {audio_path}")
             filename = os.path.basename(audio_path)
+            if target.moved:
+                reply_to = None
             reference = self._reply_reference_for_send(reply_to, channel)
             with open(audio_path, "rb") as f:
                 file_data = f.read()
@@ -213,15 +239,24 @@ class DiscordMediaMixin:
                         "content_type": "audio/ogg",
                     },
                 ]
+                if self._communication_policy().enabled:
+                    await self._resolve_delivery_target(chat_id, metadata)
                 msg_data = await self._client.http.request(
                     discord.http.Route("POST", "/channels/{channel_id}/messages", channel_id=channel.id),
                     form=form,
                 )
                 return SendResult(success=True, message_id=str(msg_data["id"]))
             except Exception as voice_err:
+                if isinstance(voice_err, (TimeoutError, ConnectionError, OSError)):
+                    return SendResult(success=False, error="delivery_unknown", raw_response={
+                        "message_ids": [], "delivery_state": "unknown", "uncertain": True,
+                        "target_id": str(channel.id),
+                    })
                 logger.debug("Voice message flag failed, falling back to file: %s", voice_err)
                 file = discord.File(io.BytesIO(file_data), filename=filename)
                 try:
+                    if self._communication_policy().enabled:
+                        await self._resolve_delivery_target(chat_id, metadata)
                     msg = await channel.send(file=file, reference=reference)
                 except Exception as send_err:
                     if reference is not None and self._is_reply_reference_rejected(send_err):
@@ -262,7 +297,7 @@ class DiscordMediaMixin:
     ) -> SendResult:
         """Download ``url`` and post it as a native attachment (Discord renders those inline).
         ``fallback(metadata)`` is the base-adapter URL send (``error_metadata`` after download failure)."""
-        from plugins.platforms.discord.adapter import _prompt_target_id, _read_url_image_with_redirect_guard, discord, is_safe_url
+        from plugins.platforms.discord.adapter import _read_url_image_with_redirect_guard, discord, is_safe_url
 
         if not self._client:
             return SendResult(success=False, error="Not connected")
@@ -271,7 +306,8 @@ class DiscordMediaMixin:
             return await fallback(metadata)
         try:
             import aiohttp
-            channel = await self._resolve_channel(_prompt_target_id(chat_id, metadata))
+            target = await self._resolve_delivery_target(chat_id, metadata)
+            channel = target.channel
             if not channel:
                 return SendResult(success=False, error=f"Channel {chat_id} not found")
             from gateway.platforms.base import resolve_proxy_url, proxy_kwargs_for_aiohttp
@@ -284,6 +320,11 @@ class DiscordMediaMixin:
                     raise Exception(f"Failed to download {kind}: HTTP {status}")
                 import io
                 file = discord.File(io.BytesIO(data), filename=filename_for(headers))
+                if self._communication_policy().enabled:
+                    current = await self._resolve_delivery_target(chat_id, metadata)
+                    if current.target_id != target.target_id:
+                        raise ValueError("communication destination changed during media download")
+                    channel = current.channel
                 if self._is_forum_parent(channel):
                     return await self._forum_post_file(channel, content=(caption or "").strip(), file=file)
                 msg = await channel.send(content=caption if caption else None, file=file)
@@ -293,6 +334,8 @@ class DiscordMediaMixin:
             return await fallback(error_metadata)
         except Exception as e:  # pragma: no cover - defensive logging
             logger.error("[%s] Failed to send %s attachment, falling back to URL: %s", self.name, kind, e, exc_info=True)
+            if self._communication_policy().enabled:
+                return SendResult(success=False, error=str(e))
             return await fallback(error_metadata)
 
 
@@ -301,7 +344,7 @@ class DiscordMediaMixin:
         reply_to: Optional[str] = None, metadata: Optional[Dict[str, Any]] = None,
     ) -> SendResult:
         """Send an image natively as a Discord file attachment."""
-        from plugins.platforms.discord.adapter import _prompt_target_id, _image_ext_from_content_type
+        from plugins.platforms.discord.adapter import _image_ext_from_content_type
 
         return await self._send_url_media(
             chat_id, image_url, caption, kind="image",

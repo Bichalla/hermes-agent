@@ -8,11 +8,15 @@ single-element lists so mutation stays visible to the outer body.
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import Any, Callable, List, Optional
+from typing import TYPE_CHECKING, Any, Callable, List, Optional
 
 
 @dataclass
 class TurnContext:
+    if TYPE_CHECKING:
+        # Runtime-only delivery owner: never a dataclass/wire field.
+        _turn_status: Any
+
     # read-only turn identity / wiring
     source: Any = None
     _run_still_current: Callable[[], bool] = None  # type: ignore[assignment]

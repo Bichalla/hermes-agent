@@ -3174,6 +3174,11 @@ class BasePlatformAdapter(ABC):
         result = await _send(content)
         if result.success:
             return result
+        # A typed partial/unknown receipt outranks error-string retry heuristics
+        # and formatting fallback: replaying the whole payload may duplicate it.
+        receipt = result.raw_response if isinstance(result.raw_response, dict) else {}
+        if receipt.get("delivery_state") in {"partial", "unknown"}:
+            return result
         error_str = result.error or ""
         # A rate-limited / flood-capped send is transient: it should back off
         # (honoring the server's retry_after when present) rather than fall
@@ -3216,6 +3221,9 @@ class BasePlatformAdapter(ABC):
                 result = await _send(content)
                 if result.success:
                     logger.info("[%s] Send succeeded on retry %d", self.name, attempt)
+                    return result
+                receipt = result.raw_response if isinstance(result.raw_response, dict) else {}
+                if receipt.get("delivery_state") in {"partial", "unknown"}:
                     return result
                 error_str = result.error or ""
                 if result.retry_after is not None:
@@ -3808,6 +3816,14 @@ class BasePlatformAdapter(ABC):
         delivery_adapter = self._final_delivery_adapter(event.source)
         logger.info("[%s] Sending response (%d chars) to %s", delivery_adapter.name,
                     len(text_content), event.source.chat_id)
+        turn_status = getattr(event, "_turn_status", None)
+        if turn_status is not None:
+            # This opt-in protocol owns intent/receipt persistence and never
+            # replays ambiguous sends through the legacy at-least-once ledger.
+            result = await turn_status.send_result(lambda: delivery_adapter.send(
+                chat_id=event.source.chat_id, content=text_content,
+                reply_to=reply_to, metadata=metadata))
+            return result, delivery_adapter
         obligation_id = await self._record_delivery_obligation(
             event, session_key, text_content, delivery_adapter, is_ephemeral_response)
         result = await delivery_adapter._send_with_retry(
@@ -3962,12 +3978,16 @@ class BasePlatformAdapter(ABC):
     async def _process_message_background(self, event: MessageEvent, session_key: str) -> None:
         """Background task that actually processes the message."""
         delivery_attempted = delivery_succeeded = False  # feeds the processing-complete hook
+        turn_status = None
+        component = None
 
         def _record_delivery(result):
             nonlocal delivery_attempted, delivery_succeeded
             if result is not None:
                 delivery_attempted = True
                 delivery_succeeded = delivery_succeeded or bool(getattr(result, "success", False))
+                if turn_status is not None and component is not None:
+                    turn_status.record_result(result, component)
         # Reuse the interrupt event handle_message() installed; new Event only if removed externally.
         interrupt_event = self._active_sessions.get(session_key) or asyncio.Event()
         self._active_sessions[session_key] = interrupt_event
@@ -3976,6 +3996,7 @@ class BasePlatformAdapter(ABC):
         try:
             await self._run_processing_hook("on_processing_start", event)
             response = await self._message_handler(event)
+            turn_status = getattr(event, "_turn_status", None)
             is_ephemeral_response = isinstance(response, EphemeralReply)
             # Unwrap EphemeralReply for downstream text processing; TTL applies after send.
             response, _ephemeral_ttl = self._unwrap_ephemeral(response)
@@ -3987,6 +4008,8 @@ class BasePlatformAdapter(ABC):
             if not response:
                 logger.debug("[%s] Handler returned empty/None response for %s", self.name, event.source.chat_id)
             else:
+                if turn_status is not None:
+                    await turn_status.before_result(response)
                 extracted = await self._extract_response_content(
                     response, event, session_key, is_ephemeral_response=is_ephemeral_response)
                 text_content, media_files = extracted.text_content, extracted.media_files
@@ -3999,6 +4022,8 @@ class BasePlatformAdapter(ABC):
                 # TTS plays before text; generated files are removed afterwards.
                 _tts_caption_delivered = False
                 for _tts_index, _tts_path in enumerate(_tts_paths):
+                    if turn_status is not None:
+                        component = turn_status.begin_component("tts")
                     try:
                         _tts_caption_delivered |= await self._play_tts_file(
                             event, text_content, _tts_path, _tts_index == 0, _final_thread_metadata,
@@ -4009,10 +4034,13 @@ class BasePlatformAdapter(ABC):
                 if not _tts_paths and _tts_requested_path is not None:
                     with contextlib.suppress(OSError):
                         os.remove(_tts_requested_path)
+                component = None  # Text is recorded by send_final_ledgered itself.
                 if text_content and not _tts_caption_delivered:
                     await self._send_final_text(
                         event, session_key, text_content, _final_thread_metadata,
                         is_ephemeral_response, _ephemeral_ttl, _record_delivery)
+                if turn_status is not None and (extracted.media_files or extracted.local_files or extracted.images):
+                    component = turn_status.begin_component("attachments")
                 await self._deliver_attachments(
                     event, extracted, _final_thread_metadata,
                     anything_sent=delivery_attempted or _tts_caption_delivered,
@@ -4044,11 +4072,15 @@ class BasePlatformAdapter(ABC):
         except BaseException as e:
             await self._run_processing_hook("on_processing_complete", event, ProcessingOutcome.FAILURE)
             logger.error("[%s] Error handling message: %s", self.name, e, exc_info=True)
-            _thread_metadata = (await self._notify_turn_error(event, e)) or _thread_metadata
+            if turn_status is None:
+                _thread_metadata = (await self._notify_turn_error(event, e)) or _thread_metadata
             # SystemExit/KeyboardInterrupt propagate; other BaseExceptions are contained.
             if isinstance(e, (SystemExit, KeyboardInterrupt)):
                 raise
         finally:
+            if turn_status is not None:
+                with contextlib.suppress(Exception):
+                    await turn_status.finish_delivery()
             # Stop typing BEFORE the post-delivery callback: a stuck callback must not keep it
             # alive.
             await self._stop_typing_refresh(event.source.chat_id, typing_task, metadata=_thread_metadata)

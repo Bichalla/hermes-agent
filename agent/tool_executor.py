@@ -680,6 +680,24 @@ def _dispatch_authorized_once(
             block_message=block_message, block_error_type=block_error_type, guardrail_decision=guardrail_decision,
         )
 
+    # A delivery/authorization barrier is policy, not a best-effort display callback.
+    # It runs after existing permission gates and before checkpoints, delegation,
+    # inline executors, or registry dispatch. A failing barrier cannot be swallowed
+    # by _safe_callback or by the ordinary tool-error fallback.
+    barrier = getattr(agent, "before_tool_execution", None)
+    if callable(barrier):
+        try:
+            barrier(ref.call_id, ref.name, ref.args)
+        except Exception:
+            _advance_start_order()
+            state.blocked = True
+            with contextlib.suppress(Exception):
+                agent.interrupt("Pre-tool delivery confirmation failed")
+            return _blocked_tool_result(
+                agent, ref, block_message="Pre-tool delivery confirmation failed; tool was not started",
+                block_error_type="delivery_barrier", guardrail_decision=None,
+            )
+
     if ref.name == "memory":
         agent._turns_since_memory = 0
     elif ref.name == "skill_manage":

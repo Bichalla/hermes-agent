@@ -2540,7 +2540,7 @@ def _machine_id() -> str:
 
 def claim_job_for_fire(
     job_id: str, *, claim_ttl_seconds: int = FIRE_CLAIM_TTL_SECONDS, force: bool = False,
-    manual: bool = False, return_job: bool = False,
+    manual: bool = False, return_job: bool = False, expected_definition_hash: Optional[str] = None,
 ) -> Union[bool, Dict[str, Any]]:
     """Atomically claim a job for one external 'fire' (multi-machine at-most-once); True iff THIS
     caller won (``CronScheduler.fire_due``: exactly one of N replicas runs a job). Under the
@@ -2552,6 +2552,8 @@ def claim_job_for_fire(
     clears the claim). Otherwise stamp ``fire_claim`` and, for recurring jobs, advance
     ``next_run_at`` so a stale re-delivery cannot re-fire."""
     def apply(jobs, _i, job):
+        # Validate under the same store lock as the claim, before any schedule/counter write.
+        validate_definition(job, expected_definition_hash)
         if is_terminal_job(job) and not _is_recoverable_error_job(job):
             return False
         # Both enabled and pause markers must clear — a half-paused record must not claim. ``force``
@@ -2585,9 +2587,17 @@ def claim_job_for_fire(
             if nxt:
                 job["next_run_at"] = nxt
         save_jobs(jobs)
-        return dict(copy.deepcopy(job), _scheduled_instant=instant) if return_job else True
+        return dict(copy.deepcopy(job), _scheduled_instant=instant)
 
-    return _under_fire_fence(job_id, lambda: _with_job(job_id, apply, False))
+    from cron.communication_transition import claim_gate, stamp_claim, validate_definition
+    with claim_gate() as allowed:
+        if not allowed:
+            return False
+        claimed = _under_fire_fence(job_id, lambda: _with_job(job_id, apply, False))
+        if isinstance(claimed, dict):
+            stamped = stamp_claim(claimed)
+            return stamped if return_job else True
+        return claimed
 
 
 def heartbeat_fire_claim(job_id: str, *, expected_owner: str) -> bool:
@@ -2668,8 +2678,12 @@ def get_due_jobs() -> List[Dict[str, Any]]:
     This prevents the perpetual-defer loop (#33315) where a job whose runtime exceeds ``interval + grace``
     would be skipped forever.
     """
-    with _jobs_lock():
-        return _get_due_jobs_locked()
+    from cron.communication_transition import claim_gate
+    with claim_gate() as allowed:
+        if not allowed:
+            return []
+        with _jobs_lock():
+            return _get_due_jobs_locked()
 
 
 @dataclass

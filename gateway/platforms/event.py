@@ -7,7 +7,7 @@ gateway.platforms.*.
 from dataclasses import dataclass, field
 from datetime import datetime
 from enum import Enum
-from typing import Any, Dict, List, Optional
+from typing import TYPE_CHECKING, Any, Dict, List, Optional
 
 from gateway.session import SessionSource
 
@@ -35,6 +35,10 @@ class ProcessingOutcome(Enum):
 @dataclass
 class MessageEvent:
     """Incoming message from a platform — the normalized shape all adapters produce."""
+    if TYPE_CHECKING:
+        # Runtime-only delivery owner: never a dataclass/wire field.
+        _turn_status: Any
+
     text: str
     message_type: MessageType = MessageType.TEXT
     # Author, mirrored from ``source`` for per-message prompt builders; None for non-IM sources.

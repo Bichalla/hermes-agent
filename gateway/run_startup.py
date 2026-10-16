@@ -524,6 +524,10 @@ class GatewayStartupMixin:
         now = datetime.now()
         scheduled = 0
         for entry in candidates:
+            recovery_profile = getattr(entry.origin, "profile", None) or "default"
+            if (entry.session_key in (getattr(self, "_turn_status_recovery_holds", None) or set())
+                    or recovery_profile in (getattr(self, "_turn_status_recovery_profile_holds", None) or set())):
+                continue  # Unknown execution/delivery never authorizes automatic work replay.
             marker = entry.last_resume_marked_at or entry.updated_at
             if marker is not None and (now - marker).total_seconds() > window:
                 continue
@@ -1240,6 +1244,36 @@ class GatewayStartupMixin:
         ):
             self._schedule_update_notification_watch()
 
+    async def _recover_turn_status_journals(self) -> None:
+        """Hold ambiguous interactive requests before any startup auto-resume."""
+        from hermes_constants import get_hermes_home
+        from gateway.turn_status import recover_turn_statuses
+        targets = [("default", get_hermes_home(), self.adapters.get(Platform.DISCORD))]
+        for profile, adapters in (getattr(self, "_profile_adapters", None) or {}).items():
+            home = self._profile_home_or_none(profile)
+            if home is not None:
+                targets.append((profile, home, adapters.get(Platform.DISCORD)))
+        holds = set()
+        profile_holds = set()
+        reports = {}
+        for profile, home, adapter in targets:
+            try:
+                report = await recover_turn_statuses(home, adapter, profile=profile)
+                holds.update(report["session_keys"])
+                reports[profile] = report
+                if report["invalid"] or report["overflow"]:
+                    profile_holds.add(profile)
+                if report["unresolved"] or report["invalid"] or report["overflow"]:
+                    logger.warning("Turn-status recovery HOLD for profile %s: unresolved=%s invalid=%s overflow=%s",
+                                   profile, report["unresolved"], report["invalid"], report["overflow"])
+            except Exception:
+                logger.warning("Turn-status recovery HOLD for profile %s: scan failed", profile, exc_info=True)
+                reports[profile] = {"invalid": 1}
+                profile_holds.add(profile)
+        self._turn_status_recovery_holds = holds
+        self._turn_status_recovery_profile_holds = profile_holds
+        self._turn_status_recovery_reports = reports
+
     async def _start_finish_wiring(self, connected_count: int) -> None:
         """Post-connect wiring: services, boot notifications, startup restore, recovered watchers."""
         from gateway.run import _planned_restart_notification_pending, _restart_notification_pending
@@ -1247,6 +1281,7 @@ class GatewayStartupMixin:
         # Let fresh adapters settle before lifecycle sends (helps Discord thread deliveries).
         if connected_count > 0:
             await asyncio.sleep(1.0)
+        await self._recover_turn_status_journals()
         # Before _send_restart_notification() unlinks the marker: did we boot from a chat /restart?
         # One-shot signal for _is_stale_restart_redelivery.
         if _restart_notification_pending():

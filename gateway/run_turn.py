@@ -1727,6 +1727,19 @@ class GatewayTurnMixin:
             response = ""
 
         adapter = self._adapter_for_source(source)
+        turn_status = agent_result.get("_turn_status")
+        if turn_status is not None:
+            event._turn_status = turn_status
+            if _intentional_silence:
+                await turn_status.finish_delivery()
+                return None
+            from gateway.turn_status import TurnStatusBlocked
+            try:
+                await turn_status.before_result(response)
+            except TurnStatusBlocked:
+                # Recovered/ambiguous requests retain their prior payload; do not
+                # turn a conservative hold into an unjournaled error resend.
+                return None
         # Auto voice reply (TTS audio before the text) unless streaming TTS already delivered audio.
         _streaming_tts_done = adapter is not None and bool(
             getattr(adapter, "_streaming_tts_turn_completed", lambda *_a, **_k: False)(session_key, run_generation)
@@ -2866,7 +2879,7 @@ class GatewayTurnMixin:
         file_handler = RotatingFileHandler(
             log_dir / "tool_calls.log", maxBytes=5 * 1024 * 1024, backupCount=3, encoding="utf-8",
         )
-        file_handler.setFormatter(RedactingFormatter("%(message)s"))
+        file_handler.setFormatter(RedactingFormatter("%(message)s", redact_url_credentials=True))
         tool_logger = logging.getLogger(f"hermes.tool_calls.{id(log_queue)}")
         tool_logger.setLevel(logging.INFO)
         tool_logger.propagate = False
@@ -3404,6 +3417,7 @@ class GatewayTurnMixin:
                     # The text send records a delivery-ledger obligation under this key, keyed on
                     # the raw inbound id (the anchor above is only the reply target).
                     session_key=session_key, inbound_message_id=turn_ctx.inbound_message_id,
+                    **({"turn_status": _delivery_result["_turn_status"]} if _delivery_result.get("_turn_status") is not None else {}),
                 )
             except Exception as e:
                 logger.warning("Failed to send first response before queued message: %s", e)
@@ -3752,6 +3766,8 @@ class GatewayTurnMixin:
         Interval: agent.gateway_notify_interval / HERMES_AGENT_NOTIFY_INTERVAL (default 180s; 0 or
         long_running_notifications=off disables)."""
         from gateway.run import _float_env, _interim_metadata, _non_conversational_metadata
+        if getattr(turn_ctx, "_turn_status", None) is not None:
+            return  # The durable card owns bounded progress edits for this turn.
         _notify_start = time.time()
         _NOTIFY_INTERVAL = _float_env("HERMES_AGENT_NOTIFY_INTERVAL", 180)
         _long_running_mode = disp._display_surface_mode("long_running_notifications", default=True, allow_generic=True)
@@ -3848,9 +3864,14 @@ class GatewayTurnMixin:
         _status_thread_metadata = self._run_agent_bind_turn_wiring(
             turn_ctx, turn_runner, source, event_message_id, disp._native_slack_task_cards,
         )
-        self._run_agent_start_streaming_tts(
-            source, message_type, _status_thread_metadata, turn_ctx.streaming_tts_consumer_holder,
-        )
+        from gateway.turn_status import create_turn_status
+        turn_status = create_turn_status(turn_ctx, turn_ctx._status_adapter, turn_runner._agent_interrupted)
+        turn_runner.turn_status = turn_status
+        turn_ctx._turn_status = turn_status
+        if turn_status is None:
+            self._run_agent_start_streaming_tts(
+                source, message_type, _status_thread_metadata, turn_ctx.streaming_tts_consumer_holder,
+            )
 
         # Progress sender drains BOTH tool-progress lines and thinking bubbles (needs_progress_queue).
         spawn = asyncio.create_task
@@ -3869,8 +3890,21 @@ class GatewayTurnMixin:
             # run_sync is TurnRunner.run_sync (bound method; executor call unchanged).
             worker = self._run_agent_start_turn_worker(turn_ctx, turn_runner.run_sync)
             _executor_task_holder[0] = worker.executor_task  # read late by _notify_long_running
-            response = await self._run_agent_await_turn_worker(worker, turn_ctx, _interrupt_detected, interrupt_monitor)
+            try:
+                response = await self._run_agent_await_turn_worker(worker, turn_ctx, _interrupt_detected, interrupt_monitor)
+            except Exception:
+                if turn_status is None:
+                    raise
+                logger.exception("Interactive turn failed; preserving turn-status delivery ownership")
+                response = {"final_response": "요청 처리가 중단되었습니다. 실행·전달 상태 확인이 필요합니다.",
+                            "failed": True, "completed": False, "messages": [], "api_calls": 0}
+                if turn_ctx.result_holder[0] is None:
+                    turn_ctx.result_holder[0] = response
             self._run_agent_evict_on_fallback(turn_ctx)
+            if turn_status is not None:
+                await turn_status.execution_finished(response if isinstance(response, dict) else {})
+                if isinstance(response, dict):
+                    response["_turn_status"] = turn_status
 
             # Interrupted OR queued message (/queue)?
             result = turn_ctx.result_holder[0]
@@ -3882,6 +3916,8 @@ class GatewayTurnMixin:
                     turn_ctx, adapter, pending, pending_event, response, result, stream_task,
                 )
         finally:
+            if turn_status is not None:
+                await turn_status.close()
             await self._run_agent_cleanup_turn_tasks(
                 turn_ctx, progress_task=progress_task, log_task=log_task, interrupt_monitor=interrupt_monitor,
                 _notify_task=_notify_task, tracking_task=tracking_task, stream_task=stream_task,

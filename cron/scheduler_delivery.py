@@ -861,6 +861,11 @@ def _resolve_delivery_targets(job: dict, *, for_failure: bool = False) -> List[d
     thread_id). ``for_failure=True`` (failure summaries, interrupted-run notices, drift/preflight
     alerts) resolves from ``failure_deliver`` INSTEAD when the job carries one —
     ``failure_deliver: local`` is the structural opt-out; absent, failures follow ``deliver``."""
+    pinned = job.get("_communication_transition")
+    if isinstance(pinned, dict):
+        key = "failure_targets" if for_failure else "targets"
+        if key in pinned:
+            return [dict(target) for target in pinned[key]]
     deliver = _normalize_deliver_value(_delivery_lane_value(job, for_failure=for_failure))
     if deliver == "local":
         return []

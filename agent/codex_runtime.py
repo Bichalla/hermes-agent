@@ -477,6 +477,12 @@ def run_codex_app_server_turn(agent, *, user_message: str, original_user_message
         from agent.conversation_compression import _checkpoint_blocked
         raise _checkpoint_blocked("codex_app_server owns the authoritative thread and compacts it "
                                   "without a truthful pre-compaction transcript boundary")
+    # App-server tool events are observations, not synchronous pre-dispatch
+    # authorization. Gate the external executor itself before it can start work.
+    # This coarser runtime also shows ACK/card for a direct-answer turn.
+    barrier = getattr(agent, "before_tool_execution", None)
+    if callable(barrier):
+        barrier("external-runtime", "codex_app_server", {})
     _ensure_codex_session(agent)
     try:
         turn = agent._codex_session.run_turn(user_input=user_message)

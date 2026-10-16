@@ -82,7 +82,7 @@ def redact_registered_vault_values(text: str) -> str:
 _SENSITIVE_QUERY_PARAMS = frozenset({
     "access_token", "refresh_token", "id_token", "token", "api_key", "apikey",
     "client_secret", "password", "auth", "jwt", "session", "secret", "key",
-    "code", "signature", "x-amz-signature",
+    "code", "signature", "x-amz-signature", "x_amz_signature",
 })
 
 # Snapshot at import time so runtime env mutations (e.g. an LLM-generated
@@ -937,7 +937,15 @@ def _reset_plugin_redaction_patterns() -> None:
 
 
 class RedactingFormatter(logging.Formatter):
-    """Log formatter that redacts secrets from all log messages."""
+    """Redact a formatted log copy, optionally including round-trip URL secrets."""
+
+    def __init__(self, *args, redact_url_credentials: bool = False, **kwargs):
+        super().__init__(*args, **kwargs)
+        self._redact_url_credentials = redact_url_credentials
 
     def format(self, record: logging.LogRecord) -> str:
-        return redact_sensitive_text(super().format(record))
+        return redact_sensitive_text(
+            super().format(record),
+            force=self._redact_url_credentials,
+            redact_url_credentials=self._redact_url_credentials,
+        )

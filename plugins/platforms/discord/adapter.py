@@ -2327,6 +2327,11 @@ class DiscordAdapter(DiscordMediaMixin, BasePlatformAdapter):
             return False
         if self._discord_message_has_active_claim(str(getattr(message, "id", ""))):
             return False
+        if self._with_discord_recovery_db(lambda conn: conn.execute(
+            "SELECT 1 FROM discord_messages WHERE message_id=? AND status IN ('delivery_partial', 'delivery_unknown')",
+            (str(getattr(message, "id", "")),),
+        ).fetchone()):
+            return False  # Delivery review never re-executes the user's work.
         # A success reaction is only an ack, not evidence the substantive response completed.
         return not await self._message_has_non_down_bot_response(message)
 
@@ -2402,7 +2407,7 @@ class DiscordAdapter(DiscordMediaMixin, BasePlatformAdapter):
 
         def _op(conn):
             existing = conn.execute("SELECT status FROM discord_messages WHERE message_id=?", (message_id,)).fetchone()
-            final_status = existing[0] if existing and existing[0] == "responded" else status
+            final_status = existing[0] if existing and existing[0] in {"responded", "delivery_partial", "delivery_unknown"} else status
             conn.execute(
                 """
                 INSERT INTO discord_messages (message_id, channel_id, thread_id, parent_channel_id, author_id, created_at, status, updated_at)
@@ -2469,7 +2474,7 @@ class DiscordAdapter(DiscordMediaMixin, BasePlatformAdapter):
         def _op(conn):
             conn.execute(
                 "UPDATE discord_messages "
-                "SET status=CASE WHEN status='responded' THEN status ELSE ? END, "
+                "SET status=CASE WHEN status IN ('responded', 'delivery_partial', 'delivery_unknown') THEN status ELSE ? END, "
                 "updated_at=? WHERE message_id=?",
                 (status, now, message_id),
             )
@@ -2489,7 +2494,11 @@ class DiscordAdapter(DiscordMediaMixin, BasePlatformAdapter):
             return
         now = self._utc_now_iso()
         completed = bool(final and result.success)
-        status = "responded" if completed else "failed"
+        raw_receipt = getattr(result, "raw_response", None)
+        receipt = raw_receipt if isinstance(raw_receipt, dict) else {}
+        review_state = receipt.get("delivery_state")
+        needs_review = review_state in {"partial", "unknown"}
+        status = "responded" if completed else (f"delivery_{review_state}" if needs_review else "failed")
 
         def _op(conn):
             conn.execute(
@@ -2509,6 +2518,11 @@ class DiscordAdapter(DiscordMediaMixin, BasePlatformAdapter):
                     result.message_id, now,
                 ),
             )
+            if needs_review:
+                conn.execute(
+                    "UPDATE discord_messages SET status=?, last_error=? WHERE message_id=?",
+                    (status, json.dumps(receipt, ensure_ascii=True), reply_to),
+                )
         self._with_discord_recovery_db(_op)
         if completed:
             def _channel_for_message(conn):
@@ -2810,6 +2824,38 @@ class DiscordAdapter(DiscordMediaMixin, BasePlatformAdapter):
         kept.append(notice)
         return kept
 
+    def _communication_policy(self):
+        from gateway.communication_routes import CommunicationPolicy
+        extra = getattr(self.config, "extra", None) or {}
+        return CommunicationPolicy.from_config(extra.get("communication"))
+
+    async def _resolve_delivery_target(self, chat_id, metadata=None, *, editing=False):
+        from gateway.communication_routes import DeliveryTarget, resolve_discord_delivery
+        policy = self._communication_policy()
+        if not policy.enabled:
+            target_id = str(_prompt_target_id(chat_id, metadata))
+            return DeliveryTarget(await self._resolve_channel(target_id), target_id, target_id, False)
+        return await resolve_discord_delivery(
+            self._client, policy, chat_id, metadata, editing=editing,
+        )
+
+    async def _communication_input_allowed(self, channel, *, notify=True):
+        """Only machine channel IDs select front doors; text never chooses a category."""
+        policy = self._communication_policy()
+        parent_id = getattr(channel, "parent_id", None)
+        if policy.accepts_input(getattr(channel, "id", None), parent_id):
+            return True
+        target = policy.redirect(getattr(channel, "id", None), parent_id)
+        if notify:
+            # This fixed notice contains no task text, source captions or retrieved data.
+            notice = (f"새 요청은 <#{target}>에서 보내 주세요. 이 요청은 실행하지 않았습니다."
+                      if target else "새 요청은 개인·일·Hermes 개발 창구에서 보내 주세요. 이 요청은 실행하지 않았습니다.")
+            try:
+                await channel.send(notice)
+            except Exception:
+                logger.warning("[%s] Could not deliver communication redirect", self.name)
+        return False
+
     async def send(
         self,
         chat_id: str,
@@ -2819,6 +2865,7 @@ class DiscordAdapter(DiscordMediaMixin, BasePlatformAdapter):
     ) -> SendResult:
         """Send a message to a Discord channel or thread (metadata thread_id wins over
         chat_id; forum channels auto-create a thread post since they reject direct sends)."""
+        record_reply_to = reply_to
         if not self._client:
             # Dead transport: classify as send_path_degraded so the delivery ledger's reconnect
             # sweep can replay this; a generic "Not connected" error would strand the output.
@@ -2830,25 +2877,25 @@ class DiscordAdapter(DiscordMediaMixin, BasePlatformAdapter):
             )
             result = SendResult(success=False, error="Refusing to send empty message")
             # Backfill replays from this table: record the dropped final reply as failed or it is lost.
-            return await self._record_response_async(reply_to, result, content, bool(metadata and metadata.get("notify")))
+            return await self._record_response_async(record_reply_to, result, content, bool(metadata and metadata.get("notify")))
+        message_ids = []
+        chunks = []
+        attempted_chunk = None
+        target_id = str((metadata or {}).get("thread_id") or chat_id)
         try:
-            thread_id = None
-            if metadata and metadata.get("thread_id"):
-                thread_id = metadata["thread_id"]
+            target = await self._resolve_delivery_target(chat_id, metadata)
+            target_id = target.target_id
+            if target.moved:
+                reply_to = None  # Reply IDs belong to the old channel, never the new surface.
             nonconversational = _metadata_marks_nonconversational(metadata)
             final_delivery = bool(metadata and metadata.get("notify"))
-            if thread_id:
-                channel = await self._resolve_channel(thread_id)
-                if not channel:
-                    return SendResult(success=False, error=f"Thread {thread_id} not found")
-            else:
-                channel = await self._resolve_channel(chat_id)
-                if not channel:
-                    return SendResult(success=False, error=f"Channel {chat_id} not found")
+            channel = target.channel
+            if not channel:
+                return SendResult(success=False, error=f"Channel {target_id} not found")
             # Forum channels reject channel.send() — create a thread post instead.
             if self._is_forum_parent(channel):
-                result = await self._send_to_forum(channel, content)
-                return await self._record_response_async(reply_to, result, content, final_delivery)
+                result = await self._send_to_forum(channel, content, delivery_context=(chat_id, metadata))
+                return await self._record_response_async(record_reply_to, result, content, final_delivery)
             formatted = self.format_message(content)
             chunks = self._cap_split_chunks(
                 self.truncate_message(formatted, self.MAX_MESSAGE_LENGTH)
@@ -2856,10 +2903,17 @@ class DiscordAdapter(DiscordMediaMixin, BasePlatformAdapter):
             message_ids = []
             reference = self._reply_reference_for_send(reply_to, channel)
             for i, chunk in enumerate(chunks):
+                attempted_chunk = None
+                if self._communication_policy().enabled:
+                    refreshed = await self._resolve_delivery_target(chat_id, metadata)
+                    if refreshed.target_id != target_id:
+                        raise ValueError("communication destination changed during delivery")
+                    channel = refreshed.channel
                 if self._reply_to_mode == "all":
                     chunk_reference = reference
                 else:  # "first" (default) or "off"
                     chunk_reference = reference if i == 0 else None
+                attempted_chunk = i
                 try:
                     msg = await channel.send(content=chunk, reference=chunk_reference)
                 except Exception as e:
@@ -2875,28 +2929,39 @@ class DiscordAdapter(DiscordMediaMixin, BasePlatformAdapter):
                 message_ids.append(str(msg.id))
             # Track the last sent message for history backfill (skips the full history scan).
             if message_ids:
-                _target_id = thread_id or chat_id
+                _target_id = target_id
                 if nonconversational:
                     await self._nonconversational_messages.mark_many(message_ids)
                 elif not _looks_like_nonconversational_history_message(content):
                     self._last_self_message_id[_target_id] = message_ids[-1]
-            # Connection-shaped failure (WS drop / closed session): use the ledger's runtime-retryable
-            # marker so the reconnect sweep can replay this final response instead of stranding it until a
-            # process restart (#95382 silent partial loss).
+            # Preserve every confirmed receipt for delivery lifecycle consumers.
             result = SendResult(
                 success=True,
                 message_id=message_ids[0] if message_ids else None,
-                raw_response={"message_ids": message_ids}
+                raw_response={"message_ids": message_ids, "delivery_state": "delivered",
+                              "delivered_chunks": len(message_ids), "total_chunks": len(chunks),
+                              "uncertain": False, "target_id": target_id}
             )
-            return await self._record_response_async(reply_to, result, content, final_delivery)
-        except Exception as e:  # pragma: no cover - defensive logging
+            return await self._record_response_async(record_reply_to, result, content, final_delivery)
+        except (Exception, asyncio.CancelledError) as e:
+            if isinstance(e, asyncio.CancelledError) and attempted_chunk is None and not message_ids:
+                raise
             logger.error("[%s] Failed to send Discord message: %s", self.name, e, exc_info=True)
-            if _is_discord_transport_error(e):
-                # Connection-shaped failure: runtime-retryable marker so the reconnect sweep can replay it.
-                result = SendResult(success=False, error="send_path_degraded", retryable=True)
-            else:
-                result = SendResult(success=False, error=str(e))
-            return await self._record_response_async(reply_to, result, content, bool(metadata and metadata.get("notify")))
+            # A remote receipt may have been lost. Never retry the whole payload after
+            # an attempted chunk with unknown outcome or any confirmed earlier chunks.
+            uncertain = attempted_chunk is not None and (
+                isinstance(e, (asyncio.CancelledError, TimeoutError, ConnectionError, OSError)) or _is_discord_transport_error(e)
+            )
+            state = "partial" if message_ids else ("unknown" if uncertain else "not_sent")
+            result = SendResult(
+                success=False, message_id=message_ids[0] if message_ids else None,
+                error=("delivery_unknown" if uncertain else str(e)), retryable=False,
+                raw_response={"message_ids": message_ids, "delivery_state": state,
+                              "delivered_chunks": len(message_ids), "total_chunks": len(chunks),
+                              "failed_chunk_index": attempted_chunk, "uncertain": uncertain,
+                              "target_id": target_id},
+            )
+            return await self._record_response_async(record_reply_to, result, content, bool(metadata and metadata.get("notify")))
 
     @staticmethod
     def _forum_thread_parts(thread: Any) -> tuple:
@@ -2908,7 +2973,7 @@ class DiscordAdapter(DiscordMediaMixin, BasePlatformAdapter):
         message_id = str(getattr(starter_msg, "id", thread_id)) if starter_msg else thread_id
         return thread_channel, thread_id, starter_msg, message_id
 
-    async def _send_to_forum(self, forum_channel: Any, content: str) -> SendResult:
+    async def _send_to_forum(self, forum_channel: Any, content: str, *, delivery_context=None) -> SendResult:
         """Create a forum thread post with the message as starter (forum channels reject direct
         sends; name from the first line). Chunk failures land in ``raw_response['warnings']``."""
         formatted = self.format_message(content)
@@ -2925,13 +2990,23 @@ class DiscordAdapter(DiscordMediaMixin, BasePlatformAdapter):
         warnings: list[str] = []
         for chunk in chunks[1:]:
             try:
+                if delivery_context is not None and self._communication_policy().enabled:
+                    await self._resolve_delivery_target(*delivery_context)
                 msg = await thread_channel.send(content=chunk)
                 message_ids.append(str(msg.id))
             except Exception as e:
                 warning = f"Failed to send follow-up chunk to forum thread {thread_id}: {e}"
                 logger.warning("[%s] %s", self.name, warning)
                 warnings.append(warning)
-        raw_response: Dict[str, Any] = {"message_ids": message_ids, "thread_id": thread_id}
+                uncertain = isinstance(e, (TimeoutError, ConnectionError, OSError)) or _is_discord_transport_error(e)
+                return SendResult(success=False, message_id=message_ids[0], error=warning, raw_response={
+                    "message_ids": message_ids, "thread_id": thread_id, "delivery_state": "partial",
+                    "delivered_chunks": len(message_ids), "total_chunks": len(chunks),
+                    "uncertain": uncertain, "target_id": thread_id,
+                })
+        raw_response: Dict[str, Any] = {"message_ids": message_ids, "thread_id": thread_id,
+                                      "delivery_state": "delivered", "delivered_chunks": len(message_ids),
+                                      "total_chunks": len(chunks), "uncertain": False, "target_id": thread_id}
         if warnings:
             raw_response["warnings"] = warnings
         return SendResult(success=True, message_id=message_ids[0], raw_response=raw_response)
@@ -3005,7 +3080,8 @@ class DiscordAdapter(DiscordMediaMixin, BasePlatformAdapter):
         if not self._client:
             return SendResult(success=False, error="Not connected")
         try:
-            channel = await self._resolve_channel(chat_id)
+            target = await self._resolve_delivery_target(chat_id, metadata, editing=True)
+            channel = target.channel
             msg = channel.get_partial_message(int(message_id))
             formatted = self.format_message(content)
             _preview_key = (str(chat_id), str(message_id))
@@ -3016,7 +3092,7 @@ class DiscordAdapter(DiscordMediaMixin, BasePlatformAdapter):
             # Pre-flight oversize: final edits split-and-deliver; streaming edits truncate in place.
             if len(formatted) > self.MAX_MESSAGE_LENGTH:
                 if finalize:
-                    return await self._edit_overflow_split(channel, msg, message_id, content)
+                    return await self._edit_overflow_split(channel, msg, message_id, content, delivery_context=(chat_id, metadata))
                 formatted = self.truncate_message(formatted, self.MAX_MESSAGE_LENGTH)[0]
                 _saturated_preview = True
                 # Saturated-preview dedup: past the cap every edit is the same text; skip until finalize.
@@ -3035,7 +3111,7 @@ class DiscordAdapter(DiscordMediaMixin, BasePlatformAdapter):
                 # Reactive split: format_message inflation can exceed 2,000 (50035) even after pre-flight.
                 if self._is_length_overflow_error(edit_err):
                     if finalize:
-                        return await self._edit_overflow_split(channel, msg, message_id, content)
+                        return await self._edit_overflow_split(channel, msg, message_id, content, delivery_context=(chat_id, metadata))
                     truncated = self.truncate_message(formatted, self.MAX_MESSAGE_LENGTH)[0]
                     if self._last_overflow_preview.get(_preview_key) == truncated:
                         # Saturated-preview dedup (see pre-flight path above).
@@ -3050,7 +3126,11 @@ class DiscordAdapter(DiscordMediaMixin, BasePlatformAdapter):
             return result
         except Exception as e:  # pragma: no cover - defensive logging
             logger.error("[%s] Failed to edit Discord message %s: %s", self.name, message_id, e, exc_info=True)
-            return SendResult(success=False, error=str(e))
+            uncertain = isinstance(e, (TimeoutError, ConnectionError, OSError)) or _is_discord_transport_error(e)
+            return SendResult(success=False, error=str(e), raw_response={
+                "delivery_state": "unknown" if uncertain else "not_sent", "message_ids": [],
+                "uncertain": uncertain, "target_id": str(chat_id),
+            })
 
     @staticmethod
     def _is_reply_reference_rejected(err: Exception) -> bool:
@@ -3070,7 +3150,7 @@ class DiscordAdapter(DiscordMediaMixin, BasePlatformAdapter):
         )
 
     async def _edit_overflow_split(
-        self, channel: Any, msg: Any, message_id: str, content: str,
+        self, channel: Any, msg: Any, message_id: str, content: str, *, delivery_context=None,
     ) -> SendResult:
         """Deliver an oversized final edit: edit ``message_id`` with chunk 1, send chunks 2..N as
         replies to the previous. Returns ``message_id=<last-id>`` + ``continuation_message_ids``.
@@ -3103,9 +3183,21 @@ class DiscordAdapter(DiscordMediaMixin, BasePlatformAdapter):
                 # Prior message without to_reference (duck-typed): build the reference from ids.
                 reference = self._message_reference_from_ids(prev_msg.id, channel)
             try:
+                if delivery_context is not None and self._communication_policy().enabled:
+                    await self._resolve_delivery_target(*delivery_context, editing=True)
                 sent = await channel.send(content=chunk, reference=reference)
             except Exception as send_err:
-                # Drop the reply anchor and retry once: deleted anchor (10008) / system message (50035).
+                if not self._is_reply_reference_rejected(send_err):
+                    ids = [message_id, *continuation_ids]
+                    uncertain = isinstance(send_err, (TimeoutError, ConnectionError, OSError)) or _is_discord_transport_error(send_err)
+                    return SendResult(
+                        success=False, message_id=ids[-1], error=str(send_err),
+                        continuation_message_ids=tuple(continuation_ids),
+                        raw_response={"message_ids": ids, "delivery_state": "partial",
+                                      "delivered_chunks": delivered, "total_chunks": len(chunks),
+                                      "uncertain": uncertain, "target_id": str(channel.id)},
+                    )
+                # Only a definitive reference rejection is safe to retry without an anchor.
                 logger.warning(
                     "[%s] Overflow continuation send failed (%s); retrying without reply reference",
                     self.name, send_err,
@@ -3150,7 +3242,14 @@ class DiscordAdapter(DiscordMediaMixin, BasePlatformAdapter):
         for gid, text_ch_id in self._voice_text_channels.items():
             if str(text_ch_id) == str(chat_id) and self.is_in_voice_channel(gid):
                 logger.info("[%s] Playing TTS in voice channel (guild=%d)", self.name, gid)
-                success = await self.play_in_voice_channel(gid, audio_path)
+                if self._communication_policy().enabled:
+                    success = await self.play_in_voice_channel(
+                        gid, audio_path, chat_id=chat_id, metadata=kwargs.get("metadata"),
+                    )
+                    if not success:
+                        return await self.send_voice(chat_id=chat_id, audio_path=audio_path, **kwargs)
+                else:
+                    success = await self.play_in_voice_channel(gid, audio_path)
                 return SendResult(success=success)
         return await self.send_voice(chat_id=chat_id, audio_path=audio_path, **kwargs)
 
@@ -3429,11 +3528,32 @@ class DiscordAdapter(DiscordMediaMixin, BasePlatformAdapter):
             self._voice_text_channels.pop(guild_id, None)
             self._voice_sources.pop(guild_id, None)
 
-    async def play_in_voice_channel(self, guild_id: int, audio_path: str) -> bool:
+    async def _voice_publication_allowed(self, guild_id, *, chat_id=None, metadata=None):
+        policy = self._communication_policy()
+        if not policy.enabled:
+            return True
+        from gateway.communication_routes import verify_discord_voice_audience
+        vc = self._voice_clients.get(guild_id)
+        voice_id = getattr(getattr(vc, "channel", None), "id", None)
+        source_id = ((metadata or {}).get("communication_source_channel_id")
+                     or (metadata or {}).get("thread_id") or chat_id)
+        if not voice_id or not source_id:
+            return False
+        try:
+            return await verify_discord_voice_audience(self._client, policy, voice_id, source_id)
+        except Exception:
+            logger.warning("[%s] Voice audience could not be verified", self.name)
+            return False
+
+    async def play_in_voice_channel(
+        self, guild_id: int, audio_path: str, *, chat_id=None, metadata=None,
+    ) -> bool:
         """Play audio in the VC: via the mixer (layered over the ambient bed, ducking it)
         when installed, else the legacy one-shot FFmpegPCMAudio path."""
         vc = self._voice_clients.get(guild_id)
         if not vc or not vc.is_connected():
+            return False
+        if not await self._voice_publication_allowed(guild_id, chat_id=chat_id, metadata=metadata):
             return False
         # Playback counts as activity: suspend the inactivity timer, re-arm in finally.
         self._cancel_voice_timeout(guild_id)
@@ -3446,6 +3566,8 @@ class DiscordAdapter(DiscordMediaMixin, BasePlatformAdapter):
                 pcm = await asyncio.to_thread(decode_to_pcm, audio_path)
                 if pcm:
                     speech_gain = float(self._voice_fx_cfg.get("speech_gain", 1.0))
+                    if not await self._voice_publication_allowed(guild_id, chat_id=chat_id, metadata=metadata):
+                        return False
                     mixer.play_speech(self._lead_silence_bytes() + pcm, gain=speech_gain)
                     # Block until speech drains so callers serialise replies; ambient keeps playing.
                     wait_start = time.monotonic()
@@ -3489,6 +3611,9 @@ class DiscordAdapter(DiscordMediaMixin, BasePlatformAdapter):
                     audio_path, executable=resolve_ffmpeg_executable(), **ffmpeg_opts,
                 )
                 source = discord.PCMVolumeTransformer(source, volume=1.0)
+                if not await self._voice_publication_allowed(guild_id, chat_id=chat_id, metadata=metadata):
+                    source.cleanup()
+                    return False
                 vc.play(source, after=_after)
                 try:
                     await asyncio.wait_for(done.wait(), timeout=playback_timeout)
@@ -3876,6 +4001,12 @@ class DiscordAdapter(DiscordMediaMixin, BasePlatformAdapter):
         Returns False only *after* sending the ephemeral rejection, so the caller just stops."""
         allowed, reason = self._evaluate_slash_authorization(interaction)
         if allowed:
+            if not await self._communication_input_allowed(interaction.channel, notify=False):
+                await interaction.response.send_message(
+                    "새 요청은 개인·일·Hermes 개발 창구에서 보내 주세요. 이 요청은 실행하지 않았습니다.",
+                    ephemeral=True,
+                )
+                return False
             return True
         return await self._reject_slash(interaction, command_text, reason=reason or "unauthorized")
 
@@ -5099,9 +5230,8 @@ class DiscordAdapter(DiscordMediaMixin, BasePlatformAdapter):
         if utf16_len(cleaned) > 80:
             cleaned = _prefix_within_utf16_limit(cleaned, 77).rstrip() + "..."
         try:
-            thread = self._client.get_channel(thread_id_int)
-            if thread is None:
-                thread = await self._client.fetch_channel(thread_id_int)
+            target = await self._resolve_delivery_target(str(thread_id_int), editing=True)
+            thread = target.channel
         except Exception:
             logger.debug("[%s] Failed to resolve Discord thread %s for rename", self.name, thread_id, exc_info=True)
             return False
@@ -5138,9 +5268,8 @@ class DiscordAdapter(DiscordMediaMixin, BasePlatformAdapter):
         except (TypeError, ValueError):
             return None
         try:
-            parent = self._client.get_channel(parent_id)
-            if parent is None:
-                parent = await self._client.fetch_channel(parent_id)
+            target = await self._resolve_delivery_target(str(parent_id))
+            parent = target.channel
         except Exception as exc:
             logger.warning(
                 "[%s] Handoff thread: cannot resolve parent %s: %s", self.name, parent_chat_id, exc,
@@ -5217,11 +5346,17 @@ class DiscordAdapter(DiscordMediaMixin, BasePlatformAdapter):
         if not self._client or not DISCORD_AVAILABLE:
             return SendResult(success=False, error="Not connected")
         try:
-            channel = await self._resolve_channel(_prompt_target_id(chat_id, metadata))
+            target = await self._resolve_delivery_target(chat_id, metadata)
+            channel = target.channel
             send_kwargs, view = build(channel)
             msg = await channel.send(**send_kwargs)
             if view is not None:
                 view._message = msg
+                async def publication_guard():
+                    current = await self._resolve_delivery_target(chat_id, metadata)
+                    if current.target_id != target.target_id:
+                        raise ValueError("communication destination changed")
+                view._publication_guard = publication_guard
             return SendResult(success=True, message_id=str(msg.id))
         except Exception as e:
             if fail_log:
@@ -5721,6 +5856,9 @@ class DiscordAdapter(DiscordMediaMixin, BasePlatformAdapter):
             if require_mention and not is_free_channel and not in_bot_thread:
                 if not self._self_is_explicitly_mentioned(message) and not mention_prefix:
                     return False
+        # Preserve silence/mention gates before emitting any legacy-channel redirect.
+        if not await self._communication_input_allowed(message.channel):
+            return False
         # Auto-thread: isolate each @mention in a text channel into its own thread (Slack-style).
         auto_threaded_channel = None
         if not is_thread and not isinstance(message.channel, discord.DMChannel):
@@ -5991,12 +6129,25 @@ def _define_discord_view_classes() -> None:
             self.allowed_role_ids = allowed_role_ids or set()
             self.resolved = False
             self._message = None
+            self._publication_guard = None
+
+        async def _can_publish(self):
+            if self._publication_guard is None:
+                return True
+            try:
+                await self._publication_guard()
+                return True
+            except Exception:
+                return False
 
         def _check_auth(self, interaction: discord.Interaction) -> bool:
             return _component_check_auth(interaction, self.allowed_user_ids, self.allowed_role_ids)
 
         async def _gate(self, interaction: discord.Interaction, *, resolved_msg: Optional[str], unauth_msg: str) -> bool:
             """Reject (ephemerally) an already-resolved or unauthorized click; True when it may proceed."""
+            if not await self._can_publish():
+                await interaction.response.send_message("이 출력면의 독자 권한을 확인할 수 없습니다.", ephemeral=True)
+                return False
             if resolved_msg is not None and self.resolved:
                 await interaction.response.send_message(resolved_msg, ephemeral=True)
                 return False
@@ -6016,7 +6167,7 @@ def _define_discord_view_classes() -> None:
         async def _expire_embed(self, footer: str) -> None:
             """Grey out the original message's embed after a timeout (best effort)."""
             msg = self._message
-            if msg:
+            if msg and await self._can_publish():
                 try:
                     embed = self._first_embed(msg)
                     if embed:
@@ -6028,6 +6179,8 @@ def _define_discord_view_classes() -> None:
 
         async def _finalize_embed(self, interaction: discord.Interaction, color, footer: str) -> None:
             """Mark resolved, stamp the embed (color + footer), disable buttons, edit in place."""
+            if not await self._can_publish():
+                return
             self.resolved = True
             embed = self._first_embed(interaction.message)
             if embed:
@@ -6147,7 +6300,8 @@ def _define_discord_view_classes() -> None:
                 from tools import slash_confirm as _slash_confirm_mod
                 result_text = await _slash_confirm_mod.resolve(self.session_key, self.confirm_id, choice)
                 if result_text:
-                    await interaction.followup.send(result_text)
+                    if await self._can_publish():
+                        await interaction.followup.send(result_text)
                 logger.info(
                     "Discord button resolved slash-confirm for session %s "
                     "(choice=%s, user=%s)",
@@ -6228,6 +6382,8 @@ def _define_discord_view_classes() -> None:
 
         async def _edit(self, interaction: discord.Interaction, description: str, *, view=..., **embed_kw) -> None:
             """Edit the picker message in place with a config embed (``view`` defaults to self)."""
+            if not await self._can_publish():
+                return
             await interaction.response.edit_message(
                 embed=self._config_embed(description, **embed_kw), view=self if view is ... else view,
             )
@@ -6322,6 +6478,8 @@ def _define_discord_view_classes() -> None:
                 result_text = await self.on_model_selected(str(interaction.channel_id), model_id, self._selected_provider)
             except Exception as exc:
                 result_text = f"Error switching model: {exc}"
+            if not await self._can_publish():
+                return
             await interaction.edit_original_response(
                 embed=self._config_embed(result_text, title="⚙ Model Switched", color=discord.Color.green()),
                 view=None,
@@ -6369,7 +6527,7 @@ def _define_discord_view_classes() -> None:
             self.resolved = True
             self.clear_items()
             msg = self._message
-            if msg:
+            if msg and await self._can_publish():
                 try:
                     embed = self._config_embed("⏱ Selection expired — no model change.", color=discord.Color.greyple())
                     await msg.edit(embed=embed, view=self)
@@ -6398,6 +6556,9 @@ def _define_discord_view_classes() -> None:
             self.add_item(select)
 
         async def _on_select(self, interaction: discord.Interaction):
+            if not await self._can_publish():
+                await interaction.response.send_message("이 출력면의 독자 권한을 확인할 수 없습니다.", ephemeral=True)
+                return
             if not self._check_auth(interaction):
                 await interaction.response.send_message("⛔ You are not authorized to change this setting.", ephemeral=True)
                 return
@@ -6411,6 +6572,8 @@ def _define_discord_view_classes() -> None:
             except Exception as exc:
                 logger.error("Choice picker selection failed: %s", exc)
                 result_text = f"Error applying selection: {exc}"
+            if not await self._can_publish():
+                return
             embed = discord.Embed(description=result_text, color=discord.Color.green())
             self.clear_items()
             self.stop()
@@ -6420,7 +6583,7 @@ def _define_discord_view_classes() -> None:
             if self.resolved:
                 return
             msg = self._message
-            if msg is not None:
+            if msg is not None and await self._can_publish():
                 try:
                     embed = discord.Embed(description="⏱ Selection expired — no change made.", color=discord.Color.greyple())
                     self.clear_items()
@@ -6480,6 +6643,8 @@ def _define_discord_view_classes() -> None:
 
         async def _finish(self, interaction: "discord.Interaction", color, footer: str, *, log_edit_failure: bool) -> None:
             """Disable the buttons and stamp the embed; fall back to a bare defer."""
+            if not await self._can_publish():
+                return
             self.resolved = True
             self._disable_all()
             embed = self._first_embed(interaction.message) if interaction.message else None
@@ -6699,6 +6864,13 @@ async def _standalone_send(
     Forum channels (type 15) reject ``POST /messages``, so a thread post is created via
     ``POST /channels/{id}/threads`` with media as multipart attachments. Channel type: directory
     cache → process-local probe cache → memoized GET. ``force_document`` accepted but unused."""
+    from gateway.communication_routes import CommunicationPolicy
+    try:
+        policy = CommunicationPolicy.from_config((getattr(pconfig, "extra", None) or {}).get("communication"))
+        if policy.enabled:
+            return {"error": "communication audience requires a live verified Discord adapter", "delivery_state": "not_sent"}
+    except ValueError:
+        return {"error": "invalid communication policy", "delivery_state": "not_sent"}
     try:
         import aiohttp
     except ImportError:
@@ -6974,6 +7146,9 @@ def _apply_yaml_config(yaml_cfg: dict, discord_cfg: dict) -> dict | None:
             if isinstance(candidate_extra, dict):
                 platform_extra_cfg = candidate_extra
     seeded_extra = {}
+    communication = discord_cfg.get("communication", platform_extra_cfg.get("communication"))
+    if isinstance(communication, dict):
+        seeded_extra["communication"] = dict(communication)
     # Gate keys are ALWAYS seeded into PlatformConfig.extra (per-profile lists); the os.environ writes
     # below are first-writer-wins for legacy consumers and skipped for profile-scoped multiplex loads.
     # The os.environ writes below remain first-writer-wins for legacy env-only consumers, but are skipped

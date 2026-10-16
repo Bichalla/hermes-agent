@@ -131,7 +131,9 @@ class TestRunningJobGuard:
         result = callback()
         future.set_result(result)
 
-        assert claim_calls == [("queued-job", {"return_job": True})]
+        from cron.communication_transition import _definition_hash
+        assert claim_calls == [("queued-job", {
+            "return_job": True, "expected_definition_hash": _definition_hash(job)})]
         assert "queued-job" not in sched._running_job_ids
 
 
